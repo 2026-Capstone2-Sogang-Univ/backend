@@ -8,16 +8,21 @@ Speed: 1 real second = 60 simulated seconds (1 simulated minute).
 Duration: simulation auto-terminates at simulated time 3600s (1 hour).
 """
 
+from __future__ import annotations
+
 import asyncio
 import random
 import threading
 import time
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import traci
 import traci.exceptions
+
+if TYPE_CHECKING:
+    from .connection_manager import ConnectionManager
 
 SUMO_CONFIG = str(
     Path(__file__).parent.parent / "sumo_configs" / "gangnam" / "LargeGangNamSimulation.sumocfg"
@@ -42,10 +47,12 @@ class SimStatus(str, Enum):
 class SimulationManager:
     def __init__(self) -> None:
         self.status = SimStatus.IDLE
+        self.connection_manager: Optional[ConnectionManager] = None
         self._paused = False
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._executor_task: Optional[asyncio.Future] = None
+        self._broadcast_task: Optional[asyncio.Task] = None
         self._state: dict = {"vehicles": [], "passengers": [], "sim_time": 0.0}
 
     # ------------------------------------------------------------------
@@ -60,6 +67,7 @@ class SimulationManager:
         self.status = SimStatus.RUNNING
         loop = asyncio.get_event_loop()
         self._executor_task = loop.run_in_executor(None, self._run_loop)
+        self._broadcast_task = asyncio.create_task(self._broadcast_loop())
 
     async def pause(self) -> None:
         if self.status == SimStatus.RUNNING:
@@ -88,6 +96,13 @@ class SimulationManager:
 
     async def _shutdown(self) -> None:
         self._stop_event.set()
+        if self._broadcast_task is not None:
+            self._broadcast_task.cancel()
+            try:
+                await self._broadcast_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._broadcast_task = None
         if self._executor_task is not None:
             try:
                 await self._executor_task
@@ -95,8 +110,27 @@ class SimulationManager:
                 pass
             self._executor_task = None
         self.status = SimStatus.IDLE
+        if self.connection_manager is not None:
+            self.connection_manager.clear_boundary()
         with self._lock:
             self._state = {"vehicles": [], "passengers": [], "sim_time": 0.0}
+
+    # ------------------------------------------------------------------
+    # Async broadcast loop — runs in the event loop
+    # ------------------------------------------------------------------
+
+    async def _broadcast_loop(self) -> None:
+        while True:
+            if self._stop_event.is_set():
+                break
+            if self.status == SimStatus.FINISHED:
+                if self.connection_manager is not None:
+                    await self.connection_manager.notify_finished()
+                break
+            if self.status == SimStatus.RUNNING and self.connection_manager is not None:
+                state = self.get_state()
+                await self.connection_manager.broadcast_state(state)
+            await asyncio.sleep(0.1)
 
     # ------------------------------------------------------------------
     # Blocking loop — runs in ThreadPoolExecutor
@@ -108,6 +142,9 @@ class SimulationManager:
                 ["sumo", "-c", SUMO_CONFIG, "--no-step-log", "--no-warnings"],
                 label="main",
             )
+            if self.connection_manager is not None:
+                (min_x, min_y), (max_x, max_y) = traci.simulation.getNetBoundary()
+                self.connection_manager.set_boundary(min_x, min_y, max_x, max_y)
             self._add_initial_vehicles()
 
             while not self._stop_event.is_set():
