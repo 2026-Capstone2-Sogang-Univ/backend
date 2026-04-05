@@ -51,7 +51,7 @@
 - **동적 배차 및 인센티브 시스템**: 수요가 공급보다 클 것으로 예측되는 불균형 지역에 빈 택시 기사들을 유도하기 위해, 실시간 동적 인센티브 제공 알고리즘을 구현합니다.
 
 ## 기술 스택
-- TraCI, SUMO, Python, websockets, TensorFlow/PyTorch (딥러닝 모델 구동)
+- TraCI, SUMO, Python, websockets, TensorFlow/PyTorch (딥러닝 모델 구동), uv (패키지 관리)
 
 ## 구현 방법
 - Microservice 아키텍처로, sumo+websocket / 딥러닝 모델 구동 / 동적 배차 및 인센티브 시스템을 각각 독립된 서비스로 구현하여, 유연성과 확장성을 확보합니다.

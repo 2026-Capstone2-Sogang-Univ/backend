@@ -61,6 +61,7 @@
 | 딥러닝 | TensorFlow / PyTorch |
 | 배포 | Docker, Docker Compose |
 | 언어 | Python |
+| 패키지 관리 | uv |
 
 ## 빠른 시작
 
@@ -68,6 +69,20 @@
 
 - Docker, Docker Compose
 - SUMO (로컬 개발 시)
+- [uv](https://docs.astral.sh/uv/) (로컬 개발 시)
+
+### 로컬 개발 환경 설정
+
+각 서비스는 `pyproject.toml`로 의존성을 관리합니다.
+
+```bash
+# 서비스 디렉토리에서 의존성 설치 (예: dispatch-service)
+cd dispatch-service
+uv sync
+
+# 테스트 실행
+uv run pytest
+```
 
 ### 전체 시스템 실행
 

@@ -50,6 +50,19 @@ Vehicle `state` values: `car` / `empty` / `dispatched` / `occupied`
 docker compose up
 ```
 
+### Local development setup
+
+Each service manages its own dependencies via `pyproject.toml` and `uv.lock`.
+
+```bash
+# Install dependencies for a service (e.g., dispatch-service)
+cd dispatch-service
+uv sync
+
+# Install with dev dependencies
+uv sync --dev
+```
+
 ### Simulation control (REST API)
 
 ```bash
@@ -64,9 +77,9 @@ Tests are focused on `dispatch-service` (no external dependencies required):
 
 ```bash
 # from dispatch-service directory
-pytest
+uv run pytest
 # run a single test
-pytest tests/test_dispatch.py::test_nearest_taxi_assignment
+uv run pytest tests/test_dispatch.py::test_nearest_taxi_assignment
 ```
 
 ## Open Issues
