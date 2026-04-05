@@ -6,13 +6,14 @@ RUN pip install --no-cache-dir uv
 
 WORKDIR /app
 
-# Install Python dependencies first (layer cache)
-COPY pyproject.toml ./
-RUN uv sync --no-dev --no-cache
+# Install dependencies first (layer cache) — project source not needed yet.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
 
-# Copy source
+# Copy source, then install the project itself.
 COPY app/ ./app/
 COPY sumo_configs/ ./sumo_configs/
+RUN uv sync --frozen --no-dev
 
 EXPOSE 8000
 

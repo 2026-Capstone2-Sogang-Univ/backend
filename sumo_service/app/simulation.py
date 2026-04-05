@@ -11,6 +11,7 @@ Duration: simulation auto-terminates at simulated time 3600s (1 hour).
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 import threading
 import time
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
 SUMO_CONFIG = str(
     Path(__file__).parent.parent / "sumo_configs" / "gangnam" / "LargeGangNamSimulation.sumocfg"
 )
+# Set SUMO_GUI=1 to open the SUMO GUI window (useful for local debugging).
+SUMO_BINARY = "sumo-gui" if os.getenv("SUMO_GUI") == "1" else "sumo"
 
 SIM_DURATION = 3600.0       # simulated seconds (1 hour)
 SPEED_FACTOR = 60.0         # 1 real second = 60 simulated seconds
@@ -138,10 +141,8 @@ class SimulationManager:
 
     def _run_loop(self) -> None:
         try:
-            traci.start(
-                ["sumo", "-c", SUMO_CONFIG, "--no-step-log", "--no-warnings"],
-                label="main",
-            )
+            cmd = [SUMO_BINARY, "-c", SUMO_CONFIG, "--no-step-log", "--no-warnings"]
+            traci.start(cmd, label="main")
             if self.connection_manager is not None:
                 (min_x, min_y), (max_x, max_y) = traci.simulation.getNetBoundary()
                 self.connection_manager.set_boundary(min_x, min_y, max_x, max_y)
