@@ -1,0 +1,8 @@
+services:
+  sumo-service:
+    build:
+      context: ./sumo_service
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
