@@ -47,6 +47,7 @@ class SimulationManager:
         self._lock = threading.Lock()
         self._executor_task: Optional[asyncio.Future] = None
         self._state: dict = {"vehicles": [], "passengers": [], "sim_time": 0.0}
+        self._boundary: dict = {"minX": 0.0, "minY": 0.0, "maxX": 0.0, "maxY": 0.0}
 
     # ------------------------------------------------------------------
     # Public async API (called from FastAPI endpoints)
@@ -82,6 +83,10 @@ class SimulationManager:
         with self._lock:
             return dict(self._state)
 
+    def get_boundary(self) -> dict:
+        with self._lock:
+            return dict(self._boundary)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -108,6 +113,9 @@ class SimulationManager:
                 ["sumo", "-c", SUMO_CONFIG, "--no-step-log", "--no-warnings"],
                 label="main",
             )
+            (min_x, min_y), (max_x, max_y) = traci.simulation.getNetBoundary()
+            with self._lock:
+                self._boundary = {"minX": min_x, "minY": min_y, "maxX": max_x, "maxY": max_y}
             self._add_initial_vehicles()
 
             while not self._stop_event.is_set():
