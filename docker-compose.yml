@@ -6,3 +6,11 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+
+  dispatch-service:
+    build:
+      context: ./dispatch-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - sumo-service
