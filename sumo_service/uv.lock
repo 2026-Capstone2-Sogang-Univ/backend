@@ -420,6 +420,7 @@ source = { editable = "." }
 dependencies = [
     { name = "eclipse-sumo" },
     { name = "fastapi" },
+    { name = "traci" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -433,6 +434,7 @@ dev = [
 requires-dist = [
     { name = "eclipse-sumo", specifier = ">=1.21.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
+    { name = "traci", specifier = ">=1.21.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
 ]
 
@@ -440,6 +442,27 @@ requires-dist = [
 dev = [
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "pytest", specifier = ">=8.0.0" },
+]
+
+[[package]]
+name = "sumolib"
+version = "1.26.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/cf/03/36bbd7b9f6120e39d9e4f6865186ab8195f7b5a3833c37fc8c24df1d23fe/sumolib-1.26.0.tar.gz", hash = "sha256:eedf9cbcea46ac9db6a2a46ee74f85edbf4384de1f6b73bf73550642ba6044c1", size = 138920, upload-time = "2026-01-29T14:54:37.312Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/92/2d/44832bb6dec541d7d0d79ce6cf50f4213dcb862f4a7e192c9828841f7d84/sumolib-1.26.0-py2.py3-none-any.whl", hash = "sha256:189011b50db451b44f0ffa3a49e7cefd6250573f0e239fba540e1883ad910eaf", size = 233486, upload-time = "2026-01-29T14:54:35.577Z" },
+]
+
+[[package]]
+name = "traci"
+version = "1.26.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "sumolib" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/eb/96/5489adb00448f640195aeed9fb9bff38f1fd64ef17e1d021449694cc475d/traci-1.26.0.tar.gz", hash = "sha256:5084ba6d0cdba78f93863d782d89ed02d278e6566cfc684c3bedccd6f29aa8ed", size = 102984, upload-time = "2026-01-29T14:54:25.63Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/99/e1/87ffbb1ad9b1cdd1e3c08633e2b94aa920ca0550f17be8c762ed3a0817d6/traci-1.26.0-py2.py3-none-any.whl", hash = "sha256:15dcd143e58a1b03a24687b6871f398d5ff36611fd8aa6b4f3d4ab45603742c0", size = 138431, upload-time = "2026-01-29T14:54:24.392Z" },
 ]
 
 [[package]]
