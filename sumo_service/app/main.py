@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -10,26 +11,71 @@ from .simulation import SimulationManager
 from .routers import simulation as simulation_router
 from .routers import ws as ws_router
 
+_CLI_KEYS: dict[str, str] = {
+    "s": "start",
+    "p": "pause",
+    "u": "resume",
+    "r": "restart",
+    "e": "end",
+}
+
+
+def _getch() -> str | None:
+    """Read one character from stdin without requiring Enter.
+
+    Returns the character, or None on EOF / error.
+    Falls back to line-buffered readline when stdin is not a TTY
+    (e.g. piped input or test environments).
+    """
+    try:
+        if not sys.stdin.isatty():
+            line = sys.stdin.readline()
+            return line[0] if line else None
+
+        if os.name == "nt":
+            import msvcrt  # Windows
+
+            raw = msvcrt.getch()
+            return raw.decode("utf-8", errors="ignore") if raw else None
+        else:
+            import termios
+            import tty
+
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                return sys.stdin.read(1) or None
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        return None
+
 
 def _cli_loop(loop: asyncio.AbstractEventLoop, sim: SimulationManager) -> None:
-    """Read commands from stdin in a background thread and dispatch to SimulationManager."""
-    print("Console ready. Commands: start | pause | resume | restart", flush=True)
-    for line in sys.stdin:
-        cmd = line.strip().lower()
-        if cmd == "start":
+    """Read single-key commands from stdin and dispatch to SimulationManager."""
+    keys_hint = "  ".join(f"{k}={v}" for k, v in _CLI_KEYS.items())
+    print(f"Console ready. Keys: {keys_hint}", flush=True)
+
+    while True:
+        ch = _getch()
+        if ch is None:
+            break
+
+        if ch == "s":
             asyncio.run_coroutine_threadsafe(sim.start(), loop)
-            print(">> start", flush=True)
-        elif cmd == "pause":
+        elif ch == "p":
             asyncio.run_coroutine_threadsafe(sim.pause(), loop)
-            print(">> pause", flush=True)
-        elif cmd == "resume":
+        elif ch == "u":
             asyncio.run_coroutine_threadsafe(sim.resume(), loop)
-            print(">> resume", flush=True)
-        elif cmd == "restart":
+        elif ch == "r":
             asyncio.run_coroutine_threadsafe(sim.restart(), loop)
-            print(">> restart", flush=True)
+        elif ch == "e":
+            asyncio.run_coroutine_threadsafe(sim.stop(), loop)
         else:
-            print(f"Unknown command: {cmd!r}. Try: start | pause | resume | restart", flush=True)
+            continue
+
+        print(f">> {_CLI_KEYS[ch]}", flush=True)
 
 
 @asynccontextmanager
