@@ -75,28 +75,42 @@
 
 각 서비스는 `pyproject.toml`로 의존성을 관리합니다.
 
-```bash
-# 서비스 디렉토리에서 의존성 설치 (예: dispatch-service)
-cd dispatch-service
-uv sync
+**전체 서비스 의존성 한번에 설치 (Windows):**
 
-# 테스트 실행
-uv run pytest
+```bat
+scripts\sync_all.bat
+```
+
+**특정 서비스만 설치:**
+
+```bat
+uv sync --project sumo_service
+
+:: 테스트 실행
+uv run --project dispatch_service pytest
 ```
 
 ### 전체 시스템 실행
 
+**개발 모드** (기본, volume mount + hot-reload):
 ```bash
 docker compose up
+```
+
+`docker-compose.override.yml`이 자동으로 merge되어 `app/`, `sumo_configs/` 디렉토리를 컨테이너에 직접 마운트합니다. 코드를 수정하면 컨테이너 재빌드 없이 즉시 반영됩니다.
+
+**배포 모드** (이미지 빌드, volume mount 없음):
+```bash
+docker compose -f docker-compose.yml up
 ```
 
 ### 시뮬레이션 제어
 
 **REST API:**
 ```bash
-curl -X POST http://localhost:8000/simulation/start
-curl -X POST http://localhost:8000/simulation/pause
-curl -X POST http://localhost:8000/simulation/restart
+curl -X POST http://localhost:8080/simulation/start
+curl -X POST http://localhost:8080/simulation/pause
+curl -X POST http://localhost:8080/simulation/restart
 ```
 
 **콘솔 (SUMO Service 컨테이너 내):**
@@ -108,7 +122,7 @@ curl -X POST http://localhost:8000/simulation/restart
 
 ## WebSocket 프로토콜
 
-WebSocket 엔드포인트: `ws://localhost:8000/ws`
+WebSocket 엔드포인트: `ws://localhost:8080/ws`
 
 ### 메시지 타입
 
@@ -157,12 +171,15 @@ WebSocket 엔드포인트: `ws://localhost:8000/ws`
 
 ```
 backend/
-├── sumo-service/        # SUMO 시뮬레이션 + FastAPI + WebSocket
-├── prediction-service/  # 딥러닝 추론 스케줄러
-├── dispatch-service/    # 동적 배차 및 인센티브 알고리즘
+├── sumo_service/        # SUMO 시뮬레이션 + FastAPI + WebSocket
+├── prediction_service/  # 딥러닝 추론 스케줄러
+├── dispatch_service/    # 동적 배차 및 인센티브 알고리즘
 ├── proto/               # 공유 gRPC proto 정의
+├── scripts/
+│   └── sync_all.bat     # 전체 서비스 uv sync (Windows)
 ├── docs/
 │   ├── PRD.md
 │   └── project-proposal.md
-└── docker-compose.yml
+├── docker-compose.yml
+└── docker-compose.override.yml  # 개발 모드 (volume mount + hot-reload)
 ```
