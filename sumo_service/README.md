@@ -42,6 +42,7 @@ SUMO_GUI=1 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `u` | resume |
 | `r` | restart |
 | `e` | end |
+| `q` | quit |
 
 ## REST API
 
