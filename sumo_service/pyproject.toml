@@ -26,3 +26,7 @@ dev-dependencies = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+filterwarnings = [
+    # CLI thread reads stdin which pytest captures; the OSError is expected in tests.
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning",
+]

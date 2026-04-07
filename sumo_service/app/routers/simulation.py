@@ -9,7 +9,7 @@ router = APIRouter()
 async def start_simulation(request: Request):
     manager = request.app.state.manager
     if manager.status == SimStatus.RUNNING:
-        raise HTTPException(status_code=400, detail="Simulation is already running")
+        raise HTTPException(status_code=409, detail="Simulation is already running")
     await manager.start()
     return {"status": manager.status}
 
