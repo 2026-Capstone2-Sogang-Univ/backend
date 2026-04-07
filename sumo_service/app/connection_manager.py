@@ -2,7 +2,7 @@
 ConnectionManager: manages active WebSocket connections and broadcasts simulation state.
 
 - On connect: sends `boundary` message once (if simulation has started).
-- Every 100ms (driven by SimulationManager): broadcasts `vehicles` and `passengers` messages.
+- Every ~16.7ms / 60 fps (driven by SimulationManager): broadcasts `vehicles` and `passengers` messages.
 - On simulation finish: broadcasts `finished` and closes all connections.
 """
 

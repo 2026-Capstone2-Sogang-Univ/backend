@@ -4,7 +4,12 @@ SimulationManager: manages the SUMO/TraCI simulation loop in a dedicated thread.
 TraCI is a synchronous (blocking) API. The loop runs in a ThreadPoolExecutor via
 asyncio.run_in_executor() so it never blocks FastAPI's async event loop.
 
-Speed: 1 real second = 60 simulated seconds (1 simulated minute).
+Speed: SIMULATION_SPEED controls how many simulated seconds pass per real second.
+  SIMULATION_SPEED = 60 → 1 real second = 1 simulated minute
+  SIMULATION_SPEED =  2 → 1 real second = 2 simulated seconds (slow/debug)
+Broadcast: driven by simulation steps (no separate timer). One WebSocket message
+  is sent immediately after each traci.simulationStep().
+  Broadcast fps = FRAME_RATE. SUMO step-length = SIMULATION_SPEED / FRAME_RATE.
 Duration: simulation auto-terminates at simulated time 3600s (1 hour).
 """
 
@@ -26,15 +31,21 @@ if TYPE_CHECKING:
     from .connection_manager import ConnectionManager
 
 SUMO_CONFIG = str(
-    Path(__file__).parent.parent / "sumo_configs" / "gangnam" / "LargeGangNamSimulation.sumocfg"
+    Path(__file__).parent.parent
+    / "sumo_configs"
+    / "gangnam"
+    / "LargeGangNamSimulation.sumocfg"
 )
 # Set SUMO_GUI=1 to open the SUMO GUI window (useful for local debugging).
 SUMO_BINARY = "sumo-gui" if os.getenv("SUMO_GUI") == "1" else "sumo"
 
-SIM_DURATION = 3600.0       # simulated seconds (1 hour)
-SPEED_FACTOR = 60.0         # 1 real second = 60 simulated seconds
-STEP_LENGTH = 1.0           # simulated seconds per TraCI step
-REAL_STEP_SLEEP = STEP_LENGTH / SPEED_FACTOR  # ~0.0167 real seconds between steps
+SIM_DURATION = 3600.0  # simulated seconds (1 hour)
+FRAME_RATE = 60.0  # broadcast fps (WebSocket messages per real second)
+SIMULATION_SPEED = 20.0  # simulation speed (simulated seconds per real second)
+STEP_LENGTH = (
+    SIMULATION_SPEED / FRAME_RATE
+)  # simulated seconds per TraCI step (passed to SUMO)
+REAL_STEP_SLEEP = 1.0 / FRAME_RATE  # real seconds between TraCI steps
 
 N_TAXIS = 50
 N_BACKGROUND_CARS = 200
@@ -54,6 +65,8 @@ class SimulationManager:
         self._paused = False
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._state_queue: Optional[asyncio.Queue] = None
         self._executor_task: Optional[asyncio.Future] = None
         self._broadcast_task: Optional[asyncio.Task] = None
         self._state: dict = {"vehicles": [], "passengers": [], "sim_time": 0.0}
@@ -68,9 +81,10 @@ class SimulationManager:
             return
         self._paused = False
         self._stop_event.clear()
+        self._loop = asyncio.get_event_loop()
+        self._state_queue = asyncio.Queue()
         self.status = SimStatus.RUNNING
-        loop = asyncio.get_event_loop()
-        self._executor_task = loop.run_in_executor(None, self._run_loop)
+        self._executor_task = self._loop.run_in_executor(None, self._run_loop)
         self._broadcast_task = asyncio.create_task(self._broadcast_loop())
 
     async def pause(self) -> None:
@@ -104,8 +118,10 @@ class SimulationManager:
 
     async def _shutdown(self) -> None:
         self._stop_event.set()
+        # Unblock the broadcast loop if it's waiting on the queue
+        if self._state_queue is not None:
+            await self._state_queue.put(None)
         if self._broadcast_task is not None:
-            self._broadcast_task.cancel()
             try:
                 await self._broadcast_task
             except (asyncio.CancelledError, Exception):
@@ -128,17 +144,23 @@ class SimulationManager:
     # ------------------------------------------------------------------
 
     async def _broadcast_loop(self) -> None:
+        """Broadcast loop driven by simulation steps via _state_queue.
+
+        _run_loop pushes a state dict after each traci.simulationStep(), or None
+        as a sentinel to signal shutdown / finished.
+        """
         while True:
-            if self._stop_event.is_set():
-                break
-            if self.status == SimStatus.FINISHED:
-                if self.connection_manager is not None:
+            state = await self._state_queue.get()
+            if state is None:
+                # Sentinel: stop signal or simulation finished
+                if (
+                    self.status == SimStatus.FINISHED
+                    and self.connection_manager is not None
+                ):
                     await self.connection_manager.notify_finished()
                 break
-            if self.status == SimStatus.RUNNING and self.connection_manager is not None:
-                state = self.get_state()
+            if self.connection_manager is not None:
                 await self.connection_manager.broadcast_state(state)
-            await asyncio.sleep(0.1)
 
     # ------------------------------------------------------------------
     # Blocking loop — runs in ThreadPoolExecutor
@@ -146,7 +168,15 @@ class SimulationManager:
 
     def _run_loop(self) -> None:
         try:
-            cmd = [SUMO_BINARY, "-c", SUMO_CONFIG, "--no-step-log", "--no-warnings"]
+            cmd = [
+                SUMO_BINARY,
+                "-c",
+                SUMO_CONFIG,
+                "--no-step-log",
+                "--no-warnings",
+                "--step-length",
+                str(STEP_LENGTH),
+            ]
             traci.start(cmd, label="main")
             if self.connection_manager is not None:
                 (min_x, min_y), (max_x, max_y) = traci.simulation.getNetBoundary()
@@ -162,10 +192,15 @@ class SimulationManager:
                 sim_time = traci.simulation.getTime()
 
                 with self._lock:
-                    self._state = self._capture_state(sim_time)
+                    state = self._capture_state(sim_time)
+                    self._state = state
+
+                # Push state immediately after each step; broadcast loop sends it.
+                self._loop.call_soon_threadsafe(self._state_queue.put_nowait, state)
 
                 if sim_time >= SIM_DURATION:
                     self.status = SimStatus.FINISHED
+                    self._loop.call_soon_threadsafe(self._state_queue.put_nowait, None)
                     break
 
                 time.sleep(REAL_STEP_SLEEP)
@@ -258,6 +293,8 @@ class SimulationManager:
             x, y = traci.vehicle.getPosition(veh_id)
             angle = traci.vehicle.getAngle(veh_id)
             state = "empty" if veh_id.startswith("taxi_") else "car"
-            vehicles.append({"id": veh_id, "x": x, "y": y, "angle": angle, "state": state})
+            vehicles.append(
+                {"id": veh_id, "x": x, "y": y, "angle": angle, "state": state}
+            )
 
         return {"vehicles": vehicles, "passengers": [], "sim_time": sim_time}
