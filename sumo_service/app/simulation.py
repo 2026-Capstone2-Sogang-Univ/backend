@@ -182,9 +182,25 @@ class SimulationManager:
             except Exception:
                 pass
 
+    def _get_routable_edges(self) -> list[str]:
+        """Return edges where passenger vehicles are permitted to depart."""
+        routable = []
+        for edge_id in traci.edge.getIDList():
+            if edge_id.startswith(":"):
+                continue
+            num_lanes = traci.edge.getLaneNumber(edge_id)
+            for lane_idx in range(num_lanes):
+                lane_id = f"{edge_id}_{lane_idx}"
+                allowed = traci.lane.getAllowed(lane_id)
+                # Empty allowed list means all vehicle classes are permitted
+                if not allowed or "passenger" in allowed:
+                    routable.append(edge_id)
+                    break
+        return routable
+
     def _add_initial_vehicles(self) -> None:
         """Place 200 background cars and 50 taxis on the network at t=0."""
-        edges = [e for e in traci.edge.getIDList() if not e.startswith(":")]
+        edges = self._get_routable_edges()
 
         # Define a yellow taxi vehicle type based on the default
         traci.vehicletype.copy("DEFAULT_VEHTYPE", "taxi")
@@ -221,16 +237,19 @@ class SimulationManager:
                 departSpeed="max",
             )
 
-    def _random_route(self, edges: list[str], attempts: int = 5) -> list[str]:
+    def _random_route(self, edges: list[str], attempts: int = 10) -> list[str]:
         """Return a routable edge list between two random edges, falling back to one edge."""
         for _ in range(attempts):
             src = random.choice(edges)
             dst = random.choice(edges)
             if src == dst:
                 continue
-            result = traci.simulation.findRoute(src, dst)
-            if result.edges:
-                return list(result.edges)
+            try:
+                result = traci.simulation.findRoute(src, dst)
+                if result.edges:
+                    return list(result.edges)
+            except traci.exceptions.TraCIException:
+                continue
         return [random.choice(edges)]
 
     def _capture_state(self, sim_time: float) -> dict:
