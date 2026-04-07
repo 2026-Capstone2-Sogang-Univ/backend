@@ -57,6 +57,7 @@ class SimulationManager:
         self._executor_task: Optional[asyncio.Future] = None
         self._broadcast_task: Optional[asyncio.Task] = None
         self._state: dict = {"vehicles": [], "passengers": [], "sim_time": 0.0}
+        self._boundary: dict = {"minX": 0.0, "minY": 0.0, "maxX": 0.0, "maxY": 0.0}
 
     # ------------------------------------------------------------------
     # Public async API (called from FastAPI endpoints)
@@ -92,6 +93,10 @@ class SimulationManager:
     def get_state(self) -> dict:
         with self._lock:
             return dict(self._state)
+
+    def get_boundary(self) -> dict:
+        with self._lock:
+            return dict(self._boundary)
 
     # ------------------------------------------------------------------
     # Internal helpers
