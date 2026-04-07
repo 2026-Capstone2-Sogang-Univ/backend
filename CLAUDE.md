@@ -16,7 +16,7 @@ Internal communication between services uses gRPC. External communication with t
 ### Key Design Constraints
 
 - **TraCI is a synchronous (blocking) API.** Inside `sumo-service`, the TraCI loop must run in a separate thread via `asyncio.run_in_executor()` to avoid blocking FastAPI's async event loop.
-- **Simulation speed**: real 1 second = simulated 1 minute (accelerated mode). WebSocket broadcasts every 100ms.
+- **Simulation speed**: real 1 second = simulated 1 minute (accelerated mode). WebSocket broadcasts at 60 fps (`BROADCAST_INTERVAL = 1/60` s in `simulation.py`).
 - **Passenger generation**: sampled from a Poisson distribution using the predicted demand count as λ, once per 5-minute simulated interval.
 - **Dispatch algorithm**: empty taxis are probabilistically rerouted based on incentive level (0.0–1.0); passengers are matched to the nearest available empty taxi by Euclidean distance.
 - **Post-pickup behavior** *(subject to change)*: drop-off destination is a random edge within the road network; the taxi returns to `empty` state immediately upon arrival. Drop-off location is not included in WebSocket messages.
@@ -35,8 +35,8 @@ Internal communication between services uses gRPC. External communication with t
 | Type | Frequency | Description |
 |------|-----------|-------------|
 | `boundary` | Once on connect | Network bounding box coordinates |
-| `vehicles` | Every 100ms | Snapshot of all vehicles (id, x, y, angle, state) |
-| `passengers` | Every 100ms | Full list of waiting passengers (id, x, y) |
+| `vehicles` | Every ~16.7ms (60 fps) | Snapshot of all vehicles (id, x, y, angle, state) |
+| `passengers` | Every ~16.7ms (60 fps) | Full list of waiting passengers (id, x, y) |
 
 Vehicle `state` values: `car` / `empty` / `dispatched` / `occupied`
 
