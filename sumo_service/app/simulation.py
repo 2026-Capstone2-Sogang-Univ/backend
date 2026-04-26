@@ -33,8 +33,8 @@ if TYPE_CHECKING:
 SUMO_CONFIG = str(
     Path(__file__).parent.parent
     / "sumo_configs"
-    / "gangnam"
-    / "LargeGangNamSimulation.sumocfg"
+    / "NY"
+    / "manhattan.sumocfg"
 )
 # Set SUMO_GUI=1 to open the SUMO GUI window (useful for local debugging).
 SUMO_BINARY = "sumo-gui" if os.getenv("SUMO_GUI") == "1" else "sumo"

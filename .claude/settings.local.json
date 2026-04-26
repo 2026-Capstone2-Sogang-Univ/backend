@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import math; print\\(math.poisson\\)\")",
+      "Bash(python3 -c \"import random; print\\(random.expovariate\\(5\\)\\)\")"
+    ]
+  }
+}
