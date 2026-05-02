@@ -58,17 +58,15 @@ async def test_connect_no_boundary_sent_before_simulation():
 
 async def test_connect_sends_boundary_when_available():
     manager = ConnectionManager()
-    manager.set_boundary(100.0, 200.0, 300.0, 400.0)
+    manager.set_boundary(100.0, 200.0, 300.0, 400.0, 40.70, -74.02, 40.73, -73.97)
     ws = make_ws()
     await manager.connect(ws)
     msgs = sent_messages(ws)
     assert len(msgs) == 1
     assert msgs[0] == {
         "type": "boundary",
-        "minX": 100.0,
-        "minY": 200.0,
-        "maxX": 300.0,
-        "maxY": 400.0,
+        "sumo": {"minX": 100.0, "minY": 200.0, "maxX": 300.0, "maxY": 400.0},
+        "geo":  {"minLat": 40.70, "minLng": -74.02, "maxLat": 40.73, "maxLng": -73.97},
     }
 
 
@@ -92,19 +90,17 @@ async def test_disconnect_nonexistent_client_is_safe():
 
 async def test_set_boundary_updates_boundary():
     manager = ConnectionManager()
-    manager.set_boundary(1.0, 2.0, 3.0, 4.0)
+    manager.set_boundary(1.0, 2.0, 3.0, 4.0, 40.70, -74.02, 40.73, -73.97)
     assert manager._boundary == {
         "type": "boundary",
-        "minX": 1.0,
-        "minY": 2.0,
-        "maxX": 3.0,
-        "maxY": 4.0,
+        "sumo": {"minX": 1.0, "minY": 2.0, "maxX": 3.0, "maxY": 4.0},
+        "geo":  {"minLat": 40.70, "minLng": -74.02, "maxLat": 40.73, "maxLng": -73.97},
     }
 
 
 async def test_clear_boundary_removes_boundary():
     manager = ConnectionManager()
-    manager.set_boundary(1.0, 2.0, 3.0, 4.0)
+    manager.set_boundary(1.0, 2.0, 3.0, 4.0, 40.70, -74.02, 40.73, -73.97)
     manager.clear_boundary()
     assert manager._boundary is None
 
@@ -115,7 +111,7 @@ async def test_late_connect_after_boundary_set():
     ws_early = make_ws()
     await manager.connect(ws_early)
 
-    manager.set_boundary(10.0, 20.0, 30.0, 40.0)
+    manager.set_boundary(10.0, 20.0, 30.0, 40.0, 40.70, -74.02, 40.73, -73.97)
 
     ws_late = make_ws()
     await manager.connect(ws_late)
@@ -150,7 +146,11 @@ async def test_broadcast_state_vehicles_payload():
     await manager.connect(ws)
     ws.send_text.reset_mock()
 
-    vehicle = {"id": "taxi_1", "x": 5.0, "y": 6.0, "angle": 45.0, "state": "dispatched"}
+    vehicle = {
+        "id": "taxi_1", "x": 5.0, "y": 6.0,
+        "lat": 40.716, "lng": -74.001,
+        "angle": 45.0, "speed": 5.2, "state": "dispatched",
+    }
     await manager.broadcast_state({"vehicles": [vehicle], "passengers": []})
 
     vehicles_msg = next(m for m in sent_messages(ws) if m["type"] == "vehicles")
@@ -163,7 +163,11 @@ async def test_broadcast_state_passengers_payload():
     await manager.connect(ws)
     ws.send_text.reset_mock()
 
-    passenger = {"id": "p_1", "x": 7.0, "y": 8.0}
+    passenger = {
+        "id": "p_1", "x": 7.0, "y": 8.0,
+        "lat": 40.715, "lng": -74.002,
+        "expected_fare": 5900, "expected_distance_m": 2100.5,
+    }
     await manager.broadcast_state({"vehicles": [], "passengers": [passenger]})
 
     passengers_msg = next(m for m in sent_messages(ws) if m["type"] == "passengers")

@@ -176,3 +176,6 @@ pyrightconfig.json
 # End of https://www.toptal.com/developers/gitignore/api/python
 
 .temp
+
+# 전처리 결과물 (scripts/preprocess_trips.py로 재생성 가능)
+sumo_service/sumo_configs/NY/trips_processed.json

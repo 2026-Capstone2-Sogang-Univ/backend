@@ -5,6 +5,7 @@ services:
       - ./sumo_service/sumo_configs:/app/sumo_configs
     environment:
       - WATCHFILES_FORCE_POLLING=true
+      - PASSENGER_SOURCE=random
     command:
       [
         "uv", "run", "uvicorn", "app.main:app",

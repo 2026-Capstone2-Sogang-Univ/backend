@@ -1,0 +1,171 @@
+"""
+Tests for passenger spawning logic in SimulationManager.
+
+TraCI is fully mocked — no SUMO required.
+PASSENGER_SOURCE is patched to "random" unless stated otherwise.
+"""
+
+import sys
+import types
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Minimal TraCI stub so simulation.py can be imported without SUMO installed
+# ---------------------------------------------------------------------------
+
+def _make_traci_stub():
+    traci_mod = types.ModuleType("traci")
+    for sub in ("simulation", "vehicle", "lane", "edge", "route", "vehicletype"):
+        setattr(traci_mod, sub, MagicMock())
+    traci_mod.exceptions = types.ModuleType("traci.exceptions")
+    traci_mod.exceptions.TraCIException = Exception
+    traci_mod.exceptions.FatalTraCIError = Exception
+    traci_mod.constants = types.ModuleType("traci.constants")
+    for attr in ("VAR_POSITION", "VAR_ANGLE", "VAR_SPEED", "VAR_DISTANCE", "VAR_ROAD_ID"):
+        setattr(traci_mod.constants, attr, attr)
+    sys.modules["traci"] = traci_mod
+    sys.modules["traci.exceptions"] = traci_mod.exceptions
+    sys.modules["traci.constants"] = traci_mod.constants
+    return traci_mod
+
+
+_traci_stub = _make_traci_stub()
+
+from app.simulation import SimulationManager, _poisson_sample  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+EDGES = [f"edge_{i}" for i in range(10)]
+
+RouteResult = MagicMock
+_ROUTE = MagicMock(edges=["edge_0", "edge_1"], length=2000.0)
+_SHAPE = [(100.0, 200.0), (110.0, 210.0), (120.0, 220.0)]
+
+
+def make_manager() -> SimulationManager:
+    mgr = SimulationManager()
+    mgr._routable_edges = EDGES
+    mgr._latlng = lambda x, y: (40.7 + y * 1e-5, -74.0 + x * 1e-5)
+    return mgr
+
+
+# ---------------------------------------------------------------------------
+# random 모드 — 5분 경계 확인
+# ---------------------------------------------------------------------------
+
+def test_no_spawn_within_same_interval():
+    # int(299/300)=0 — interval 0 이미 처리됐으면 299초에 재스폰 없음
+    mgr = make_manager()
+    mgr._last_spawn_interval = 0
+    with patch("app.simulation.PASSENGER_SOURCE", "random"), \
+         patch("app.simulation._poisson_sample", return_value=3):
+        mgr._spawn_passengers(299.0)
+    assert len(mgr._passengers) == 0
+
+
+def test_spawn_at_first_interval_boundary():
+    mgr = make_manager()
+    _traci_stub.simulation.findRoute.return_value = _ROUTE
+    _traci_stub.lane.getShape.return_value = _SHAPE
+    edges_cycle = ["edge_0", "edge_1"] * 10
+    with patch("app.simulation.PASSENGER_SOURCE", "random"), \
+         patch("app.simulation._poisson_sample", return_value=3), \
+         patch("app.simulation._random.choice", side_effect=edges_cycle):
+        mgr._spawn_passengers(300.0)
+    assert len(mgr._passengers) == 3
+
+
+def test_no_double_spawn_same_interval():
+    mgr = make_manager()
+    _traci_stub.simulation.findRoute.return_value = _ROUTE
+    _traci_stub.lane.getShape.return_value = _SHAPE
+    edges_cycle = ["edge_0", "edge_1"] * 10
+    with patch("app.simulation.PASSENGER_SOURCE", "random"), \
+         patch("app.simulation._poisson_sample", return_value=2), \
+         patch("app.simulation._random.choice", side_effect=edges_cycle):
+        mgr._spawn_passengers(300.0)
+        mgr._spawn_passengers(350.0)
+    assert len(mgr._passengers) == 2
+
+
+def test_zero_poisson_spawns_nothing():
+    mgr = make_manager()
+    with patch("app.simulation.PASSENGER_SOURCE", "random"), \
+         patch("app.simulation._poisson_sample", return_value=0):
+        mgr._spawn_passengers(300.0)
+    assert len(mgr._passengers) == 0
+
+
+def test_passenger_counter_increments():
+    mgr = make_manager()
+    _traci_stub.simulation.findRoute.return_value = _ROUTE
+    _traci_stub.lane.getShape.return_value = _SHAPE
+    # edge_0/edge_1 교대로 반환 → 항상 서로 다른 엣지
+    edges_cycle = ["edge_0", "edge_1"] * 10
+    with patch("app.simulation.PASSENGER_SOURCE", "random"), \
+         patch("app.simulation._poisson_sample", return_value=3), \
+         patch("app.simulation._random.choice", side_effect=edges_cycle):
+        mgr._spawn_passengers(300.0)
+    ids = list(mgr._passengers.keys())
+    assert ids == ["p_0", "p_1", "p_2"]
+
+
+def test_passenger_state_is_waiting():
+    mgr = make_manager()
+    _traci_stub.simulation.findRoute.return_value = _ROUTE
+    _traci_stub.lane.getShape.return_value = _SHAPE
+    with patch("app.simulation.PASSENGER_SOURCE", "random"), \
+         patch("app.simulation._poisson_sample", return_value=1), \
+         patch("app.simulation._random.choice", side_effect=["edge_0", "edge_1"]):
+        mgr._spawn_passengers(300.0)
+    p = list(mgr._passengers.values())[0]
+    assert p.state == "waiting"
+    assert p.h3_pickup is not None
+
+
+def test_findroute_failure_skips_passenger():
+    mgr = make_manager()
+    _traci_stub.simulation.findRoute.return_value = MagicMock(edges=[], length=0.0)
+    with patch("app.simulation.PASSENGER_SOURCE", "random"), \
+         patch("app.simulation._poisson_sample", return_value=3):
+        mgr._spawn_passengers(300.0)
+    assert len(mgr._passengers) == 0
+
+
+# ---------------------------------------------------------------------------
+# parquet 모드 — _trip_queue 기반 스폰
+# ---------------------------------------------------------------------------
+
+def _make_trip(sim_time: float) -> dict:
+    return {
+        "sim_time": sim_time,
+        "pickup_edge": "edge_0",
+        "dropoff_edge": "edge_1",
+        "h3_pickup": "892830828cbffff",
+    }
+
+
+def test_parquet_spawn_when_time_reached():
+    mgr = make_manager()
+    mgr._trip_queue = [_make_trip(50.0), _make_trip(120.0)]
+    _traci_stub.simulation.findRoute.return_value = _ROUTE
+    _traci_stub.lane.getShape.return_value = _SHAPE
+    with patch("app.simulation.PASSENGER_SOURCE", "parquet"):
+        mgr._spawn_passengers(100.0)
+    assert len(mgr._passengers) == 1
+    assert mgr._trip_queue[0]["sim_time"] == 120.0
+
+
+def test_parquet_no_spawn_before_time():
+    mgr = make_manager()
+    mgr._trip_queue = [_make_trip(200.0)]
+    with patch("app.simulation.PASSENGER_SOURCE", "parquet"):
+        mgr._spawn_passengers(100.0)
+    assert len(mgr._passengers) == 0
+    assert len(mgr._trip_queue) == 1

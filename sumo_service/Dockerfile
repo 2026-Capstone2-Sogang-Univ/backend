@@ -1,11 +1,7 @@
 FROM ghcr.io/eclipse-sumo/sumo:main
 
-# Install Python 3.11 from deadsnakes PPA on Ubuntu 22.04 Jammy.
-# The official SUMO image ships Python 3.10; we need 3.11 to match pyproject.toml.
+# python3.11 is available in Ubuntu 22.04 universe repo — no PPA needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa \
-    && apt-get update && apt-get install -y --no-install-recommends \
     python3.11 \
     python3.11-dev \
     python3.11-venv \
@@ -25,6 +21,10 @@ COPY app/ ./app/
 COPY sumo_configs/ ./sumo_configs/
 RUN python3.11 -m uv sync --frozen --no-dev
 
+# Use the Python package's SUMO binary (ships with all required shared libs).
+ENV SUMO_HOME=/app/.venv/lib/python3.11/site-packages/sumo
+ENV PATH="/app/.venv/bin:${PATH}"
+
 EXPOSE 8080
 
-CMD ["python3.11", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["/app/.venv/bin/python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]

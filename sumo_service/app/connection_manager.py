@@ -10,19 +10,23 @@ import json
 
 from fastapi import WebSocket
 
+from .grid import H3_RESOLUTION
+
 
 class ConnectionManager:
     def __init__(self) -> None:
         self._connections: set[WebSocket] = set()
         self._boundary: dict | None = None
 
-    def set_boundary(self, min_x: float, min_y: float, max_x: float, max_y: float) -> None:
+    def set_boundary(
+        self,
+        min_x: float, min_y: float, max_x: float, max_y: float,
+        min_lat: float, min_lng: float, max_lat: float, max_lng: float,
+    ) -> None:
         self._boundary = {
             "type": "boundary",
-            "minX": min_x,
-            "minY": min_y,
-            "maxX": max_x,
-            "maxY": max_y,
+            "sumo": {"minX": min_x, "minY": min_y, "maxX": max_x, "maxY": max_y},
+            "geo":  {"minLat": min_lat, "minLng": min_lng, "maxLat": max_lat, "maxLng": max_lng},
         }
 
     def clear_boundary(self) -> None:
@@ -40,6 +44,33 @@ class ConnectionManager:
     async def broadcast_state(self, state: dict) -> None:
         await self._broadcast({"type": "vehicles", "vehicles": state["vehicles"]})
         await self._broadcast({"type": "passengers", "passengers": state["passengers"]})
+
+    async def broadcast_surge(self, cells: list[dict], sim_time: float) -> None:
+        await self._broadcast({
+            "type": "surge",
+            "h3_resolution": H3_RESOLUTION,
+            "cells": cells,
+            "sim_time": sim_time,
+        })
+
+    async def broadcast_fare_update(
+        self,
+        passenger_id: str,
+        taxi_id: str,
+        fare: int,
+        expected_fare: int,
+        distance_m: float,
+        sim_time: float,
+    ) -> None:
+        await self._broadcast({
+            "type": "fare_update",
+            "passenger_id": passenger_id,
+            "taxi_id": taxi_id,
+            "fare": fare,
+            "expected_fare": expected_fare,
+            "distance_m": distance_m,
+            "sim_time": sim_time,
+        })
 
     async def notify_finished(self) -> None:
         await self._broadcast({"type": "finished"})

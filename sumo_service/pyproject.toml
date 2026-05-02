@@ -8,6 +8,7 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "eclipse-sumo>=1.21.0",
     "traci>=1.21.0",
+    "h3>=4.0.0",
 ]
 
 [build-system]
