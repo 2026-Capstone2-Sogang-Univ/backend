@@ -151,8 +151,7 @@ uv run uvicorn app.main:app --reload --port 8080
 | 타입 | 전송 빈도 | 설명 |
 |------|----------|------|
 | `boundary` | 연결당 1회 | SUMO 내부 좌표 + WGS84 지리 경계 |
-| `vehicles` | 60 fps | 전체 차량 스냅샷 (좌표, 방향, 속도, 상태) |
-| `passengers` | 60 fps | 대기/배차 승객 목록 (예상 요금 포함) |
+| `snapshot` | 60 fps | 차량 전체 + 대기/배차 승객 목록 (단일 메시지) |
 | `surge` | 5 시뮬 초마다 | H3 셀별 공급·수요·서지 계수 |
 | `fare_update` | 하차 시 1회 | 실제 요금 및 이동 거리 기록 |
 | `finished` | 시뮬 종료 시 1회 | 시뮬레이션 3,600초 도달 알림 |
@@ -179,24 +178,19 @@ uv run uvicorn app.main:app --reload --port 8080
 }
 ```
 
-### vehicles
+### snapshot
 
-매 스텝(60 fps) 전송. 택시 50대와 배경 차량 200대 전체를 포함합니다.
+매 스텝(60 fps) 전송. 차량과 승객을 하나의 메시지로 묶어 전송합니다.
 
 ```json
 {
-  "type": "vehicles",
+  "type": "snapshot",
+  "sim_time": 300.0,
   "vehicles": [
-    {
-      "id": "taxi_0",
-      "x": 964.3,
-      "y": 951.1,
-      "lat": 40.716,
-      "lng": -74.001,
-      "angle": 90.0,
-      "speed": 5.2,
-      "state": "empty"
-    }
+    {"id": "taxi_0", "lat": 40.716, "lng": -74.001, "angle": 90.0, "speed": 5.2, "state": "empty"}
+  ],
+  "passengers": [
+    {"id": "p_0", "lat": 40.715, "lng": -74.002, "expected_fare": 5900, "expected_distance_m": 2100.5}
   ]
 }
 ```
@@ -208,27 +202,7 @@ uv run uvicorn app.main:app --reload --port 8080
 | `dispatched` | 택시 | 승객 픽업 이동 중 |
 | `occupied` | 택시 | 승객 탑승, 목적지 이동 중 |
 
-### passengers
-
-매 스텝(60 fps) 전송. `waiting`(대기) 및 `assigned`(배차됨) 상태 승객만 포함합니다.
-택시에 탑승한 승객은 목록에서 제거됩니다.
-
-```json
-{
-  "type": "passengers",
-  "passengers": [
-    {
-      "id": "p_0",
-      "x": 970.1,
-      "y": 940.5,
-      "lat": 40.715,
-      "lng": -74.002,
-      "expected_fare": 5900,
-      "expected_distance_m": 2100.5
-    }
-  ]
-}
-```
+`passengers`는 대기(`waiting`) 및 배차됨(`assigned`) 상태만 포함합니다. 탑승 후 목록에서 제거됩니다.
 
 ### surge
 
@@ -244,11 +218,7 @@ uv run uvicorn app.main:app --reload --port 8080
       "supply": 4,
       "demand": 2,
       "surge": 0.63,
-      "center": {"lat": 40.7128, "lng": -74.006},
-      "boundary": [
-        [40.713, -74.007], [40.712, -74.005], [40.711, -74.004],
-        [40.710, -74.005], [40.711, -74.008], [40.712, -74.009]
-      ]
+      "center": {"lat": 40.7128, "lng": -74.006}
     }
   ],
   "sim_time": 300.0

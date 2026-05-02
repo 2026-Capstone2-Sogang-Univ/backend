@@ -2,7 +2,7 @@
 ConnectionManager: manages active WebSocket connections and broadcasts simulation state.
 
 - On connect: sends `boundary` message once (if simulation has started).
-- Every ~16.7ms / 60 fps (driven by SimulationManager): broadcasts `vehicles` and `passengers` messages.
+- Every ~16.7ms / 60 fps (driven by SimulationManager): broadcasts a single `snapshot` message.
 - On simulation finish: broadcasts `finished` and closes all connections.
 """
 
@@ -42,8 +42,12 @@ class ConnectionManager:
         self._connections.discard(ws)
 
     async def broadcast_state(self, state: dict) -> None:
-        await self._broadcast({"type": "vehicles", "vehicles": state["vehicles"]})
-        await self._broadcast({"type": "passengers", "passengers": state["passengers"]})
+        await self._broadcast({
+            "type": "snapshot",
+            "vehicles": state["vehicles"],
+            "passengers": state["passengers"],
+            "sim_time": state["sim_time"],
+        })
 
     async def broadcast_surge(self, cells: list[dict], sim_time: float) -> None:
         await self._broadcast({

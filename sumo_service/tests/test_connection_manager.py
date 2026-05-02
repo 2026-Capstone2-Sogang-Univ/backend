@@ -123,21 +123,22 @@ async def test_late_connect_after_boundary_set():
 # broadcast_state
 # ---------------------------------------------------------------------------
 
-async def test_broadcast_state_sends_vehicles_and_passengers():
+async def test_broadcast_state_sends_snapshot():
     manager = ConnectionManager()
     ws = make_ws()
     await manager.connect(ws)
     ws.send_text.reset_mock()
 
     state = {
-        "vehicles": [{"id": "taxi_0", "x": 1.0, "y": 2.0, "angle": 90.0, "state": "empty"}],
-        "passengers": [{"id": "p_0", "x": 3.0, "y": 4.0}],
+        "vehicles": [{"id": "taxi_0", "lat": 40.716, "lng": -74.001, "angle": 90.0, "state": "empty"}],
+        "passengers": [{"id": "p_0", "lat": 40.715, "lng": -74.002}],
+        "sim_time": 300.0,
     }
     await manager.broadcast_state(state)
 
     msgs = sent_messages(ws)
-    types = {m["type"] for m in msgs}
-    assert types == {"vehicles", "passengers"}
+    assert len(msgs) == 1
+    assert msgs[0]["type"] == "snapshot"
 
 
 async def test_broadcast_state_vehicles_payload():
@@ -147,14 +148,15 @@ async def test_broadcast_state_vehicles_payload():
     ws.send_text.reset_mock()
 
     vehicle = {
-        "id": "taxi_1", "x": 5.0, "y": 6.0,
+        "id": "taxi_1",
         "lat": 40.716, "lng": -74.001,
         "angle": 45.0, "speed": 5.2, "state": "dispatched",
     }
-    await manager.broadcast_state({"vehicles": [vehicle], "passengers": []})
+    await manager.broadcast_state({"vehicles": [vehicle], "passengers": [], "sim_time": 0.0})
 
-    vehicles_msg = next(m for m in sent_messages(ws) if m["type"] == "vehicles")
-    assert vehicles_msg["vehicles"] == [vehicle]
+    snapshot = sent_messages(ws)[0]
+    assert snapshot["type"] == "snapshot"
+    assert snapshot["vehicles"] == [vehicle]
 
 
 async def test_broadcast_state_passengers_payload():
@@ -164,14 +166,15 @@ async def test_broadcast_state_passengers_payload():
     ws.send_text.reset_mock()
 
     passenger = {
-        "id": "p_1", "x": 7.0, "y": 8.0,
+        "id": "p_1",
         "lat": 40.715, "lng": -74.002,
         "expected_fare": 5900, "expected_distance_m": 2100.5,
     }
-    await manager.broadcast_state({"vehicles": [], "passengers": [passenger]})
+    await manager.broadcast_state({"vehicles": [], "passengers": [passenger], "sim_time": 0.0})
 
-    passengers_msg = next(m for m in sent_messages(ws) if m["type"] == "passengers")
-    assert passengers_msg["passengers"] == [passenger]
+    snapshot = sent_messages(ws)[0]
+    assert snapshot["type"] == "snapshot"
+    assert snapshot["passengers"] == [passenger]
 
 
 async def test_broadcast_state_reaches_all_clients():
@@ -182,10 +185,10 @@ async def test_broadcast_state_reaches_all_clients():
     ws1.send_text.reset_mock()
     ws2.send_text.reset_mock()
 
-    await manager.broadcast_state({"vehicles": [], "passengers": []})
+    await manager.broadcast_state({"vehicles": [], "passengers": [], "sim_time": 0.0})
 
-    assert ws1.send_text.call_count == 2  # vehicles + passengers
-    assert ws2.send_text.call_count == 2
+    assert ws1.send_text.call_count == 1  # single snapshot message
+    assert ws2.send_text.call_count == 1
 
 
 async def test_broadcast_state_empty_lists():
@@ -195,13 +198,13 @@ async def test_broadcast_state_empty_lists():
     await manager.connect(ws)
     ws.send_text.reset_mock()
 
-    await manager.broadcast_state({"vehicles": [], "passengers": []})
+    await manager.broadcast_state({"vehicles": [], "passengers": [], "sim_time": 0.0})
 
     msgs = sent_messages(ws)
-    vehicles_msg = next(m for m in msgs if m["type"] == "vehicles")
-    passengers_msg = next(m for m in msgs if m["type"] == "passengers")
-    assert vehicles_msg["vehicles"] == []
-    assert passengers_msg["passengers"] == []
+    assert len(msgs) == 1
+    assert msgs[0]["type"] == "snapshot"
+    assert msgs[0]["vehicles"] == []
+    assert msgs[0]["passengers"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +272,7 @@ async def test_dead_connection_removed_on_broadcast():
     await manager.connect(ws_dead)
     ws_alive.send_text.reset_mock()
 
-    await manager.broadcast_state({"vehicles": [], "passengers": []})
+    await manager.broadcast_state({"vehicles": [], "passengers": [], "sim_time": 0.0})
 
     assert ws_dead not in manager._connections
     assert ws_alive in manager._connections

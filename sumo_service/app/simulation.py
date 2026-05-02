@@ -34,7 +34,7 @@ from traci import constants as tc
 
 from .coord import make_affine_converter, sumo_to_latlng
 from .fare import SPEED_THRESHOLD_MPS, TripAccumulator, calculate_fare, estimate_fare
-from .grid import H3_RESOLUTION, cell_boundary, cell_center_latlng, compute_surge, get_cell
+from .grid import H3_RESOLUTION, cell_center_latlng, compute_surge, get_cell
 from .passenger import Passenger
 
 if TYPE_CHECKING:
@@ -299,7 +299,7 @@ class SimulationManager:
                 fare_updates += self._accumulate_fares(sim_time, sub_results)
 
                 with self._lock:
-                    state = self._capture_state(sim_time, sub_results)
+                    state, grid_supply, grid_demand = self._capture_state(sim_time, sub_results)
                     self._state = state
                     state["fare_updates"] = fare_updates
                     for fu in fare_updates:
@@ -309,6 +309,7 @@ class SimulationManager:
                     surge_interval = int(sim_time / 5.0)
                     if surge_interval > self._last_surge_interval:
                         self._last_surge_interval = surge_interval
+                        self._build_surge_cells(grid_supply, grid_demand)
                         state["surge"] = self._surge_cells
                     else:
                         state["surge"] = None
@@ -656,7 +657,13 @@ class SimulationManager:
                 continue
         return [_random.choice(edges)]
 
-    def _capture_state(self, sim_time: float, sub_results: dict) -> dict:
+    def _capture_state(
+        self, sim_time: float, sub_results: dict
+    ) -> tuple[dict, dict[str, int], dict[str, int]]:
+        """Return (state, grid_supply, grid_demand).
+
+        Surge computation is intentionally excluded — caller decides when to run it.
+        """
         grid_supply: dict[str, int] = defaultdict(int)
         grid_demand: dict[str, int] = defaultdict(int)
 
@@ -669,7 +676,7 @@ class SimulationManager:
             state = self._taxi_states.get(veh_id, "empty") if veh_id.startswith("taxi_") else "car"
             if state == "empty":
                 grid_supply[get_cell(lat, lng)] += 1
-            vehicles.append({"id": veh_id, "x": x, "y": y, "lat": lat, "lng": lng,
+            vehicles.append({"id": veh_id, "lat": lat, "lng": lng,
                              "angle": angle, "speed": speed, "state": state})
 
         passengers_list = []
@@ -677,11 +684,16 @@ class SimulationManager:
             if p.state in ("waiting", "assigned"):
                 if p.h3_pickup:
                     grid_demand[p.h3_pickup] += 1
-                passengers_list.append({"id": p.id, "x": p.x, "y": p.y,
-                                         "lat": p.lat, "lng": p.lng,
+                passengers_list.append({"id": p.id, "lat": p.lat, "lng": p.lng,
                                          "expected_fare": p.expected_fare,
                                          "expected_distance_m": p.expected_distance_m})
 
+        state_dict = {"vehicles": vehicles, "passengers": passengers_list, "sim_time": sim_time}
+        return state_dict, grid_supply, grid_demand
+
+    def _build_surge_cells(
+        self, grid_supply: dict[str, int], grid_demand: dict[str, int]
+    ) -> None:
         surge_cells = []
         for cell in set(grid_supply) | set(grid_demand):
             lat_c, lng_c = cell_center_latlng(cell)
@@ -691,8 +703,5 @@ class SimulationManager:
                 "demand": grid_demand.get(cell, 0),
                 "surge": compute_surge(grid_supply.get(cell, 0), grid_demand.get(cell, 0)),
                 "center": {"lat": lat_c, "lng": lng_c},
-                "boundary": [list(v) for v in cell_boundary(cell)],
             })
         self._surge_cells = surge_cells
-
-        return {"vehicles": vehicles, "passengers": passengers_list, "sim_time": sim_time}
