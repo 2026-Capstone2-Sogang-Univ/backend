@@ -179,3 +179,6 @@ pyrightconfig.json
 
 # 전처리 결과물 (scripts/preprocess_trips.py로 재생성 가능)
 sumo_service/sumo_configs/NY/trips_processed.json
+
+# 원시 택시 데이터 (대용량, 로컬에서만 보관)
+real_taxi_data/

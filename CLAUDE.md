@@ -16,10 +16,10 @@ Internal communication between services uses gRPC. External communication with t
 ### Key Design Constraints
 
 - **TraCI is a synchronous (blocking) API.** Inside `sumo-service`, the TraCI loop must run in a separate thread via `asyncio.run_in_executor()` to avoid blocking FastAPI's async event loop.
-- **Simulation speed**: real 1 second = simulated 1 minute (accelerated mode). WebSocket broadcasts at 60 fps (`BROADCAST_INTERVAL = 1/60` s in `simulation.py`).
-- **Passenger generation**: sampled from a Poisson distribution using the predicted demand count as λ, once per 5-minute simulated interval.
-- **Dispatch algorithm**: empty taxis are probabilistically rerouted based on incentive level (0.0–1.0); passengers are matched to the nearest available empty taxi by Euclidean distance.
-- **Post-pickup behavior** *(subject to change)*: drop-off destination is a random edge within the road network; the taxi returns to `empty` state immediately upon arrival. Drop-off location is not included in WebSocket messages.
+- **Simulation speed**: real 1 second = simulated 1 minute (accelerated mode). WebSocket broadcasts at 60 fps (`FRAME_RATE = 60` in `simulation.py`).
+- **Passenger generation**: dual-mode — `PASSENGER_SOURCE=random` uses Poisson(λ=5) every 5 simulated minutes; `PASSENGER_SOURCE=parquet` replays preprocessed NYC taxi trip data from `sumo_configs/NY/trips_processed.json`.
+- **Dispatch algorithm**: empty taxis are matched to the nearest waiting passenger by Euclidean distance; dispatched taxi retargets to pickup edge via `traci.vehicle.changeTarget`.
+- **Fare model**: Seoul taxi pricing — base ₩4,800 for 1.6 km, then ₩100 per 131 m distance and ₩100 per 30 s at low speed (<3 m/s).
 
 ### gRPC Communication Flow
 
@@ -30,58 +30,68 @@ Internal communication between services uses gRPC. External communication with t
 [SUMO Service] --(current simulation time)--> [Prediction Service]
 ```
 
+> gRPC is planned but not yet implemented. Proto contracts are pending ML model I/O spec confirmation.
+
 ### WebSocket Message Types (SUMO Service → Unity)
 
 | Type | Frequency | Description |
 |------|-----------|-------------|
-| `boundary` | Once on connect | Network bounding box coordinates |
-| `vehicles` | Every ~16.7ms (60 fps) | Snapshot of all vehicles (id, x, y, angle, state) |
-| `passengers` | Every ~16.7ms (60 fps) | Full list of waiting passengers (id, x, y) |
+| `boundary` | Once on connect | Network bounding box — `sumo` (minX/Y/maxX/Y) and `geo` (minLat/Lng/maxLat/Lng) |
+| `snapshot` | Every ~16.7ms (60 fps) | `vehicles` list (id, x, y, lat, lng, angle, speed, state) + `passengers` list (id, lat, lng, expected_fare, expected_distance_m, state) + `sim_time` |
+| `surge` | Every 5 sim seconds | H3 grid cells with supply, demand, surge coefficient |
+| `fare_update` | On trip completion | passenger_id, taxi_id, fare, expected_fare, distance_m, sim_time |
+| `finished` | Once at sim end | Simulation complete notification |
 
-Vehicle `state` values: `car` / `empty` / `dispatched` / `occupied`
+Vehicle `state` values: `car` / `empty` / `dispatched` / `occupied`  
+Passenger `state` values: `waiting` / `assigned`
 
 ## Development Commands
-
-> The project is in its initial stage. Commands below will be refined as service directories are created.
 
 ### Run the full system
 
 ```bash
-docker compose up
+cd back
+docker compose up --build
 ```
 
-### Local development setup
-
-Each service manages its own dependencies via `pyproject.toml` and `uv.lock`.
+### Local development (sumo-service)
 
 ```bash
-# Install dependencies for a service (e.g., dispatch-service)
-cd dispatch-service
-uv sync
+cd back/sumo_service
+uv sync --group dev
 
-# Install with dev dependencies
-uv sync --dev
+# Run tests (no SUMO/Docker required)
+uv run pytest -v
+
+# Run a specific test file
+uv run pytest tests/test_fare.py -v
 ```
 
 ### Simulation control (REST API)
 
 ```bash
-curl -X POST http://localhost:8000/simulation/start
-curl -X POST http://localhost:8000/simulation/pause
-curl -X POST http://localhost:8000/simulation/restart
+curl -X POST http://localhost:8080/simulation/start
+curl -X POST http://localhost:8080/simulation/pause
+curl -X POST http://localhost:8080/simulation/resume
+curl -X POST http://localhost:8080/simulation/restart
+curl      http://localhost:8080/simulation/status
+curl      http://localhost:8080/simulation/surge
+curl      http://localhost:8080/simulation/passengers
+curl      http://localhost:8080/simulation/fare/{passenger_id}
 ```
 
-### Run tests
-
-Tests are focused on `dispatch-service` (no external dependencies required):
+### Preprocess NYC taxi data (parquet mode only)
 
 ```bash
-# from dispatch-service directory
-uv run pytest
-# run a single test
-uv run pytest tests/test_dispatch.py::test_nearest_taxi_assignment
+python scripts/preprocess_trips.py \
+  --input  real_taxi_data/od_month=07/consolidated.parquet \
+  --net    back/sumo_service/sumo_configs/NY/manhattan_car_only.net.xml \
+  --output back/sumo_service/sumo_configs/NY/trips_processed.json \
+  --date   2024-01-15 --hour 8 --sample 5000
 ```
 
 ## Open Issues
 
-- **Prediction Service model I/O spec**: gRPC proto interface cannot be finalized until the ML model team confirms the model's input/output contract. This is the critical path for the full pipeline.
+- **gRPC proto contracts**: cannot be finalized until the ML model team confirms the Prediction Service input/output spec. This is the critical path for the full pipeline.
+- **Prediction Service**: not yet implemented.
+- **Dispatch Service**: not yet implemented (depends on Prediction Service gRPC contract).
