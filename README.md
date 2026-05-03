@@ -2,7 +2,7 @@
 
 뉴욕 맨해튼 실제 도로 네트워크 위에서 택시·승객·일반 차량의 이동을 시뮬레이션하고,
 딥러닝 기반 수요 예측을 실시간으로 반영하여 동적 배차를 수행하는 백엔드 시스템입니다.
-시뮬레이션 결과는 WebSocket을 통해 Unity 기반 3D Digital Twin 프론트엔드에 스트리밍됩니다.
+시뮬레이션 결과는 WebSocket을 통해 웹 기반 Digital Twin 프론트엔드에 스트리밍됩니다.
 
 ---
 
@@ -12,7 +12,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                       Unity (Digital Twin)                       │
+│                    Web Frontend (Digital Twin)                   │
 │                         WebSocket Client                         │
 └──────────────────────────────┬──────────────────────────────────┘
                                │ WebSocket
@@ -114,7 +114,7 @@ s=start  p=pause  u=resume  r=restart  e=end
 cd Back/sumo_service
 
 # 의존성 설치 (개발 도구 포함)
-uv sync --dev
+uv sync --group dev
 
 # 단위 테스트 실행
 uv run pytest -v
@@ -143,8 +143,6 @@ uv run uvicorn app.main:app --reload --port 8080
 ## WebSocket 프로토콜
 
 **엔드포인트:** `ws://localhost:8080/ws`
-
-상세 스키마는 [`../websocket-messages.md`](../websocket-messages.md)를 참고하세요.
 
 ### 메시지 타입 요약
 

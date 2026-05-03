@@ -11,7 +11,7 @@ Three independent microservices:
 - **`dispatch-service/`** — Supply-demand imbalance calculation, incentive algorithm, nearest-taxi assignment + gRPC client/server
 - **`proto/`** — Shared gRPC `.proto` definitions used by all three services
 
-Internal communication between services uses gRPC. External communication with the Unity frontend uses WebSocket. The SUMO Service is the single source of truth for simulation time.
+Internal communication between services uses gRPC. External communication with the web frontend uses WebSocket. The SUMO Service is the single source of truth for simulation time.
 
 ### Key Design Constraints
 
@@ -32,12 +32,12 @@ Internal communication between services uses gRPC. External communication with t
 
 > gRPC is planned but not yet implemented. Proto contracts are pending ML model I/O spec confirmation.
 
-### WebSocket Message Types (SUMO Service → Unity)
+### WebSocket Message Types (SUMO Service → Web Frontend)
 
 | Type | Frequency | Description |
 |------|-----------|-------------|
 | `boundary` | Once on connect | Network bounding box — `sumo` (minX/Y/maxX/Y) and `geo` (minLat/Lng/maxLat/Lng) |
-| `snapshot` | Every ~16.7ms (60 fps) | `vehicles` list (id, x, y, lat, lng, angle, speed, state) + `passengers` list (id, lat, lng, expected_fare, expected_distance_m, state) + `sim_time` |
+| `snapshot` | Every ~16.7ms (60 fps) | `vehicles` list (id, lat, lng, angle, speed, state) + `passengers` list (id, lat, lng, expected_fare, expected_distance_m) + `sim_time` |
 | `surge` | Every 5 sim seconds | H3 grid cells with supply, demand, surge coefficient |
 | `fare_update` | On trip completion | passenger_id, taxi_id, fare, expected_fare, distance_m, sim_time |
 | `finished` | Once at sim end | Simulation complete notification |

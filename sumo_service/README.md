@@ -62,7 +62,7 @@ curl      http://localhost:8000/simulation/status
 
 ## WebSocket
 
-`ws://localhost:8000/ws` 로 연결하면 Unity 프론트엔드로 브로드캐스트되는 메시지를 수신합니다.
+`ws://localhost:8000/ws` 로 연결하면 웹 프론트엔드로 브로드캐스트되는 메시지를 수신합니다.
 
 | Type | 전송 시점 | 내용 |
 |------|-----------|------|
