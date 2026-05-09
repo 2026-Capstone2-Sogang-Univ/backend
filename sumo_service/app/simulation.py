@@ -272,7 +272,8 @@ class SimulationManager:
             self._add_initial_vehicles()
 
             for veh_id in traci.vehicle.getIDList():
-                traci.vehicle.subscribe(veh_id, _SUB_VARS)
+                if veh_id.startswith("taxi_"):
+                    traci.vehicle.subscribe(veh_id, _SUB_VARS)
 
             if PASSENGER_SOURCE == "parquet":
                 with open(TRIPS_FILE) as f:
@@ -287,7 +288,8 @@ class SimulationManager:
                 sim_time = traci.simulation.getTime()
 
                 for veh_id in traci.simulation.getDepartedIDList():
-                    traci.vehicle.subscribe(veh_id, _SUB_VARS)
+                    if veh_id.startswith("taxi_"):
+                        traci.vehicle.subscribe(veh_id, _SUB_VARS)
 
                 sub_results = traci.vehicle.getAllSubscriptionResults()
 
@@ -670,7 +672,7 @@ class SimulationManager:
             angle = vals[tc.VAR_ANGLE]
             speed = vals[tc.VAR_SPEED]
             lat, lng = self._latlng(x, y)
-            state = self._taxi_states.get(veh_id, "empty") if veh_id.startswith("taxi_") else "car"
+            state = self._taxi_states.get(veh_id, "empty")
             if state == "empty":
                 grid_supply[get_cell(lat, lng)] += 1
             vehicles.append({"id": veh_id, "lat": lat, "lng": lng,
