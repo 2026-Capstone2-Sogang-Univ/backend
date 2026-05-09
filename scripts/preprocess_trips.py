@@ -11,7 +11,7 @@ NYC 택시 parquet → trips_processed.json 변환 스크립트
         --sample 5000
 
 의존성 (서비스 컨테이너 외부에서만 필요):
-    pip install pandas pyarrow sumolib pyproj rtree
+    pip install pandas pyarrow fastparquet sumolib pyproj rtree
     (pyproj: 좌표 변환 필수 / rtree: 엣지 탐색 가속, 없으면 brute-force로 동작)
 """
 
@@ -25,11 +25,34 @@ import pandas as pd
 import sumolib
 
 
+REQUIRED_COLUMNS = [
+    "pickup_datetime",
+    "pickup_date",
+    "pickup_latitude",
+    "pickup_longitude",
+    "dropoff_latitude",
+    "dropoff_longitude",
+    "h3_pickup",
+]
+
+
 def load_net(net_path: str) -> sumolib.net.Net:
     print(f"[0/5] 네트워크 로드: {net_path}")
     net = sumolib.net.readNet(net_path, withInternal=False)
     print(f"      완료")
     return net
+
+
+def validate_geo_projection(net: sumolib.net.Net) -> None:
+    try:
+        net.convertLonLat2XY(-73.9857, 40.7484)
+    except ModuleNotFoundError as exc:
+        print("ERROR: 좌표 변환에 필요한 pyproj가 설치되어 있지 않습니다.")
+        print("       실행 전 `pip install pyproj` 또는 의존성 재설치를 수행하세요.")
+        raise SystemExit(1) from exc
+    except Exception:
+        # pyproj가 있으면 실제 좌표별 실패는 latlng_to_edge에서 개별 처리한다.
+        pass
 
 
 def latlng_to_edge(net: sumolib.net.Net, lat: float, lon: float, radius: float = 200.0) -> str | None:
@@ -44,6 +67,41 @@ def latlng_to_edge(net: sumolib.net.Net, lat: float, lon: float, radius: float =
         return min(candidates, key=lambda ed: ed[1])[0].getID()
     except Exception:
         return None
+
+
+def read_trip_parquet(input_path: str) -> pd.DataFrame:
+    print(f"[1/5] parquet 로드: {input_path}")
+    try:
+        df = pd.read_parquet(input_path, columns=REQUIRED_COLUMNS)
+        print("      엔진: pyarrow")
+    except OSError as exc:
+        if "Repetition level histogram size mismatch" not in str(exc):
+            raise
+        print("      pyarrow 읽기 실패, fastparquet로 재시도합니다.")
+        df = pd.read_parquet(input_path, engine="fastparquet", columns=REQUIRED_COLUMNS)
+        print("      엔진: fastparquet")
+
+    df["pickup_datetime"] = pd.to_datetime(df["pickup_datetime"], errors="coerce")
+
+    # fastparquet에서 DATE 컬럼이 ns 단위 정수(object)로 들어오는 케이스를 정규화한다.
+    pickup_date_raw = df["pickup_date"]
+    if pd.api.types.is_numeric_dtype(pickup_date_raw):
+        df["pickup_date"] = pd.to_datetime(pickup_date_raw, errors="coerce").dt.date
+    else:
+        sample = pickup_date_raw.dropna().iloc[0] if not pickup_date_raw.dropna().empty else None
+        if isinstance(sample, int):
+            df["pickup_date"] = pd.to_datetime(pickup_date_raw, errors="coerce").dt.date
+        else:
+            df["pickup_date"] = pd.to_datetime(pickup_date_raw, errors="coerce").dt.date
+
+    before = len(df)
+    df = df.dropna(subset=["pickup_datetime", "pickup_date"])
+    dropped = before - len(df)
+    if dropped:
+        print(f"      경고: datetime/date 파싱 실패 {dropped:,}행 제거")
+
+    print(f"      총 {len(df):,}행")
+    return df
 
 
 def main() -> None:
@@ -71,11 +129,10 @@ def main() -> None:
 
     # 0. 네트워크 로드
     net = load_net(args.net)
+    validate_geo_projection(net)
 
     # 1. parquet 로드
-    print(f"[1/5] parquet 로드: {args.input}")
-    df = pd.read_parquet(args.input)
-    print(f"      총 {len(df):,}행")
+    df = read_trip_parquet(args.input)
 
     # 2. 날짜/시간 필터
     print(f"[2/5] 날짜/시간 필터 ({args.date} {args.hour:02d}:xx)")
