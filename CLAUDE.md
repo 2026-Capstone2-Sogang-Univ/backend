@@ -19,7 +19,7 @@ Internal communication between services uses gRPC. External communication with t
 - **Simulation speed**: real 1 second = simulated 1 minute (accelerated mode). WebSocket broadcasts at 60 fps (`FRAME_RATE = 60` in `simulation.py`).
 - **Passenger generation**: dual-mode — `PASSENGER_SOURCE=random` uses Poisson(λ=5) every 5 simulated minutes; `PASSENGER_SOURCE=parquet` replays preprocessed NYC taxi trip data from `sumo_configs/NY/trips_processed.json`.
 - **Dispatch algorithm**: empty taxis are matched to the nearest waiting passenger by Euclidean distance; dispatched taxi retargets to pickup edge via `traci.vehicle.changeTarget`.
-- **Fare model**: Seoul taxi pricing — base ₩4,800 for 1.6 km, then ₩100 per 131 m distance and ₩100 per 30 s at low speed (<3 m/s).
+- **Fare model**: NYC taxi meter (amounts in USD cents) — base $3.00, $0.70 per 1/5 mile (322 m), $0.70 per 60 s at low speed (<12 mph / 5.36 m/s), plus fixed surcharges $1.50 (improvement $1.00 + MTA $0.50). Conditional surcharges (NYS congestion, CBD toll) and time-based surcharges (night, rush hour) are documented but not applied.
 
 ### gRPC Communication Flow
 

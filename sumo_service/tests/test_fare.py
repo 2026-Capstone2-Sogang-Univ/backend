@@ -1,10 +1,8 @@
-import pytest
-
 from app.fare import (
-    BASE_DIST_M,
     BASE_FARE,
     DIST_UNIT_FARE,
     DIST_UNIT_M,
+    FIXED_SURCHARGES,
     TIME_UNIT_FARE,
     TIME_UNIT_S,
     TripAccumulator,
@@ -17,21 +15,22 @@ from app.fare import (
 # estimate_fare
 # ---------------------------------------------------------------------------
 
-def test_estimate_fare_below_base_distance():
-    assert estimate_fare(0.0) == BASE_FARE
+def test_estimate_fare_zero_distance():
+    # base + no distance units + surcharges
+    assert estimate_fare(0.0) == BASE_FARE + FIXED_SURCHARGES
 
 
-def test_estimate_fare_exactly_base_distance():
-    assert estimate_fare(BASE_DIST_M) == BASE_FARE
-
-
-def test_estimate_fare_one_unit_over():
-    assert estimate_fare(BASE_DIST_M + DIST_UNIT_M) == BASE_FARE + DIST_UNIT_FARE
+def test_estimate_fare_one_unit():
+    assert estimate_fare(DIST_UNIT_M) == BASE_FARE + DIST_UNIT_FARE + FIXED_SURCHARGES
 
 
 def test_estimate_fare_fractional_unit_truncated():
-    # 1.5 단위 → 버림 → 1 단위분만 추가
-    assert estimate_fare(BASE_DIST_M + 1.5 * DIST_UNIT_M) == BASE_FARE + DIST_UNIT_FARE
+    # 1.5 units → floor to 1
+    assert estimate_fare(1.5 * DIST_UNIT_M) == BASE_FARE + DIST_UNIT_FARE + FIXED_SURCHARGES
+
+
+def test_estimate_fare_two_units():
+    assert estimate_fare(2 * DIST_UNIT_M) == BASE_FARE + 2 * DIST_UNIT_FARE + FIXED_SURCHARGES
 
 
 # ---------------------------------------------------------------------------
@@ -43,24 +42,24 @@ def _acc(**kwargs) -> TripAccumulator:
 
 
 def test_calculate_fare_no_distance_no_lowspeed():
-    assert calculate_fare(_acc()) == BASE_FARE
+    assert calculate_fare(_acc()) == BASE_FARE + FIXED_SURCHARGES
 
 
 def test_calculate_fare_distance_only():
-    acc = _acc(distance_m=BASE_DIST_M + DIST_UNIT_M)
-    assert calculate_fare(acc) == BASE_FARE + DIST_UNIT_FARE
+    acc = _acc(distance_m=DIST_UNIT_M)
+    assert calculate_fare(acc) == BASE_FARE + DIST_UNIT_FARE + FIXED_SURCHARGES
 
 
 def test_calculate_fare_lowspeed_only():
     acc = _acc(low_speed_seconds=TIME_UNIT_S)
-    assert calculate_fare(acc) == BASE_FARE + TIME_UNIT_FARE
+    assert calculate_fare(acc) == BASE_FARE + TIME_UNIT_FARE + FIXED_SURCHARGES
 
 
 def test_calculate_fare_both():
-    acc = _acc(distance_m=BASE_DIST_M + DIST_UNIT_M, low_speed_seconds=TIME_UNIT_S)
-    assert calculate_fare(acc) == BASE_FARE + DIST_UNIT_FARE + TIME_UNIT_FARE
+    acc = _acc(distance_m=DIST_UNIT_M, low_speed_seconds=TIME_UNIT_S)
+    assert calculate_fare(acc) == BASE_FARE + DIST_UNIT_FARE + TIME_UNIT_FARE + FIXED_SURCHARGES
 
 
 def test_calculate_fare_exceeds_estimate_when_lowspeed():
-    acc = _acc(distance_m=BASE_DIST_M + DIST_UNIT_M, low_speed_seconds=TIME_UNIT_S)
+    acc = _acc(distance_m=DIST_UNIT_M, low_speed_seconds=TIME_UNIT_S)
     assert calculate_fare(acc) > estimate_fare(acc.distance_m)

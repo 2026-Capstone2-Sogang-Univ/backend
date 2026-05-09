@@ -1,3 +1,7 @@
+import asyncio
+import os
+import signal
+
 from fastapi import APIRouter, HTTPException, Request
 
 from ..grid import H3_RESOLUTION
@@ -38,6 +42,20 @@ async def restart_simulation(request: Request):
     manager = request.app.state.manager
     await manager.restart()
     return {"status": manager.status}
+
+
+@router.post("/stop")
+async def stop_simulation(request: Request):
+    manager = request.app.state.manager
+    await manager.stop()
+    return {"status": manager.status}
+
+
+@router.post("/shutdown")
+async def shutdown_server(request: Request):
+    await request.app.state.manager.stop()
+    asyncio.get_event_loop().call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
+    return {"status": "shutting down"}
 
 
 @router.get("/status")

@@ -4,7 +4,7 @@ Tests for POST /simulation/start, /pause, /restart REST endpoints.
 SimulationManager is replaced with a lightweight stub — no SUMO or TraCI needed.
 """
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -25,7 +25,7 @@ def make_manager(status: SimStatus) -> MagicMock:
     mgr.pause = AsyncMock(side_effect=lambda: setattr(mgr, "status", SimStatus.PAUSED))
     mgr.resume = AsyncMock(side_effect=lambda: setattr(mgr, "status", SimStatus.RUNNING))
     mgr.restart = AsyncMock(side_effect=lambda: setattr(mgr, "status", SimStatus.RUNNING))
-    mgr.stop = AsyncMock()
+    mgr.stop = AsyncMock(side_effect=lambda: setattr(mgr, "status", SimStatus.IDLE))
     mgr.get_state = MagicMock(return_value={"vehicles": [], "passengers": [], "sim_time": 0.0})
     mgr.get_passengers = MagicMock(return_value=[])
     mgr.get_surge = MagicMock(return_value=[])
@@ -193,3 +193,129 @@ def test_get_fare_calls_manager_with_correct_id():
     with TestClient(app) as client:
         client.get("/simulation/fare/p_42")
     mgr.get_fare.assert_called_once_with("p_42")
+
+
+# ---------------------------------------------------------------------------
+# POST /simulation/resume
+# ---------------------------------------------------------------------------
+
+def test_resume_when_paused_returns_200():
+    app.state.manager = make_manager(SimStatus.PAUSED)
+    with TestClient(app) as client:
+        resp = client.post("/simulation/resume")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == SimStatus.RUNNING
+
+
+def test_resume_when_not_paused_returns_400():
+    app.state.manager = make_manager(SimStatus.IDLE)
+    with TestClient(app) as client:
+        resp = client.post("/simulation/resume")
+    assert resp.status_code == 400
+
+
+def test_resume_when_running_returns_400():
+    app.state.manager = make_manager(SimStatus.RUNNING)
+    with TestClient(app) as client:
+        resp = client.post("/simulation/resume")
+    assert resp.status_code == 400
+
+
+def test_resume_calls_resume_on_manager():
+    mgr = make_manager(SimStatus.PAUSED)
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        client.post("/simulation/resume")
+    mgr.resume.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# GET /simulation/status
+# ---------------------------------------------------------------------------
+
+def test_get_status_returns_200():
+    app.state.manager = make_manager(SimStatus.RUNNING)
+    with TestClient(app) as client:
+        resp = client.get("/simulation/status")
+    assert resp.status_code == 200
+
+
+def test_get_status_contains_status_field():
+    app.state.manager = make_manager(SimStatus.RUNNING)
+    with TestClient(app) as client:
+        resp = client.get("/simulation/status")
+    assert "status" in resp.json()
+
+
+def test_get_status_contains_snapshot_fields():
+    app.state.manager = make_manager(SimStatus.RUNNING)
+    with TestClient(app) as client:
+        resp = client.get("/simulation/status")
+    body = resp.json()
+    assert "vehicles" in body
+    assert "passengers" in body
+    assert "sim_time" in body
+
+
+def test_get_status_reflects_paused_state():
+    app.state.manager = make_manager(SimStatus.PAUSED)
+    with TestClient(app) as client:
+        resp = client.get("/simulation/status")
+    assert resp.json()["status"] == SimStatus.PAUSED
+
+
+# ---------------------------------------------------------------------------
+# POST /simulation/stop
+# ---------------------------------------------------------------------------
+
+def test_stop_returns_200():
+    app.state.manager = make_manager(SimStatus.RUNNING)
+    with TestClient(app) as client:
+        resp = client.post("/simulation/stop")
+    assert resp.status_code == 200
+
+
+def test_stop_calls_stop_on_manager():
+    mgr = make_manager(SimStatus.RUNNING)
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        client.post("/simulation/stop")
+    mgr.stop.assert_called()
+
+
+def test_stop_returns_idle_status():
+    app.state.manager = make_manager(SimStatus.RUNNING)
+    with TestClient(app) as client:
+        resp = client.post("/simulation/stop")
+    assert resp.json()["status"] == SimStatus.IDLE
+
+
+# ---------------------------------------------------------------------------
+# POST /simulation/shutdown
+# ---------------------------------------------------------------------------
+
+def test_shutdown_returns_200():
+    mgr = make_manager(SimStatus.RUNNING)
+    app.state.manager = mgr
+    with patch("os.kill") as mock_kill:
+        with TestClient(app) as client:
+            resp = client.post("/simulation/shutdown")
+    assert resp.status_code == 200
+
+
+def test_shutdown_response_status_is_shutting_down():
+    mgr = make_manager(SimStatus.RUNNING)
+    app.state.manager = mgr
+    with patch("os.kill"):
+        with TestClient(app) as client:
+            resp = client.post("/simulation/shutdown")
+    assert resp.json()["status"] == "shutting down"
+
+
+def test_shutdown_calls_stop_on_manager():
+    mgr = make_manager(SimStatus.RUNNING)
+    app.state.manager = mgr
+    with patch("os.kill"):
+        with TestClient(app) as client:
+            client.post("/simulation/shutdown")
+    mgr.stop.assert_called()

@@ -105,7 +105,7 @@ curl -X POST http://localhost:8080/simulation/restart
 **콘솔 (컨테이너 stdout):**
 
 ```
-s=start  p=pause  u=resume  r=restart  e=end
+s=start  p=pause  u=resume  r=restart  e=end  q=quit server
 ```
 
 ### 로컬 개발 (sumo_service 단독)
@@ -133,6 +133,8 @@ uv run uvicorn app.main:app --reload --port 8080
 | POST | `/simulation/pause` | 일시정지 |
 | POST | `/simulation/resume` | 재개 |
 | POST | `/simulation/restart` | 초기화 후 재시작 |
+| POST | `/simulation/stop` | 시뮬레이션 중단 (서버 유지) |
+| POST | `/simulation/shutdown` | 시뮬레이션 중단 후 서버 프로세스 종료 |
 | GET  | `/simulation/status` | 현재 상태 + 차량/승객 스냅샷 |
 | GET  | `/simulation/passengers` | 대기 중 승객 목록 |
 | GET  | `/simulation/surge` | H3 셀별 공급/수요/서지 계수 |
@@ -248,12 +250,19 @@ uv run uvicorn app.main:app --reload --port 8080
 }
 ```
 
-요금 계산 방식:
+요금 계산 방식 (단위: USD 센트):
 
 ```
-기본요금   4,800원  (1.6km 이하)
-거리 추가  (이동거리 - 1,600m) ÷ 131m 마다 100원
-저속 추가  저속(<15km/h) 누적 시간 ÷ 30초 마다 100원
+기본요금       $3.00  (승차 즉시)
+거리 추가      $0.70  (1/5마일 = 약 322m 마다)
+저속 추가      $0.70  (시속 12마일 미만 시 60초 마다)
+─────────────────────────────────────
+개선 부담금    $1.00  (모든 운행)
+MTA 할증료     $0.50  (맨해튼 운행, 항상 적용)
+─────────────────────────────────────
+미적용 항목    NYS 혼잡 할증료 $2.50 (96번가 남쪽)
+               CBD 혼잡 통행료 $0.75 (60번가 남쪽)
+               야간 할증 $1.00 / 러시아워 할증 $2.50
 ```
 
 ---

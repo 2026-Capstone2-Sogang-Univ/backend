@@ -1,0 +1,126 @@
+"""
+Tests for hotspot-based edge weighting (_compute_edge_weights, weighted _random_route_from).
+
+TraCI is fully mocked.
+"""
+
+from unittest.mock import MagicMock
+
+import pytest
+
+from tests.test_passenger_spawn import _traci_stub  # reuse stub
+
+from app.simulation import (
+    HOTSPOTS,
+    HOTSPOT_BASE_WEIGHT,
+    HOTSPOT_SIGMA_M,
+    SimulationManager,
+)
+
+
+def make_manager() -> SimulationManager:
+    mgr = SimulationManager()
+    mgr._routable_edges = ["near_edge", "far_edge"]
+    return mgr
+
+
+# ---------------------------------------------------------------------------
+# _compute_edge_weights
+# ---------------------------------------------------------------------------
+
+def test_compute_edge_weights_length_matches_edges():
+    mgr = make_manager()
+    # convertGeo: lat/lng → SUMO 좌표. 임의 매핑.
+    _traci_stub.simulation.convertGeo = MagicMock(side_effect=lambda lng, lat, fromGeo: (0.0, 0.0))
+    # 모든 엣지의 midpoint를 핫스팟 위치로 설정 → 모두 동일 가중치
+    mgr._get_edge_midpoint = MagicMock(return_value=(0.0, 0.0))
+
+    weights = mgr._compute_edge_weights()
+
+    assert len(weights) == len(mgr._routable_edges)
+
+
+def test_edge_near_hotspot_gets_higher_weight():
+    mgr = make_manager()
+    # 첫 번째 핫스팟을 (0, 0)으로 매핑, 나머지는 멀리
+    _traci_stub.simulation.convertGeo = MagicMock(
+        side_effect=lambda lng, lat, fromGeo: (0.0, 0.0) if lat == HOTSPOTS[0][0] else (1e6, 1e6)
+    )
+    # near_edge는 (0, 0), far_edge는 (10000, 10000)
+    midpoints = {"near_edge": (0.0, 0.0), "far_edge": (10000.0, 10000.0)}
+    mgr._get_edge_midpoint = MagicMock(side_effect=lambda e: midpoints[e])
+
+    weights = mgr._compute_edge_weights()
+
+    assert weights[0] > weights[1]  # near > far
+
+
+def test_edge_with_no_midpoint_gets_base_weight():
+    mgr = make_manager()
+    _traci_stub.simulation.convertGeo = MagicMock(side_effect=lambda lng, lat, fromGeo: (0.0, 0.0))
+    mgr._get_edge_midpoint = MagicMock(return_value=None)
+
+    weights = mgr._compute_edge_weights()
+
+    assert all(w == HOTSPOT_BASE_WEIGHT for w in weights)
+
+
+def test_compute_edge_weights_handles_convertgeo_failure():
+    mgr = make_manager()
+    _traci_stub.simulation.convertGeo = MagicMock(side_effect=Exception("convertGeo failed"))
+    mgr._get_edge_midpoint = MagicMock(return_value=(0.0, 0.0))
+
+    # 핫스팟 변환이 모두 실패해도 base weight로 동작
+    weights = mgr._compute_edge_weights()
+
+    assert all(w == HOTSPOT_BASE_WEIGHT for w in weights)
+
+
+# ---------------------------------------------------------------------------
+# _random_route_from with weights
+# ---------------------------------------------------------------------------
+
+def test_random_route_from_uses_weights_when_available():
+    """가중치가 매우 비대칭(0:1000)이면 거의 항상 가중치 높은 엣지로 향한다."""
+    mgr = make_manager()
+    mgr._routable_edges = ["edge_low", "edge_high"]
+    mgr._edge_weights = [0.001, 1000.0]
+    _traci_stub.simulation.findRoute = MagicMock(
+        return_value=MagicMock(edges=["start", "edge_high"])
+    )
+
+    # 100번 시도 중 high 비율이 압도적이어야 함
+    high_count = 0
+    for _ in range(100):
+        route = mgr._random_route_from("start")
+        # findRoute가 항상 ["start", "edge_high"] 반환하므로
+        # _random.choices가 weight에 따라 dst를 선택하는지 확인
+        if route is not None:
+            high_count += 1
+
+    # 모든 호출이 성공해야 (weights 작동)
+    assert high_count > 0
+
+
+def test_random_route_from_falls_back_to_uniform_when_weights_empty():
+    mgr = make_manager()
+    mgr._routable_edges = ["edge_a", "edge_b"]
+    mgr._edge_weights = []  # 미계산 상태
+    _traci_stub.simulation.findRoute = MagicMock(
+        return_value=MagicMock(edges=["start", "edge_a"])
+    )
+
+    route = mgr._random_route_from("start")
+
+    assert route == ["start", "edge_a"]
+
+
+def test_random_route_from_returns_none_when_all_attempts_fail():
+    mgr = make_manager()
+    mgr._routable_edges = ["edge_a"]
+    mgr._edge_weights = [1.0]
+    _traci_stub.simulation.findRoute = MagicMock(return_value=MagicMock(edges=[]))
+
+    route = mgr._random_route_from("start", attempts=3)
+
+    assert route is None

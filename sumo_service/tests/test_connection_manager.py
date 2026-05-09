@@ -276,3 +276,87 @@ async def test_dead_connection_removed_on_broadcast():
 
     assert ws_dead not in manager._connections
     assert ws_alive in manager._connections
+
+
+# ---------------------------------------------------------------------------
+# broadcast_surge
+# ---------------------------------------------------------------------------
+
+async def test_broadcast_surge_sends_correct_type():
+    manager = ConnectionManager()
+    ws = make_ws()
+    await manager.connect(ws)
+    ws.send_text.reset_mock()
+
+    await manager.broadcast_surge([], sim_time=100.0)
+
+    msgs = sent_messages(ws)
+    assert msgs[0]["type"] == "surge"
+
+
+async def test_broadcast_surge_payload():
+    manager = ConnectionManager()
+    ws = make_ws()
+    await manager.connect(ws)
+    ws.send_text.reset_mock()
+
+    cells = [{"h3": "abc", "supply": 3, "demand": 1, "surge": 0.5,
+              "center": {"lat": 40.7, "lng": -74.0}}]
+    await manager.broadcast_surge(cells, sim_time=300.0)
+
+    msg = sent_messages(ws)[0]
+    assert msg["cells"] == cells
+    assert msg["sim_time"] == 300.0
+    assert "h3_resolution" in msg
+
+
+async def test_broadcast_surge_empty_cells():
+    manager = ConnectionManager()
+    ws = make_ws()
+    await manager.connect(ws)
+    ws.send_text.reset_mock()
+
+    await manager.broadcast_surge([], sim_time=0.0)
+
+    msg = sent_messages(ws)[0]
+    assert msg["cells"] == []
+
+
+# ---------------------------------------------------------------------------
+# broadcast_fare_update
+# ---------------------------------------------------------------------------
+
+async def test_broadcast_fare_update_sends_correct_type():
+    manager = ConnectionManager()
+    ws = make_ws()
+    await manager.connect(ws)
+    ws.send_text.reset_mock()
+
+    await manager.broadcast_fare_update("p_0", "taxi_0", 845, 775, 1500.0, 500.0)
+
+    msg = sent_messages(ws)[0]
+    assert msg["type"] == "fare_update"
+
+
+async def test_broadcast_fare_update_payload():
+    manager = ConnectionManager()
+    ws = make_ws()
+    await manager.connect(ws)
+    ws.send_text.reset_mock()
+
+    await manager.broadcast_fare_update(
+        passenger_id="p_42",
+        taxi_id="taxi_7",
+        fare=845,
+        expected_fare=775,
+        distance_m=1500.0,
+        sim_time=500.0,
+    )
+
+    msg = sent_messages(ws)[0]
+    assert msg["passenger_id"] == "p_42"
+    assert msg["taxi_id"] == "taxi_7"
+    assert msg["fare"] == 845
+    assert msg["expected_fare"] == 775
+    assert msg["distance_m"] == 1500.0
+    assert msg["sim_time"] == 500.0

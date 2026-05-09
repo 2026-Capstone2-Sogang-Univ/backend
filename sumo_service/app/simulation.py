@@ -49,7 +49,7 @@ SUMO_CONFIG = str(
 # Set SUMO_GUI=1 to open the SUMO GUI window (useful for local debugging).
 SUMO_BINARY = "sumo-gui" if os.getenv("SUMO_GUI") == "1" else "sumo"
 
-SIM_DURATION = 3600.0  # simulated seconds (1 hour)
+SIM_DURATION = 36000.0  # simulated seconds (10 hours)
 FRAME_RATE = 60.0  # broadcast fps (WebSocket messages per real second)
 SIMULATION_SPEED = 20.0  # simulation speed (simulated seconds per real second)
 STEP_LENGTH = (
@@ -69,6 +69,21 @@ TRIP_TIMEOUT_S = 1800.0      # 탑승 후 이 시간 내 하차 못하면 강제
 
 PASSENGER_SOURCE = os.getenv("PASSENGER_SOURCE", "random")
 TRIPS_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "trips_processed.json"
+
+# Manhattan 핫스팟: (lat, lng, importance). 하차 후 택시 목적지 가중치에 사용.
+HOTSPOTS: list[tuple[float, float, float]] = [
+    (40.7580, -73.9855, 1.0),  # Times Square
+    (40.7506, -73.9935, 1.0),  # Penn Station
+    (40.7527, -73.9772, 1.0),  # Grand Central
+    (40.7484, -73.9857, 0.7),  # Empire State Building
+    (40.7359, -73.9911, 0.7),  # Union Square
+    (40.7681, -73.9819, 0.7),  # Columbus Circle
+    (40.7587, -73.9787, 0.7),  # Rockefeller Center
+    (40.7074, -74.0113, 1.0),  # Wall Street / Financial District
+    (40.7127, -74.0134, 0.7),  # World Trade Center
+]
+HOTSPOT_SIGMA_M = 300.0     # 가우시안 감쇠 스케일 (m)
+HOTSPOT_BASE_WEIGHT = 1.0   # 모든 엣지 최소 가중치
 
 _SUB_VARS = [tc.VAR_POSITION, tc.VAR_ANGLE, tc.VAR_SPEED, tc.VAR_DISTANCE, tc.VAR_ROAD_ID]
 
@@ -117,6 +132,7 @@ class SimulationManager:
         self._trip_queue: list[dict] = []
         self._latlng: Callable[[float, float], tuple[float, float]] | None = None
         self._bg_route_counter: int = 0
+        self._edge_weights: list[float] = []
 
     # ------------------------------------------------------------------
     # Public async API (called from FastAPI endpoints)
@@ -213,6 +229,7 @@ class SimulationManager:
             self._trip_queue = []
             self._latlng = None
             self._bg_route_counter = 0
+            self._edge_weights = []
 
     # ------------------------------------------------------------------
     # Async broadcast loop — runs in the event loop
@@ -271,6 +288,7 @@ class SimulationManager:
                 )
             self._latlng = sumo_to_latlng
             self._routable_edges = self._get_routable_edges()
+            self._edge_weights = self._compute_edge_weights()
             self._add_initial_vehicles()
 
             for veh_id in traci.vehicle.getIDList():
@@ -471,7 +489,10 @@ class SimulationManager:
                 nearest = min(waiting_passengers,
                               key=lambda p: (p.x - tx) ** 2 + (p.y - ty) ** 2)
                 try:
-                    traci.vehicle.changeTarget(veh_id, nearest.pickup_edge)
+                    route = traci.simulation.findRoute(road_id, nearest.pickup_edge)
+                    if not route.edges:
+                        continue
+                    traci.vehicle.setRoute(veh_id, list(route.edges))
                 except traci.exceptions.TraCIException:
                     continue
                 nearest.state = "assigned"
@@ -499,7 +520,10 @@ class SimulationManager:
                     continue
                 if road_id == passenger.pickup_edge:
                     try:
-                        traci.vehicle.changeTarget(veh_id, passenger.dropoff_edge)
+                        route = traci.simulation.findRoute(road_id, passenger.dropoff_edge)
+                        if not route.edges:
+                            continue
+                        traci.vehicle.setRoute(veh_id, list(route.edges))
                     except traci.exceptions.TraCIException:
                         continue
                     passenger.state = "picked_up"
@@ -534,11 +558,9 @@ class SimulationManager:
                     del self._active_trips[veh_id]
                     del self._taxi_targets[veh_id]
                     self._taxi_states[veh_id] = "empty"
-                    dst = _random.choice(self._routable_edges)
-                    try:
-                        traci.vehicle.changeTarget(veh_id, dst)
-                    except traci.exceptions.TraCIException:
-                        pass
+                    route = self._random_route_from(road_id)
+                    if route:
+                        traci.vehicle.setRoute(veh_id, route)
                     continue
                 if road_id == passenger.dropoff_edge:
                     accum = self._active_trips[veh_id]
@@ -554,11 +576,9 @@ class SimulationManager:
                     del self._active_trips[veh_id]
                     del self._taxi_targets[veh_id]
                     self._taxi_states[veh_id] = "empty"
-                    dst = _random.choice(self._routable_edges)
-                    try:
-                        traci.vehicle.changeTarget(veh_id, dst)
-                    except traci.exceptions.TraCIException:
-                        pass
+                    route = self._random_route_from(road_id)
+                    if route:
+                        traci.vehicle.setRoute(veh_id, route)
 
         return fare_updates
 
@@ -661,6 +681,55 @@ class SimulationManager:
             departPos="random_free",
             departSpeed="max",
         )
+
+    def _compute_edge_weights(self) -> list[float]:
+        """Compute weighted destination probability for each routable edge.
+
+        Each edge's weight = base + sum_i(importance_i * exp(-d_i^2 / 2σ²))
+        where d_i is distance (m) from edge midpoint to hotspot i.
+        """
+        # 핫스팟 lat/lng → SUMO 좌표 (한 번만 변환)
+        hotspots_xy: list[tuple[float, float, float]] = []
+        for lat, lng, importance in HOTSPOTS:
+            try:
+                x, y = traci.simulation.convertGeo(lng, lat, fromGeo=True)
+                hotspots_xy.append((x, y, importance))
+            except Exception:
+                continue
+
+        two_sigma_sq = 2.0 * HOTSPOT_SIGMA_M * HOTSPOT_SIGMA_M
+        weights = []
+        for edge_id in self._routable_edges:
+            pt = self._get_edge_midpoint(edge_id)
+            if pt is None:
+                weights.append(HOTSPOT_BASE_WEIGHT)
+                continue
+            ex, ey = pt
+            w = HOTSPOT_BASE_WEIGHT
+            for hx, hy, imp in hotspots_xy:
+                dx, dy = ex - hx, ey - hy
+                w += imp * math.exp(-(dx * dx + dy * dy) / two_sigma_sq)
+            weights.append(w)
+        return weights
+
+    def _random_route_from(self, current_edge: str, attempts: int = 10) -> list[str] | None:
+        """Return a routable edge list starting from current_edge to a weighted-random destination."""
+        edges = self._routable_edges
+        weights = self._edge_weights if len(self._edge_weights) == len(edges) else None
+        for _ in range(attempts):
+            if weights:
+                dst = _random.choices(edges, weights=weights, k=1)[0]
+            else:
+                dst = _random.choice(edges)
+            if dst == current_edge:
+                continue
+            try:
+                result = traci.simulation.findRoute(current_edge, dst)
+                if result.edges:
+                    return list(result.edges)
+            except traci.exceptions.TraCIException:
+                continue
+        return None
 
     def _random_route(self, edges: list[str], attempts: int = 10) -> list[str]:
         """Return a routable edge list between two random edges, falling back to one edge."""
