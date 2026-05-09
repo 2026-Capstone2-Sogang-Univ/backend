@@ -297,7 +297,7 @@ Back/
 │   │   ├── main.py                # FastAPI 앱 + WebSocket 엔드포인트 + CLI 스레드
 │   │   ├── simulation.py          # SimulationManager (TraCI 루프, 상태머신, 요금 누적)
 │   │   ├── connection_manager.py  # WebSocket 연결 관리 + 브로드캐스트
-│   │   ├── coord.py               # SUMO <-> WGS84 좌표 변환 (affine 근사)
+│   │   ├── coord.py               # SUMO <-> WGS84 좌표 변환 (TraCI 정밀 변환)
 │   │   ├── fare.py                # 요금 계산 (TripAccumulator, calculate_fare)
 │   │   ├── grid.py                # H3 격자 조회 + compute_surge
 │   │   ├── passenger.py           # Passenger 데이터클래스

@@ -32,7 +32,7 @@ import traci
 import traci.exceptions
 from traci import constants as tc
 
-from .coord import make_affine_converter, sumo_to_latlng
+from .coord import sumo_to_latlng
 from .fare import SPEED_THRESHOLD_MPS, TripAccumulator, calculate_fare, estimate_fare
 from .grid import H3_RESOLUTION, cell_center_latlng, compute_surge, get_cell
 from .passenger import Passenger
@@ -267,10 +267,7 @@ class SimulationManager:
                     min_x, min_y, max_x, max_y,
                     min_lat, min_lng, max_lat, max_lng,
                 )
-            self._latlng = make_affine_converter(
-                min_x, min_y, max_x, max_y,
-                min_lat, min_lng, max_lat, max_lng,
-            )
+            self._latlng = sumo_to_latlng
             self._routable_edges = self._get_routable_edges()
             self._add_initial_vehicles()
 
