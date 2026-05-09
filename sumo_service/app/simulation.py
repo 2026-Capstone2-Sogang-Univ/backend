@@ -57,8 +57,8 @@ STEP_LENGTH = (
 )  # simulated seconds per TraCI step (passed to SUMO)
 REAL_STEP_SLEEP = 1.0 / FRAME_RATE  # real seconds between TraCI steps
 
-N_TAXIS = 50
-N_BACKGROUND_CARS = 200
+N_TAXIS = 200
+N_BACKGROUND_CARS = 800
 
 PASSENGER_SPAWN_INTERVAL = 300.0
 PASSENGER_LAMBDA = 5
@@ -116,6 +116,7 @@ class SimulationManager:
         self._completed_passengers: list[dict] = []
         self._trip_queue: list[dict] = []
         self._latlng: Callable[[float, float], tuple[float, float]] | None = None
+        self._bg_route_counter: int = 0
 
     # ------------------------------------------------------------------
     # Public async API (called from FastAPI endpoints)
@@ -211,6 +212,7 @@ class SimulationManager:
             self._completed_passengers = []
             self._trip_queue = []
             self._latlng = None
+            self._bg_route_counter = 0
 
     # ------------------------------------------------------------------
     # Async broadcast loop — runs in the event loop
@@ -290,6 +292,10 @@ class SimulationManager:
                 for veh_id in traci.simulation.getDepartedIDList():
                     if veh_id.startswith("taxi_"):
                         traci.vehicle.subscribe(veh_id, _SUB_VARS)
+
+                for veh_id in traci.simulation.getArrivedIDList():
+                    if veh_id.startswith("bg_"):
+                        self._respawn_background_car(veh_id)
 
                 sub_results = traci.vehicle.getAllSubscriptionResults()
 
@@ -640,6 +646,21 @@ class SimulationManager:
                 departPos="random_free",
                 departSpeed="max",
             )
+
+    def _respawn_background_car(self, veh_id: str) -> None:
+        route_edges = self._random_route(self._routable_edges)
+        route_id = f"bg_route_{self._bg_route_counter}"
+        self._bg_route_counter += 1
+        traci.route.add(route_id, route_edges)
+        traci.vehicle.add(
+            vehID=veh_id,
+            routeID=route_id,
+            typeID="DEFAULT_VEHTYPE",
+            depart="now",
+            departLane="best",
+            departPos="random_free",
+            departSpeed="max",
+        )
 
     def _random_route(self, edges: list[str], attempts: int = 10) -> list[str]:
         """Return a routable edge list between two random edges, falling back to one edge."""
