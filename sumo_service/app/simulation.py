@@ -32,7 +32,7 @@ import traci
 import traci.exceptions
 from traci import constants as tc
 
-from .coord import sumo_to_latlng
+from .coord import make_sumolib_converter, sumo_to_latlng
 from .fare import SPEED_THRESHOLD_MPS, TripAccumulator, calculate_fare, estimate_fare
 from .grid import H3_RESOLUTION, cell_center_latlng, compute_surge, get_cell
 from .passenger import Passenger
@@ -45,6 +45,12 @@ SUMO_CONFIG = str(
     / "sumo_configs"
     / "NY"
     / "manhattan.sumocfg"
+)
+SUMO_NET = str(
+    Path(__file__).parent.parent
+    / "sumo_configs"
+    / "NY"
+    / "manhattan_car_only.net.xml"
 )
 # Set SUMO_GUI=1 to open the SUMO GUI window (useful for local debugging).
 SUMO_BINARY = "sumo-gui" if os.getenv("SUMO_GUI") == "1" else "sumo"
@@ -339,7 +345,7 @@ class SimulationManager:
                     min_x, min_y, max_x, max_y,
                     min_lat, min_lng, max_lat, max_lng,
                 )
-            self._latlng = sumo_to_latlng
+            self._latlng = make_sumolib_converter(SUMO_NET)
             all_routable = self._get_routable_edges()
             if SCC_FILE.exists():
                 with open(SCC_FILE) as f:
