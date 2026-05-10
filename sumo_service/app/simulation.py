@@ -57,8 +57,8 @@ STEP_LENGTH = (
 )  # simulated seconds per TraCI step (passed to SUMO)
 REAL_STEP_SLEEP = 1.0 / FRAME_RATE  # real seconds between TraCI steps
 
-N_TAXIS = 200
-N_BACKGROUND_CARS = 800
+N_TAXIS = 300
+N_BACKGROUND_CARS = 1200
 
 PASSENGER_SPAWN_INTERVAL = 300.0
 PASSENGER_LAMBDA = 5
@@ -69,6 +69,7 @@ TRIP_TIMEOUT_S = 1800.0      # 탑승 후 이 시간 내 하차 못하면 강제
 
 PASSENGER_SOURCE = os.getenv("PASSENGER_SOURCE", "random")
 TRIPS_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "trips_processed.json"
+SCC_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "routable_scc.json"
 
 # Manhattan 핫스팟: (lat, lng, importance). 하차 후 택시 목적지 가중치에 사용.
 HOTSPOTS: list[tuple[float, float, float]] = [
@@ -96,6 +97,58 @@ def _poisson_sample(lam: float) -> int:
         k += 1
         p *= _random.random()
     return k - 1
+
+
+def _kosaraju_scc(graph: dict[str, set[str]]) -> list[set[str]]:
+    """Iterative Kosaraju's algorithm — returns list of SCCs.
+
+    Uses iterative DFS to avoid Python recursion limits on large graphs.
+    """
+    # Phase 1: forward DFS, record finish order
+    visited: set[str] = set()
+    finish_order: list[str] = []
+    for start in graph:
+        if start in visited:
+            continue
+        visited.add(start)
+        stack: list[tuple[str, "object"]] = [(start, iter(graph[start]))]
+        while stack:
+            node, neighbors = stack[-1]
+            advanced = False
+            for w in neighbors:
+                if w not in visited:
+                    visited.add(w)
+                    stack.append((w, iter(graph.get(w, set()))))
+                    advanced = True
+                    break
+            if not advanced:
+                finish_order.append(node)
+                stack.pop()
+
+    # 역방향 그래프 구축
+    rgraph: dict[str, set[str]] = {v: set() for v in graph}
+    for v, outs in graph.items():
+        for w in outs:
+            rgraph.setdefault(w, set()).add(v)
+
+    # Phase 2: 종료 순서 역순으로 역방향 DFS — 각 트리가 하나의 SCC
+    visited = set()
+    sccs: list[set[str]] = []
+    for start in reversed(finish_order):
+        if start in visited:
+            continue
+        scc: set[str] = set()
+        rstack = [start]
+        visited.add(start)
+        while rstack:
+            node = rstack.pop()
+            scc.add(node)
+            for w in rgraph.get(node, set()):
+                if w not in visited:
+                    visited.add(w)
+                    rstack.append(w)
+        sccs.append(scc)
+    return sccs
 
 
 class SimStatus(str, Enum):
@@ -287,7 +340,24 @@ class SimulationManager:
                     min_lat, min_lng, max_lat, max_lng,
                 )
             self._latlng = sumo_to_latlng
-            self._routable_edges = self._get_routable_edges()
+            all_routable = self._get_routable_edges()
+            if SCC_FILE.exists():
+                with open(SCC_FILE) as f:
+                    scc_set = set(json.load(f))
+                # 사전 계산된 SCC와 현재 routable의 교집합 사용 (안전망)
+                self._routable_edges = [e for e in all_routable if e in scc_set]
+                print(
+                    f"[init] loaded pre-computed SCC: "
+                    f"{len(self._routable_edges)} edges (of {len(all_routable)} routable)",
+                    flush=True,
+                )
+            else:
+                self._routable_edges = self._filter_to_largest_scc(all_routable)
+                print(
+                    f"[init] computed SCC at runtime: {len(all_routable)} → "
+                    f"{len(self._routable_edges)} (run scripts/compute_scc.py to cache)",
+                    flush=True,
+                )
             self._edge_weights = self._compute_edge_weights()
             self._add_initial_vehicles()
 
@@ -627,6 +697,41 @@ class SimulationManager:
                     routable.append(edge_id)
                     break
         return routable
+
+    def _filter_to_largest_scc(self, edges: list[str]) -> list[str]:
+        """Filter edges to those in the largest strongly connected component.
+
+        Within the returned set, findRoute is guaranteed to succeed for any
+        (src, dst) pair — eliminating unreachable-destination failures.
+        """
+        if not edges:
+            return edges
+
+        edge_set = set(edges)
+
+        # 그래프 구축: edge → 도달 가능한 outgoing edges (edge_set 내)
+        graph: dict[str, set[str]] = {e: set() for e in edges}
+        for edge_id in edges:
+            num_lanes = traci.edge.getLaneNumber(edge_id)
+            for lane_idx in range(num_lanes):
+                lane_id = f"{edge_id}_{lane_idx}"
+                try:
+                    links = traci.lane.getLinks(lane_id)
+                except traci.exceptions.TraCIException:
+                    continue
+                for link in links:
+                    next_lane = link[0] if link else ""
+                    if not next_lane:
+                        continue
+                    next_edge = next_lane.rsplit("_", 1)[0]
+                    if next_edge in edge_set and next_edge != edge_id:
+                        graph[edge_id].add(next_edge)
+
+        sccs = _kosaraju_scc(graph)
+        if not sccs:
+            return edges
+        largest = max(sccs, key=len)
+        return list(largest)
 
     def _add_initial_vehicles(self) -> None:
         """Place 200 background cars and 50 taxis on the network at t=0."""
