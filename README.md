@@ -269,14 +269,31 @@ uv run uvicorn app.main:app --reload --port 8080
 
 **parquet 모드 사전 준비 — 전처리 스크립트 실행:**
 
+`bash` / Git Bash:
+
 ```bash
 cd Back
 python scripts/preprocess_trips.py \
   --input  real_taxi_data/od_month=07/consolidated.parquet \
   --net    sumo_service/sumo_configs/NY/manhattan_car_only.net.xml \
   --output sumo_service/sumo_configs/NY/trips_processed.json \
-  --date   2013-07-08 \
-  --hour   8 \
+  --start  "2013-07-08 08-00-00" \
+  --end    "2013-07-08 09-00-00" \
+  --workers 8 \
+  --sample 5000
+```
+
+PowerShell:
+
+```powershell
+cd Back
+python scripts/preprocess_trips.py `
+  --input  real_taxi_data/od_month=07/consolidated.parquet `
+  --net    sumo_service/sumo_configs/NY/manhattan_car_only.net.xml `
+  --output sumo_service/sumo_configs/NY/trips_processed.json `
+  --start  "2013-07-08 08-00-00" `
+  --end    "2013-07-08 09-00-00" `
+  --workers 8 `
   --sample 5000
 ```
 
@@ -297,7 +314,7 @@ Back/
 │   │   ├── main.py                # FastAPI 앱 + WebSocket 엔드포인트 + CLI 스레드
 │   │   ├── simulation.py          # SimulationManager (TraCI 루프, 상태머신, 요금 누적)
 │   │   ├── connection_manager.py  # WebSocket 연결 관리 + 브로드캐스트
-│   │   ├── coord.py               # SUMO <-> WGS84 좌표 변환 (affine 근사)
+│   │   ├── coord.py               # SUMO <-> WGS84 좌표 변환 (TraCI 정밀 변환)
 │   │   ├── fare.py                # 요금 계산 (TripAccumulator, calculate_fare)
 │   │   ├── grid.py                # H3 격자 조회 + compute_surge
 │   │   ├── passenger.py           # Passenger 데이터클래스

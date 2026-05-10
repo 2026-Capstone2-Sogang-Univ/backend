@@ -87,7 +87,9 @@ python scripts/preprocess_trips.py \
   --input  real_taxi_data/od_month=07/consolidated.parquet \
   --net    back/sumo_service/sumo_configs/NY/manhattan_car_only.net.xml \
   --output back/sumo_service/sumo_configs/NY/trips_processed.json \
-  --date   2024-01-15 --hour 8 --sample 5000
+  --start  "2024-01-15 08-00-00" \
+  --end    "2024-01-15 09-00-00" \
+  --sample 5000
 ```
 
 ## Open Issues

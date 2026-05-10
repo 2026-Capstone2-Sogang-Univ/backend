@@ -1,5 +1,6 @@
 import asyncio
 import os
+import signal
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -17,6 +18,7 @@ _CLI_KEYS: dict[str, str] = {
     "u": "resume",
     "r": "restart",
     "e": "end",
+    "q": "quit",
 }
 
 
@@ -72,6 +74,10 @@ def _cli_loop(loop: asyncio.AbstractEventLoop, sim: SimulationManager) -> None:
             asyncio.run_coroutine_threadsafe(sim.restart(), loop)
         elif ch == "e":
             asyncio.run_coroutine_threadsafe(sim.stop(), loop)
+        elif ch == "q":
+            # Signal the main process to shut down gracefully
+            os.kill(os.getpid(), signal.SIGINT)
+            break
         else:
             continue
 
