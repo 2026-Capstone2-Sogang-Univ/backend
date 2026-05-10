@@ -1064,6 +1064,8 @@ class SimulationManager:
             angle = vals[tc.VAR_ANGLE]
             speed = vals[tc.VAR_SPEED]
             lat, lng = self._latlng(x, y)
+            if not (math.isfinite(lat) and math.isfinite(lng)):
+                continue
             state = self._taxi_states.get(veh_id, "empty")
             if state == "empty":
                 grid_supply[get_cell(lat, lng)] += 1
