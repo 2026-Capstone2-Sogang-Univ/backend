@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from .connection_manager import ConnectionManager
+from .db.engine import close_pool, init_pool
 from .simulation import SimulationManager
 from .routers import simulation as simulation_router
 from .routers import ws as ws_router
@@ -86,6 +87,7 @@ def _cli_loop(loop: asyncio.AbstractEventLoop, sim: SimulationManager) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await init_pool()
     loop = asyncio.get_event_loop()
     cli_thread = threading.Thread(
         target=_cli_loop,
@@ -96,6 +98,7 @@ async def lifespan(app: FastAPI):
     cli_thread.start()
     yield
     await app.state.manager.stop()
+    await close_pool()
 
 
 app = FastAPI(title="SUMO Service", version="0.1.0", lifespan=lifespan)

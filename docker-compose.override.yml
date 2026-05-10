@@ -6,6 +6,7 @@ services:
     environment:
       - WATCHFILES_FORCE_POLLING=true
       - PASSENGER_SOURCE=random
+      - DATABASE_URL=postgresql://sumo:sumo@postgres:5432/sumo
     command:
       [
         "uv", "run", "uvicorn", "app.main:app",

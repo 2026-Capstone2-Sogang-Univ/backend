@@ -4,6 +4,7 @@ import signal
 
 from fastapi import APIRouter, HTTPException, Request
 
+from ..db.engine import get_pool
 from ..grid import H3_RESOLUTION
 from ..simulation import SimStatus
 
@@ -79,6 +80,26 @@ async def get_passengers(request: Request):
 @router.get("/fare/{passenger_id}")
 async def get_fare(passenger_id: str, request: Request):
     manager = request.app.state.manager
+    pool = get_pool()
+    if pool is not None:
+        run_id = manager._run_id
+        if run_id is None:
+            raise HTTPException(status_code=404, detail="Fare not found")
+        row = await pool.fetchrow(
+            "SELECT taxi_id, fare, expected_fare, distance_m, dropoff_sim_time "
+            "FROM trip WHERE passenger_id = $1 AND run_id = $2 LIMIT 1",
+            passenger_id, run_id,
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="Fare not found")
+        return {
+            "passenger_id": passenger_id,
+            "taxi_id": row["taxi_id"],
+            "fare": row["fare"],
+            "expected_fare": row["expected_fare"],
+            "distance_m": row["distance_m"],
+            "sim_time": row["dropoff_sim_time"],
+        }
     result = manager.get_fare(passenger_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Fare not found")

@@ -1,8 +1,31 @@
 services:
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: sumo
+      POSTGRES_USER: sumo
+      POSTGRES_PASSWORD: sumo
+    volumes:
+      - ./sumo_service/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sumo -d sumo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   sumo-service:
     build:
       context: ./sumo_service
       dockerfile: Dockerfile
     ports:
       - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  pgdata:

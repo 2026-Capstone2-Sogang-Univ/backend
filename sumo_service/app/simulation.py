@@ -28,11 +28,15 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+import uuid
+
 import traci
 import traci.exceptions
 from traci import constants as tc
 
 from .coord import make_sumolib_converter, sumo_to_latlng
+from .db.engine import get_pool
+from .db.writer import db_writer_task as _db_writer_task
 from .fare import SPEED_THRESHOLD_MPS, TripAccumulator, calculate_fare, estimate_fare
 from .grid import H3_RESOLUTION, cell_center_latlng, compute_surge, get_cell
 from .passenger import Passenger
@@ -193,6 +197,10 @@ class SimulationManager:
         self._bg_route_counter: int = 0
         self._edge_weights: list[float] = []
         self._routable_edges_set: set[str] = set()
+        self._run_id: int | None = None
+        self._db_queue: asyncio.Queue | None = None
+        self._db_writer_task: asyncio.Task | None = None
+        self._taxi_dispatch_ids: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Public async API (called from FastAPI endpoints)
@@ -205,6 +213,31 @@ class SimulationManager:
         self._stop_event.clear()
         self._loop = asyncio.get_event_loop()
         self._state_queue = asyncio.Queue()
+
+        pool = get_pool()
+        if pool is not None:
+            params = json.dumps({
+                "n_taxis": N_TAXIS,
+                "n_background_cars": N_BACKGROUND_CARS,
+                "frame_rate": FRAME_RATE,
+                "simulation_speed": SIMULATION_SPEED,
+                "passenger_lambda": PASSENGER_LAMBDA,
+                "dispatch_timeout_s": DISPATCH_TIMEOUT_S,
+                "trip_timeout_s": TRIP_TIMEOUT_S,
+            })
+            async with pool.acquire() as conn:
+                self._run_id = await conn.fetchval(
+                    "INSERT INTO simulation_run (sim_duration_s, passenger_source, params) "
+                    "VALUES ($1, $2, $3) RETURNING id",
+                    SIM_DURATION, PASSENGER_SOURCE, params,
+                )
+                await conn.executemany(
+                    "INSERT INTO taxi (run_id, taxi_id) VALUES ($1, $2)",
+                    [(self._run_id, f"taxi_{i}") for i in range(N_TAXIS)],
+                )
+        self._db_queue = asyncio.Queue()
+        self._db_writer_task = asyncio.create_task(_db_writer_task(self._db_queue))
+
         self.status = SimStatus.RUNNING
         self._executor_task = self._loop.run_in_executor(None, self._run_loop)
         self._broadcast_task = asyncio.create_task(self._broadcast_loop())
@@ -270,6 +303,24 @@ class SimulationManager:
             except Exception:
                 pass
             self._executor_task = None
+        # Flush any pending call_soon_threadsafe callbacks from the run thread
+        await asyncio.sleep(0)
+        # Push run_end and drain DB writer before resetting state
+        if self._run_id is not None and self._db_queue is not None:
+            end_reason = (
+                "duration" if self.status == SimStatus.FINISHED
+                else "error" if self.status == SimStatus.IDLE
+                else "manual_stop"
+            )
+            await self._db_queue.put({"type": "run_end", "run_id": self._run_id, "end_reason": end_reason})
+        if self._db_queue is not None:
+            await self._db_queue.put(None)
+        if self._db_writer_task is not None:
+            try:
+                await self._db_writer_task
+            except Exception:
+                pass
+            self._db_writer_task = None
         self.status = SimStatus.IDLE
         if self.connection_manager is not None:
             self.connection_manager.clear_boundary()
@@ -291,6 +342,9 @@ class SimulationManager:
             self._bg_route_counter = 0
             self._edge_weights = []
             self._routable_edges_set = set()
+            self._run_id = None
+            self._db_queue = None
+            self._taxi_dispatch_ids = {}
 
     # ------------------------------------------------------------------
     # Async broadcast loop — runs in the event loop
@@ -378,11 +432,14 @@ class SimulationManager:
                 with open(TRIPS_FILE) as f:
                     self._trip_queue = sorted(json.load(f), key=lambda t: t["sim_time"])
 
+            next_deadline = time.perf_counter()
             while not self._stop_event.is_set():
                 if self._paused:
                     time.sleep(0.05)
+                    next_deadline = time.perf_counter()  # pause 중 누적 방지
                     continue
 
+                next_deadline += REAL_STEP_SLEEP
                 traci.simulationStep()
                 sim_time = traci.simulation.getTime()
 
@@ -426,22 +483,41 @@ class SimulationManager:
                             pid = self._taxi_targets.pop(taxi_id, None)
                             p = self._passengers.pop(pid, None) if pid else None
                             if p:
+                                fare = calculate_fare(accum)
                                 self._completed_passengers.append({
                                     "passenger_id": pid,
                                     "taxi_id": taxi_id,
-                                    "fare": calculate_fare(accum),
+                                    "fare": fare,
                                     "expected_fare": p.expected_fare,
                                     "distance_m": accum.distance_m,
                                     "sim_time": sim_time,
                                 })
                                 if len(self._completed_passengers) > MAX_COMPLETED_PASSENGERS:
                                     self._completed_passengers.pop(0)
+                                self._push_db_event({
+                                    "type": "trip",
+                                    "run_id": self._run_id,
+                                    "passenger_id": pid,
+                                    "taxi_id": taxi_id,
+                                    "dispatch_id": accum.dispatch_id,
+                                    "dispatch_sim_time": accum.dispatch_sim_time,
+                                    "pickup_sim_time": accum.pickup_sim_time,
+                                    "dropoff_sim_time": sim_time,
+                                    "distance_m": accum.distance_m,
+                                    "low_speed_seconds": accum.low_speed_seconds,
+                                    "fare": fare,
+                                    "expected_fare": p.expected_fare,
+                                    "completion": "forced_at_end",
+                                })
+                            self._taxi_dispatch_ids.pop(taxi_id, None)
                         self._active_trips.clear()
                     self.status = SimStatus.FINISHED
                     self._loop.call_soon_threadsafe(self._state_queue.put_nowait, None)
                     break
 
-                time.sleep(REAL_STEP_SLEEP)
+                remaining = next_deadline - time.perf_counter()
+                if remaining > 0:
+                    time.sleep(remaining)
 
         except traci.exceptions.FatalTraCIError:
             # SUMO closed the connection (e.g. reached configured end time)
@@ -455,11 +531,16 @@ class SimulationManager:
             except Exception:
                 pass
 
+    def _push_db_event(self, event: dict) -> None:
+        if self._run_id is None or self._db_queue is None or self._loop is None:
+            return
+        self._loop.call_soon_threadsafe(self._db_queue.put_nowait, event)
+
     def _spawn_passengers(self, sim_time: float) -> None:
         if PASSENGER_SOURCE == "parquet":
             while self._trip_queue and self._trip_queue[0]["sim_time"] <= sim_time:
                 trip = self._trip_queue.pop(0)
-                self._create_passenger_from_trip(trip)
+                self._create_passenger_from_trip(trip, sim_time)
         else:
             interval = int(sim_time / PASSENGER_SPAWN_INTERVAL)
             if interval <= self._last_spawn_interval:
@@ -467,7 +548,7 @@ class SimulationManager:
             self._last_spawn_interval = interval
             n = _poisson_sample(PASSENGER_LAMBDA)
             for _ in range(n):
-                self._create_passenger_random()
+                self._create_passenger_random(sim_time)
 
     def _get_edge_midpoint(self, edge_id: str) -> tuple[float, float] | None:
         try:
@@ -486,7 +567,7 @@ class SimulationManager:
         mid = len(shape) // 2
         return shape[mid]
 
-    def _create_passenger_random(self) -> None:
+    def _create_passenger_random(self, sim_time: float) -> None:
         pickup_edge = _random.choice(self._routable_edges)
         dropoff_edge = _random.choice(self._routable_edges)
         if pickup_edge == dropoff_edge:
@@ -509,18 +590,36 @@ class SimulationManager:
         dlat, dlng = self._latlng(dx, dy)
         pid = f"p_{self._passenger_counter}"
         self._passenger_counter += 1
+        h3 = get_cell(lat, lng)
+        expected_fare = estimate_fare(route.length)
         self._passengers[pid] = Passenger(
             id=pid, x=x, y=y, lat=lat, lng=lng,
             pickup_edge=pickup_edge, dropoff_edge=dropoff_edge,
             dropoff_x=dx, dropoff_y=dy, dropoff_lat=dlat, dropoff_lng=dlng,
             expected_distance_m=route.length,
-            expected_fare=estimate_fare(route.length),
-            spawn_time=0.0,
+            expected_fare=expected_fare,
+            spawn_time=sim_time,
             state="waiting",
-            h3_pickup=get_cell(lat, lng),
+            h3_pickup=h3,
         )
+        self._push_db_event({
+            "type": "passenger",
+            "run_id": self._run_id,
+            "passenger_id": pid,
+            "spawn_sim_time": sim_time,
+            "pickup_edge": pickup_edge,
+            "dropoff_edge": dropoff_edge,
+            "pickup_lat": lat,
+            "pickup_lng": lng,
+            "dropoff_lat": dlat,
+            "dropoff_lng": dlng,
+            "expected_distance_m": route.length,
+            "expected_fare": expected_fare,
+            "h3_pickup": h3,
+            "source": "random",
+        })
 
-    def _create_passenger_from_trip(self, trip: dict) -> None:
+    def _create_passenger_from_trip(self, trip: dict, sim_time: float) -> None:
         pickup_edge = trip["pickup_edge"]
         dropoff_edge = trip["dropoff_edge"]
         # SCC 외부 엣지면 스킵: 픽업이 외부면 배차 불가, 하차가 외부면 택시 갇힘
@@ -545,16 +644,34 @@ class SimulationManager:
         dlat, dlng = self._latlng(dx, dy)
         pid = f"p_{self._passenger_counter}"
         self._passenger_counter += 1
+        h3 = trip["h3_pickup"]
+        expected_fare = estimate_fare(route.length)
         self._passengers[pid] = Passenger(
             id=pid, x=x, y=y, lat=lat, lng=lng,
             pickup_edge=pickup_edge, dropoff_edge=dropoff_edge,
             dropoff_x=dx, dropoff_y=dy, dropoff_lat=dlat, dropoff_lng=dlng,
             expected_distance_m=route.length,
-            expected_fare=estimate_fare(route.length),
-            spawn_time=0.0,
+            expected_fare=expected_fare,
+            spawn_time=sim_time,
             state="waiting",
-            h3_pickup=trip["h3_pickup"],
+            h3_pickup=h3,
         )
+        self._push_db_event({
+            "type": "passenger",
+            "run_id": self._run_id,
+            "passenger_id": pid,
+            "spawn_sim_time": sim_time,
+            "pickup_edge": pickup_edge,
+            "dropoff_edge": dropoff_edge,
+            "pickup_lat": lat,
+            "pickup_lng": lng,
+            "dropoff_lat": dlat,
+            "dropoff_lng": dlng,
+            "expected_distance_m": route.length,
+            "expected_fare": expected_fare,
+            "h3_pickup": h3,
+            "source": "parquet",
+        })
 
     def _update_taxi_states(self, sim_time: float, sub_results: dict) -> list[dict]:
         fare_updates: list[dict] = []
@@ -583,6 +700,17 @@ class SimulationManager:
                 self._taxi_targets[veh_id] = nearest.id
                 self._taxi_states[veh_id] = "dispatched"
                 self._taxi_dispatch_times[veh_id] = sim_time
+                dispatch_id = str(uuid.uuid4())
+                self._taxi_dispatch_ids[veh_id] = dispatch_id
+                self._push_db_event({
+                    "type": "dispatch",
+                    "id": dispatch_id,
+                    "run_id": self._run_id,
+                    "passenger_id": nearest.id,
+                    "taxi_id": veh_id,
+                    "dispatch_sim_time": sim_time,
+                    "estimated_pickup_distance_m": route.length,
+                })
 
             # 단계 2 — 픽업: 택시가 픽업 엣지 위에 도달했을 때 (또는 배차 타임아웃)
             elif state == "dispatched":
@@ -600,6 +728,9 @@ class SimulationManager:
                     self._taxi_states[veh_id] = "empty"
                     self._taxi_dispatch_times.pop(veh_id, None)
                     waiting_passengers.append(passenger)
+                    old_dispatch_id = self._taxi_dispatch_ids.pop(veh_id, None)
+                    if old_dispatch_id:
+                        self._push_db_event({"type": "dispatch_timeout", "id": old_dispatch_id})
                     continue
                 if road_id == passenger.pickup_edge:
                     try:
@@ -611,10 +742,12 @@ class SimulationManager:
                         continue
                     passenger.state = "picked_up"
                     self._taxi_states[veh_id] = "occupied"
-                    self._taxi_dispatch_times.pop(veh_id, None)
+                    dispatch_time = self._taxi_dispatch_times.pop(veh_id, sim_time)
                     self._active_trips[veh_id] = TripAccumulator(
                         passenger_id=passenger_id,
                         pickup_sim_time=sim_time,
+                        dispatch_id=self._taxi_dispatch_ids.get(veh_id),
+                        dispatch_sim_time=dispatch_time,
                         last_distance_snapshot=traci.vehicle.getDistance(veh_id),
                     )
 
@@ -629,36 +762,70 @@ class SimulationManager:
                 accum = self._active_trips.get(veh_id)
                 # 트립 타임아웃: 누적된 요금으로 강제 완료
                 if accum and sim_time - accum.pickup_sim_time > TRIP_TIMEOUT_S:
+                    fare = calculate_fare(accum)
                     fare_updates.append({
                         "passenger_id": passenger_id,
                         "taxi_id": veh_id,
-                        "fare": calculate_fare(accum),
+                        "fare": fare,
                         "expected_fare": passenger.expected_fare,
                         "distance_m": accum.distance_m,
                         "sim_time": sim_time,
+                    })
+                    self._push_db_event({
+                        "type": "trip",
+                        "run_id": self._run_id,
+                        "passenger_id": passenger_id,
+                        "taxi_id": veh_id,
+                        "dispatch_id": accum.dispatch_id,
+                        "dispatch_sim_time": accum.dispatch_sim_time,
+                        "pickup_sim_time": accum.pickup_sim_time,
+                        "dropoff_sim_time": sim_time,
+                        "distance_m": accum.distance_m,
+                        "low_speed_seconds": accum.low_speed_seconds,
+                        "fare": fare,
+                        "expected_fare": passenger.expected_fare,
+                        "completion": "trip_timeout",
                     })
                     del self._passengers[passenger_id]
                     del self._active_trips[veh_id]
                     del self._taxi_targets[veh_id]
                     self._taxi_states[veh_id] = "empty"
+                    self._taxi_dispatch_ids.pop(veh_id, None)
                     route = self._random_route_from(road_id)
                     if route:
                         traci.vehicle.setRoute(veh_id, route)
                     continue
                 if road_id == passenger.dropoff_edge:
                     accum = self._active_trips[veh_id]
+                    fare = calculate_fare(accum)
                     fare_updates.append({
                         "passenger_id": passenger_id,
                         "taxi_id": veh_id,
-                        "fare": calculate_fare(accum),
+                        "fare": fare,
                         "expected_fare": passenger.expected_fare,
                         "distance_m": accum.distance_m,
                         "sim_time": sim_time,
+                    })
+                    self._push_db_event({
+                        "type": "trip",
+                        "run_id": self._run_id,
+                        "passenger_id": passenger_id,
+                        "taxi_id": veh_id,
+                        "dispatch_id": accum.dispatch_id,
+                        "dispatch_sim_time": accum.dispatch_sim_time,
+                        "pickup_sim_time": accum.pickup_sim_time,
+                        "dropoff_sim_time": sim_time,
+                        "distance_m": accum.distance_m,
+                        "low_speed_seconds": accum.low_speed_seconds,
+                        "fare": fare,
+                        "expected_fare": passenger.expected_fare,
+                        "completion": "normal",
                     })
                     del self._passengers[passenger_id]
                     del self._active_trips[veh_id]
                     del self._taxi_targets[veh_id]
                     self._taxi_states[veh_id] = "empty"
+                    self._taxi_dispatch_ids.pop(veh_id, None)
                     route = self._random_route_from(road_id)
                     if route:
                         traci.vehicle.setRoute(veh_id, route)
@@ -674,17 +841,34 @@ class SimulationManager:
                 passenger_id = self._taxi_targets.pop(taxi_id, None)
                 passenger = self._passengers.pop(passenger_id, None) if passenger_id else None
                 if passenger:
+                    fare = calculate_fare(accum)
                     fare_updates.append({
                         "passenger_id": passenger_id,
                         "taxi_id": taxi_id,
-                        "fare": calculate_fare(accum),
+                        "fare": fare,
                         "expected_fare": passenger.expected_fare,
                         "distance_m": accum.distance_m,
                         "sim_time": sim_time,
                     })
+                    self._push_db_event({
+                        "type": "trip",
+                        "run_id": self._run_id,
+                        "passenger_id": passenger_id,
+                        "taxi_id": taxi_id,
+                        "dispatch_id": accum.dispatch_id,
+                        "dispatch_sim_time": accum.dispatch_sim_time,
+                        "pickup_sim_time": accum.pickup_sim_time,
+                        "dropoff_sim_time": sim_time,
+                        "distance_m": accum.distance_m,
+                        "low_speed_seconds": accum.low_speed_seconds,
+                        "fare": fare,
+                        "expected_fare": passenger.expected_fare,
+                        "completion": "sumo_removed",
+                    })
                 self._active_trips.pop(taxi_id, None)
                 self._taxi_states.pop(taxi_id, None)
                 self._taxi_dispatch_times.pop(taxi_id, None)
+                self._taxi_dispatch_ids.pop(taxi_id, None)
                 continue
             dist = vals[tc.VAR_DISTANCE]
             delta = dist - accum.last_distance_snapshot

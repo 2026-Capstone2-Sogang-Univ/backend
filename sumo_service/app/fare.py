@@ -33,6 +33,8 @@ class TripAccumulator:
     distance_m: float = 0.0
     low_speed_seconds: float = 0.0
     last_distance_snapshot: float = 0.0
+    dispatch_id: str | None = None
+    dispatch_sim_time: float = 0.0
 
 
 def calculate_fare(a: TripAccumulator) -> int:
