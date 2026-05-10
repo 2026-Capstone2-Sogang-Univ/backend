@@ -55,7 +55,7 @@ SUMO_NET = str(
 # Set SUMO_GUI=1 to open the SUMO GUI window (useful for local debugging).
 SUMO_BINARY = "sumo-gui" if os.getenv("SUMO_GUI") == "1" else "sumo"
 
-SIM_DURATION = 36000.0  # simulated seconds (10 hours)
+SIM_DURATION = 3600.0  # simulated seconds (10 hours)
 FRAME_RATE = 60.0  # broadcast fps (WebSocket messages per real second)
 SIMULATION_SPEED = 20.0  # simulation speed (simulated seconds per real second)
 STEP_LENGTH = (
@@ -192,6 +192,7 @@ class SimulationManager:
         self._latlng: Callable[[float, float], tuple[float, float]] | None = None
         self._bg_route_counter: int = 0
         self._edge_weights: list[float] = []
+        self._routable_edges_set: set[str] = set()
 
     # ------------------------------------------------------------------
     # Public async API (called from FastAPI endpoints)
@@ -289,6 +290,7 @@ class SimulationManager:
             self._latlng = None
             self._bg_route_counter = 0
             self._edge_weights = []
+            self._routable_edges_set = set()
 
     # ------------------------------------------------------------------
     # Async broadcast loop — runs in the event loop
@@ -364,6 +366,7 @@ class SimulationManager:
                     f"{len(self._routable_edges)} (run scripts/compute_scc.py to cache)",
                     flush=True,
                 )
+            self._routable_edges_set = set(self._routable_edges)
             self._edge_weights = self._compute_edge_weights()
             self._add_initial_vehicles()
 
@@ -520,6 +523,10 @@ class SimulationManager:
     def _create_passenger_from_trip(self, trip: dict) -> None:
         pickup_edge = trip["pickup_edge"]
         dropoff_edge = trip["dropoff_edge"]
+        # SCC 외부 엣지면 스킵: 픽업이 외부면 배차 불가, 하차가 외부면 택시 갇힘
+        if pickup_edge not in self._routable_edges_set or \
+           dropoff_edge not in self._routable_edges_set:
+            return
         try:
             route = traci.simulation.findRoute(pickup_edge, dropoff_edge)
         except traci.exceptions.TraCIException:

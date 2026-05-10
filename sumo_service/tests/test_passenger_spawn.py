@@ -51,6 +51,7 @@ _SHAPE = [(100.0, 200.0), (110.0, 210.0), (120.0, 220.0)]
 def make_manager() -> SimulationManager:
     mgr = SimulationManager()
     mgr._routable_edges = EDGES
+    mgr._routable_edges_set = set(EDGES)
     mgr._latlng = lambda x, y: (40.7 + y * 1e-5, -74.0 + x * 1e-5)
     return mgr
 
@@ -169,3 +170,55 @@ def test_parquet_no_spawn_before_time():
         mgr._spawn_passengers(100.0)
     assert len(mgr._passengers) == 0
     assert len(mgr._trip_queue) == 1
+
+
+def test_parquet_skips_pickup_outside_scc():
+    mgr = make_manager()
+    trip = {
+        "sim_time": 50.0,
+        "pickup_edge": "outside_edge",  # not in EDGES
+        "dropoff_edge": "edge_1",
+        "h3_pickup": "892830828cbffff",
+    }
+    mgr._trip_queue = [trip]
+    _traci_stub.simulation.findRoute.return_value = _ROUTE
+    _traci_stub.lane.getShape.return_value = _SHAPE
+    with patch("app.simulation.PASSENGER_SOURCE", "parquet"):
+        mgr._spawn_passengers(100.0)
+    assert len(mgr._passengers) == 0
+
+
+def test_parquet_skips_dropoff_outside_scc():
+    mgr = make_manager()
+    trip = {
+        "sim_time": 50.0,
+        "pickup_edge": "edge_0",
+        "dropoff_edge": "outside_edge",  # not in EDGES
+        "h3_pickup": "892830828cbffff",
+    }
+    mgr._trip_queue = [trip]
+    _traci_stub.simulation.findRoute.return_value = _ROUTE
+    _traci_stub.lane.getShape.return_value = _SHAPE
+    with patch("app.simulation.PASSENGER_SOURCE", "parquet"):
+        mgr._spawn_passengers(100.0)
+    assert len(mgr._passengers) == 0
+
+
+def test_parquet_outside_scc_trip_consumed_from_queue():
+    """SCC 외부 trip이라도 큐에서 제거되어야 다음 trip이 처리됨."""
+    mgr = make_manager()
+    trip_outside = {
+        "sim_time": 50.0,
+        "pickup_edge": "outside_edge",
+        "dropoff_edge": "edge_1",
+        "h3_pickup": "892830828cbffff",
+    }
+    trip_inside = _make_trip(60.0)
+    mgr._trip_queue = [trip_outside, trip_inside]
+    _traci_stub.simulation.findRoute.return_value = _ROUTE
+    _traci_stub.lane.getShape.return_value = _SHAPE
+    with patch("app.simulation.PASSENGER_SOURCE", "parquet"):
+        mgr._spawn_passengers(100.0)
+    # 외부 trip은 스킵되지만 큐에서 빠지고, 내부 trip 1개만 스폰
+    assert len(mgr._passengers) == 1
+    assert len(mgr._trip_queue) == 0

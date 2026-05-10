@@ -9,6 +9,7 @@ dependencies = [
     "eclipse-sumo>=1.21.0",
     "traci>=1.21.0",
     "h3>=4.0.0",
+    "pyproj>=3.6",
 ]
 
 [build-system]
