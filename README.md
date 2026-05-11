@@ -16,8 +16,8 @@
 │                         WebSocket Client                         │
 └──────────────────────────────┬──────────────────────────────────┘
                                │ WebSocket
-                               │ boundary / vehicles / passengers
-                               │ surge / fare_update / finished
+                               │ boundary / snapshot / surge
+                               │ fare_update / finished
                                │
 ┌──────────────────────────────▼──────────────────────────────────┐
 │                         SUMO Service                             │
@@ -41,12 +41,16 @@
 
 - SUMO 1.26 시뮬레이터를 TraCI API로 제어하는 핵심 서비스
 - 맨해튼 OSM 기반 도로 네트워크(`manhattan_car_only.net.xml`) 사용
-- 초기 상태: 빈 택시 50대 + 배경 일반 차량 200대 (TraCI로 동적 생성)
+- 초기 상태: 빈 택시 300대 + 배경 일반 차량 1,200대 (TraCI로 동적 생성)
 - 시뮬레이션 속도: 20× 가속 모드 (실제 1초 = 시뮬레이션 20초)
 - 종료 조건: 시뮬레이션 시간 3,600초(1시간) 도달 시 자동 종료
 - 승객 생성: 5분 시뮬 주기마다 Poisson 분포(λ=5), `random` / `parquet` 이중 모드
-- 요금 계산: 거리 + 저속 시간 기반 (서울 택시 요금 체계 근사)
+- 배차 타임아웃: 600초 내 미픽업 시 재배차 (새 택시 즉시 배정)
+- 트립 타임아웃: 1,800초 내 미하차 시 강제 완료 처리
+- 빈 택시 경로: 핫스팟(Times Square, Penn Station 등) 가중치 기반 무작위 재배정
+- 요금 계산: NYC 택시 미터 요금체계 (기본료 $3.00 + 거리/저속 추가 + 고정 할증 $1.50)
 - H3 격자(해상도 9) 기반 공급/수요 집계 및 서지 계수(surge coefficient) 계산
+- DB 영속화: PostgreSQL 16 + TimescaleDB — 모든 run/승객/배차/트립 기록
 
 ### Prediction Service [미구현]
 
@@ -71,6 +75,8 @@
 | 웹 프레임워크 | FastAPI + Uvicorn |
 | WebSocket | FastAPI WebSocket (Starlette) |
 | H3 격자 | h3 4.x |
+| DB | PostgreSQL 16 + TimescaleDB |
+| DB 드라이버 | asyncpg |
 | 내부 통신 | gRPC (예정) |
 | 배포 | Docker, Docker Compose |
 | 언어 | Python 3.11 |
@@ -84,12 +90,22 @@
 
 - Docker, Docker Compose
 
+### 환경변수
+
+| 변수 | 기본값 | 설명 |
+|------|--------|------|
+| `PASSENGER_SOURCE` | `random` | 승객 생성 모드 (`random` / `parquet`) |
+| `DATABASE_URL` | 없음 | PostgreSQL 연결 문자열. 미설정 시 DB 기능 비활성화 (no-op) |
+| `SUMO_GUI` | 없음 | `1` 설정 시 SUMO GUI 창 오픈 (로컬 디버깅 전용) |
+
 ### 전체 시스템 실행
 
 ```bash
 cd Back
 docker compose up --build
 ```
+
+`docker-compose.override.yml`에 `DATABASE_URL`이 설정되어 있어 postgres 컨테이너와 자동 연결.  
 
 ### 시뮬레이션 제어
 
@@ -151,7 +167,7 @@ uv run uvicorn app.main:app --reload --port 8080
 | 타입 | 전송 빈도 | 설명 |
 |------|----------|------|
 | `boundary` | 연결당 1회 | SUMO 내부 좌표 + WGS84 지리 경계 |
-| `snapshot` | 60 fps | 차량 전체 + 대기/배차 승객 목록 (단일 메시지) |
+| `snapshot` | 60 fps | 택시 전체 + 대기/배차 승객 목록 (단일 메시지) |
 | `surge` | 5 시뮬 초마다 | H3 셀별 공급·수요·서지 계수 |
 | `fare_update` | 하차 시 1회 | 실제 요금 및 이동 거리 기록 |
 | `finished` | 시뮬 종료 시 1회 | 시뮬레이션 3,600초 도달 알림 |
@@ -180,7 +196,7 @@ uv run uvicorn app.main:app --reload --port 8080
 
 ### snapshot
 
-매 스텝(60 fps) 전송. 차량과 승객을 하나의 메시지로 묶어 전송합니다.
+매 스텝(60 fps) 전송. 택시와 승객을 하나의 메시지로 묶어 전송합니다.  
 
 ```json
 {
@@ -195,12 +211,11 @@ uv run uvicorn app.main:app --reload --port 8080
 }
 ```
 
-| state | 대상 | 의미 |
-|-------|------|------|
-| `car` | 배경 차량 | 일반 차량 |
-| `empty` | 택시 | 승객 없음, 배차 대기 중 |
-| `dispatched` | 택시 | 승객 픽업 이동 중 |
-| `occupied` | 택시 | 승객 탑승, 목적지 이동 중 |
+| state | 의미 |
+|-------|------|
+| `empty` | 승객 없음, 배차 대기 중 |
+| `dispatched` | 승객 픽업 이동 중 |
+| `occupied` | 승객 탑승, 목적지 이동 중 |
 
 `passengers`는 대기(`waiting`) 및 배차됨(`assigned`) 상태만 포함합니다. 탑승 후 목록에서 제거됩니다.
 
@@ -323,15 +338,21 @@ Back/
 │   │   ├── main.py                # FastAPI 앱 + WebSocket 엔드포인트 + CLI 스레드
 │   │   ├── simulation.py          # SimulationManager (TraCI 루프, 상태머신, 요금 누적)
 │   │   ├── connection_manager.py  # WebSocket 연결 관리 + 브로드캐스트
-│   │   ├── coord.py               # SUMO <-> WGS84 좌표 변환 (TraCI 정밀 변환)
+│   │   ├── coord.py               # SUMO <-> WGS84 좌표 변환 (sumolib 기반)
 │   │   ├── fare.py                # 요금 계산 (TripAccumulator, calculate_fare)
 │   │   ├── grid.py                # H3 격자 조회 + compute_surge
 │   │   ├── passenger.py           # Passenger 데이터클래스
+│   │   ├── db/
+│   │   │   ├── engine.py          # asyncpg 풀 관리 (DATABASE_URL 없으면 no-op)
+│   │   │   └── writer.py          # asyncio.Queue 기반 비동기 DB 라이터
 │   │   └── routers/
-│   │       └── simulation.py      # REST 라우터 (start/pause/resume/restart/status/fare/surge/passengers)
+│   │       ├── simulation.py      # REST 라우터 (start/pause/resume/restart/stop/shutdown/status/fare/surge/passengers)
+│   │       └── ws.py              # WebSocket 라우터
+│   ├── db/
+│   │   └── init.sql               # DB 스키마 (simulation_run/passenger/taxi/dispatch/trip)
 │   ├── sumo_configs/
 │   │   └── NY/                    # 맨해튼 SUMO 네트워크 설정 파일
-│   ├── tests/                     # 단위 테스트 61개 (pytest, SUMO 없이 실행 가능)
+│   ├── tests/                     # 단위 테스트 (pytest, SUMO/Docker 없이 실행 가능)
 │   ├── Dockerfile
 │   └── pyproject.toml
 ├── scripts/
