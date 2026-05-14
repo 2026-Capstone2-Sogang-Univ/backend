@@ -1,1 +1,2 @@
 *.net.xml filter=lfs diff=lfs merge=lfs -text
+sumo_service/sumo_configs/NY/trips_processed.json filter=lfs diff=lfs merge=lfs -text
