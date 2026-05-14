@@ -194,7 +194,8 @@ class SimulationManager:
         self._completed_passengers: list[dict] = []
         self._trip_queue: list[dict] = []
         self._latlng: Callable[[float, float], tuple[float, float]] | None = None
-        self._bg_route_counter: int = 0
+        self._bg_last_edges: dict[str, str] = {}
+        self._taxi_last_edges: dict[str, str] = {}
         self._edge_weights: list[float] = []
         self._routable_edges_set: set[str] = set()
         self._run_id: int | None = None
@@ -339,7 +340,8 @@ class SimulationManager:
             self._completed_passengers = []
             self._trip_queue = []
             self._latlng = None
-            self._bg_route_counter = 0
+            self._bg_last_edges = {}
+            self._taxi_last_edges = {}
             self._edge_weights = []
             self._routable_edges_set = set()
             self._run_id = None
@@ -427,6 +429,8 @@ class SimulationManager:
             for veh_id in traci.vehicle.getIDList():
                 if veh_id.startswith("taxi_"):
                     traci.vehicle.subscribe(veh_id, _SUB_VARS)
+                elif veh_id.startswith("bg_"):
+                    traci.vehicle.subscribe(veh_id, [tc.VAR_ROAD_ID])
 
             if PASSENGER_SOURCE == "parquet":
                 with open(TRIPS_FILE) as f:
@@ -447,11 +451,8 @@ class SimulationManager:
                     if veh_id.startswith("taxi_"):
                         traci.vehicle.subscribe(veh_id, _SUB_VARS)
 
-                for veh_id in traci.simulation.getArrivedIDList():
-                    if veh_id.startswith("bg_"):
-                        self._respawn_background_car(veh_id)
-
                 sub_results = traci.vehicle.getAllSubscriptionResults()
+                self._extend_vehicle_routes(sub_results)
 
                 self._spawn_passengers(sim_time)
                 fare_updates = self._update_taxi_states(sim_time, sub_results)
@@ -794,6 +795,7 @@ class SimulationManager:
                     route = self._random_route_from(road_id)
                     if route:
                         traci.vehicle.setRoute(veh_id, route)
+                        self._taxi_last_edges[veh_id] = route[-1]
                     continue
                 if road_id == passenger.dropoff_edge:
                     accum = self._active_trips[veh_id]
@@ -829,6 +831,7 @@ class SimulationManager:
                     route = self._random_route_from(road_id)
                     if route:
                         traci.vehicle.setRoute(veh_id, route)
+                        self._taxi_last_edges[veh_id] = route[-1]
 
         return fare_updates
 
@@ -953,6 +956,8 @@ class SimulationManager:
                 departPos="random_free",
                 departSpeed="max",
             )
+            traci.vehicle.subscribe(f"bg_{i}", [tc.VAR_ROAD_ID])
+            self._bg_last_edges[f"bg_{i}"] = route_edges[-1]
 
         for i in range(N_TAXIS):
             route_edges = self._random_route(edges)
@@ -968,21 +973,38 @@ class SimulationManager:
                 departPos="random_free",
                 departSpeed="max",
             )
+            self._taxi_last_edges[f"taxi_{i}"] = route_edges[-1]
 
-    def _respawn_background_car(self, veh_id: str) -> None:
-        route_edges = self._random_route(self._routable_edges)
-        route_id = f"bg_route_{self._bg_route_counter}"
-        self._bg_route_counter += 1
-        traci.route.add(route_id, route_edges)
-        traci.vehicle.add(
-            vehID=veh_id,
-            routeID=route_id,
-            typeID="DEFAULT_VEHTYPE",
-            depart="now",
-            departLane="best",
-            departPos="random_free",
-            departSpeed="max",
-        )
+    def _extend_vehicle_routes(self, sub_results: dict) -> None:
+        """마지막 엣지에 진입한 bg 차량·empty 택시에 새 경로를 할당해 리스폰 점프를 방지."""
+        for veh_id, vals in sub_results.items():
+            road_id = vals.get(tc.VAR_ROAD_ID, "")
+            if not road_id or road_id.startswith(":"):
+                continue
+
+            if veh_id.startswith("bg_"):
+                if road_id != self._bg_last_edges.get(veh_id):
+                    continue
+                new_route = self._random_route_from(road_id)
+                if new_route:
+                    try:
+                        traci.vehicle.setRoute(veh_id, new_route)
+                        self._bg_last_edges[veh_id] = new_route[-1]
+                    except traci.exceptions.TraCIException:
+                        pass
+
+            elif veh_id.startswith("taxi_"):
+                if self._taxi_states.get(veh_id, "empty") != "empty":
+                    continue
+                if road_id != self._taxi_last_edges.get(veh_id):
+                    continue
+                new_route = self._random_route_from(road_id)
+                if new_route:
+                    try:
+                        traci.vehicle.setRoute(veh_id, new_route)
+                        self._taxi_last_edges[veh_id] = new_route[-1]
+                    except traci.exceptions.TraCIException:
+                        pass
 
     def _compute_edge_weights(self) -> list[float]:
         """Compute weighted destination probability for each routable edge.
@@ -1060,6 +1082,8 @@ class SimulationManager:
 
         vehicles = []
         for veh_id, vals in sub_results.items():
+            if veh_id.startswith("bg_"):
+                continue
             x, y = vals[tc.VAR_POSITION]
             angle = vals[tc.VAR_ANGLE]
             speed = vals[tc.VAR_SPEED]

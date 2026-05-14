@@ -92,6 +92,11 @@ python scripts/preprocess_trips.py \
   --sample 5000
 ```
 
+## Analysis & Scripting Principles
+
+- Never approximate spatial data (coordinate bounds, cell lists, edge lists) with hardcoded guesses. Always derive them from actual project files (`routable_scc.json`, `.net.xml`, `.parquet`, etc.).
+- Before writing any analysis script, ask: "Does a file already exist that provides the data I need?" If yes, read it first.
+
 ## Open Issues
 
 - **gRPC proto contracts**: cannot be finalized until the ML model team confirms the Prediction Service input/output spec. This is the critical path for the full pipeline.
