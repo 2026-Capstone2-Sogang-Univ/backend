@@ -16,25 +16,30 @@ Duration: simulation auto-terminates at simulated time 3600s (1 hour).
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
+import logging
 import math
 import os
 import random as _random
 import threading
 import time
+import uuid
 from collections import defaultdict
 from collections.abc import Callable
+from datetime import datetime as _datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
-
-import uuid
 
 import traci
 import traci.exceptions
 from traci import constants as tc
 
 from .coord import make_sumolib_converter, sumo_to_latlng
+from .driver.decision_function import acceptance_probability as _acceptance_probability
+
+_logger = logging.getLogger(__name__)
 from .db.engine import get_pool
 from .db.writer import db_writer_task as _db_writer_task
 from .fare import SPEED_THRESHOLD_MPS, TripAccumulator, calculate_fare, estimate_fare
@@ -59,23 +64,28 @@ SUMO_NET = str(
 # Set SUMO_GUI=1 to open the SUMO GUI window (useful for local debugging).
 SUMO_BINARY = "sumo-gui" if os.getenv("SUMO_GUI") == "1" else "sumo"
 
-SIM_DURATION = 3600.0  # simulated seconds (10 hours)
+SIM_DURATION = float(os.getenv("SIM_DURATION", "3600"))        # simulated seconds
 FRAME_RATE = 60.0  # broadcast fps (WebSocket messages per real second)
-SIMULATION_SPEED = 20.0  # simulation speed (simulated seconds per real second)
+SIMULATION_SPEED = float(os.getenv("SIMULATION_SPEED", "20"))  # simulated seconds per real second
 STEP_LENGTH = (
     SIMULATION_SPEED / FRAME_RATE
 )  # simulated seconds per TraCI step (passed to SUMO)
 REAL_STEP_SLEEP = 1.0 / FRAME_RATE  # real seconds between TraCI steps
 
-N_TAXIS = 300
+N_TAXIS = int(os.getenv("N_TAXIS", "300"))
 N_BACKGROUND_CARS = 1200
 
 PASSENGER_SPAWN_INTERVAL = 300.0
-PASSENGER_LAMBDA = 5
+PASSENGER_LAMBDA = int(os.getenv("PASSENGER_LAMBDA", "5"))
 PICKUP_THRESHOLD_M = 30.0
 MAX_COMPLETED_PASSENGERS = 100
 DISPATCH_TIMEOUT_S = 600.0   # 배차 후 이 시간 내 픽업 못하면 재배차
 TRIP_TIMEOUT_S = 1800.0      # 탑승 후 이 시간 내 하차 못하면 강제 완료
+
+# 기사 행동 모델: V/s 테이블은 2013 NYC 데이터 기반 → 동일 시간대 사용
+SIM_BASE_DATETIME = _datetime(2013, 7, 8, 8, 0, 0)
+# parquet 모드에서 승객 대량 스폰 시 findRoute RPC 폭증 방지용 튜닝값
+DISPATCH_MAX_CANDIDATES = int(os.getenv("DISPATCH_MAX_CANDIDATES", "3"))
 
 PASSENGER_SOURCE = os.getenv("PASSENGER_SOURCE", "random")
 TRIPS_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "trips_processed.json"
@@ -202,6 +212,9 @@ class SimulationManager:
         self._db_queue: asyncio.Queue | None = None
         self._db_writer_task: asyncio.Task | None = None
         self._taxi_dispatch_ids: dict[str, str] = {}
+        self._taxi_last_dropoff_cells: dict[str, str] = {}
+        self._taxi_appeared: set[str] = set()   # taxis that have appeared in sub_results at least once
+        self._taxi_missing_since: dict[str, float] = {}  # veh_id → sim_time when first detected missing
 
     # ------------------------------------------------------------------
     # Public async API (called from FastAPI endpoints)
@@ -347,6 +360,9 @@ class SimulationManager:
             self._run_id = None
             self._db_queue = None
             self._taxi_dispatch_ids = {}
+            self._taxi_last_dropoff_cells = {}
+            self._taxi_appeared.clear()
+            self._taxi_missing_since.clear()
 
     # ------------------------------------------------------------------
     # Async broadcast loop — runs in the event loop
@@ -452,6 +468,45 @@ class SimulationManager:
                         traci.vehicle.subscribe(veh_id, _SUB_VARS)
 
                 sub_results = traci.vehicle.getAllSubscriptionResults()
+
+                # Track which taxis have appeared at least once, and clear stale missing records
+                for veh_id in sub_results:
+                    if veh_id.startswith("taxi_"):
+                        self._taxi_appeared.add(veh_id)
+                        self._taxi_missing_since.pop(veh_id, None)
+
+                # Respawn empty taxis that have definitively left the network.
+                # Only fires for taxis that (a) previously appeared, (b) are now absent,
+                # (c) have been missing for > _RESPAWN_THRESHOLD sim seconds.
+                _RESPAWN_THRESHOLD = 60.0
+                for veh_id in list(self._taxi_last_edges.keys()):
+                    if veh_id in sub_results:
+                        continue
+                    if veh_id not in self._taxi_appeared:
+                        continue  # never appeared yet (pending initial departure)
+                    if self._taxi_states.get(veh_id, "empty") != "empty":
+                        continue  # non-empty handled elsewhere
+                    missing_since = self._taxi_missing_since.get(veh_id)
+                    if missing_since is None:
+                        self._taxi_missing_since[veh_id] = sim_time
+                    elif sim_time - missing_since >= _RESPAWN_THRESHOLD:
+                        route_edges = self._random_route(self._routable_edges)
+                        if route_edges:
+                            route_id = f"respawn_{veh_id}_{int(sim_time)}"
+                            try:
+                                traci.route.add(route_id, route_edges)
+                                traci.vehicle.add(
+                                    vehID=veh_id, routeID=route_id, typeID="taxi",
+                                    depart=sim_time, departLane="best",
+                                    departPos="random_free", departSpeed="max",
+                                )
+                                traci.vehicle.subscribe(veh_id, _SUB_VARS)
+                                self._taxi_last_edges[veh_id] = self._trigger_edge(route_edges)
+                                self._taxi_missing_since.pop(veh_id, None)
+                                print(f"[respawn] {veh_id} at sim_time={sim_time:.0f}", flush=True)
+                            except traci.exceptions.TraCIException as e:
+                                print(f"[respawn] FAILED {veh_id}: {e}", flush=True)
+
                 self._extend_vehicle_routes(sub_results)
 
                 self._spawn_passengers(sim_time)
@@ -592,6 +647,7 @@ class SimulationManager:
         pid = f"p_{self._passenger_counter}"
         self._passenger_counter += 1
         h3 = get_cell(lat, lng)
+        h3_dropoff = get_cell(dlat, dlng)
         expected_fare = estimate_fare(route.length)
         self._passengers[pid] = Passenger(
             id=pid, x=x, y=y, lat=lat, lng=lng,
@@ -602,6 +658,7 @@ class SimulationManager:
             spawn_time=sim_time,
             state="waiting",
             h3_pickup=h3,
+            h3_dropoff=h3_dropoff,
         )
         self._push_db_event({
             "type": "passenger",
@@ -646,6 +703,7 @@ class SimulationManager:
         pid = f"p_{self._passenger_counter}"
         self._passenger_counter += 1
         h3 = trip["h3_pickup"]
+        h3_dropoff = get_cell(dlat, dlng)
         expected_fare = estimate_fare(route.length)
         self._passengers[pid] = Passenger(
             id=pid, x=x, y=y, lat=lat, lng=lng,
@@ -656,6 +714,7 @@ class SimulationManager:
             spawn_time=sim_time,
             state="waiting",
             h3_pickup=h3,
+            h3_dropoff=h3_dropoff,
         )
         self._push_db_event({
             "type": "passenger",
@@ -685,33 +744,75 @@ class SimulationManager:
             tx, ty = vals[tc.VAR_POSITION]
             road_id = vals.get(tc.VAR_ROAD_ID, "")
 
-            # 단계 1 — 배차: 가장 가까운 waiting 승객에게 배차
+            # 단계 1 — 배차: 거리 기준 상위 K명 검토 후 수락 확률로 배차
             if state == "empty" and waiting_passengers:
-                nearest = min(waiting_passengers,
-                              key=lambda p: (p.x - tx) ** 2 + (p.y - ty) ** 2)
-                try:
-                    route = traci.simulation.findRoute(road_id, nearest.pickup_edge)
-                    if not route.edges:
+                candidates = heapq.nsmallest(
+                    DISPATCH_MAX_CANDIDATES, waiting_passengers,
+                    key=lambda p: (p.x - tx) ** 2 + (p.y - ty) ** 2,
+                )
+                for candidate in candidates:
+                    try:
+                        route = traci.simulation.findRoute(road_id, candidate.pickup_edge)
+                        if not route.edges:
+                            continue
+                    except traci.exceptions.TraCIException:
                         continue
-                    traci.vehicle.setRoute(veh_id, list(route.edges))
-                except traci.exceptions.TraCIException:
-                    continue
-                nearest.state = "assigned"
-                waiting_passengers.remove(nearest)
-                self._taxi_targets[veh_id] = nearest.id
-                self._taxi_states[veh_id] = "dispatched"
-                self._taxi_dispatch_times[veh_id] = sim_time
-                dispatch_id = str(uuid.uuid4())
-                self._taxi_dispatch_ids[veh_id] = dispatch_id
-                self._push_db_event({
-                    "type": "dispatch",
-                    "id": dispatch_id,
-                    "run_id": self._run_id,
-                    "passenger_id": nearest.id,
-                    "taxi_id": veh_id,
-                    "dispatch_sim_time": sim_time,
-                    "estimated_pickup_distance_m": route.length,
-                })
+
+                    dispatch_id = str(uuid.uuid4())
+                    dispatch_payload = {
+                        "type": "dispatch",
+                        "id": dispatch_id,
+                        "run_id": self._run_id,
+                        "passenger_id": candidate.id,
+                        "taxi_id": veh_id,
+                        "dispatch_sim_time": sim_time,
+                        "estimated_pickup_distance_m": route.length,
+                    }
+
+                    if candidate.h3_pickup and candidate.h3_dropoff:
+                        D_pu_miles = route.length / 1609.344
+                        fare_usd   = candidate.expected_fare / 100.0
+                        trip_miles = candidate.expected_distance_m / 1609.344
+                        call_dt    = SIM_BASE_DATETIME + timedelta(seconds=sim_time)
+                        last_cell  = (self._taxi_last_dropoff_cells.get(veh_id)
+                                      or get_cell(*self._latlng(tx, ty)))
+                        try:
+                            p = _acceptance_probability(
+                                last_dropoff_cell=last_cell,
+                                pickup_cell=candidate.h3_pickup,
+                                dropoff_cell=candidate.h3_dropoff,
+                                call_datetime=call_dt,
+                                fare_amount=fare_usd,
+                                D_pu=D_pu_miles,
+                                trip_distance=trip_miles,
+                            )
+                        except Exception as e:
+                            _logger.warning(
+                                "acceptance_probability failed (pickup=%s dropoff=%s): %s"
+                                " — defaulting to accept",
+                                candidate.h3_pickup, candidate.h3_dropoff, e,
+                            )
+                            p = 1.0
+                        if _random.random() >= p:
+                            self._push_db_event({**dispatch_payload, "accepted": False})
+                            continue
+
+                    dispatch_edges = list(route.edges)
+                    # Buffer past pickup edge: prevents network exit if taxi traverses
+                    # pickup edge in one step before our pickup detection fires.
+                    buf = self._random_route_from(candidate.pickup_edge)
+                    if buf and len(buf) > 1:
+                        dispatch_edges = dispatch_edges + buf[1:]
+                    traci.vehicle.setRoute(veh_id, dispatch_edges)
+                    self._taxi_last_edges[veh_id] = self._trigger_edge(dispatch_edges)
+                    candidate.state = "assigned"
+                    waiting_passengers.remove(candidate)
+                    self._taxi_targets[veh_id] = candidate.id
+                    self._taxi_states[veh_id] = "dispatched"
+                    self._taxi_dispatch_times[veh_id] = sim_time
+                    self._taxi_dispatch_ids[veh_id] = dispatch_id
+                    self._push_db_event({**dispatch_payload, "accepted": True})
+                    break
 
             # 단계 2 — 픽업: 택시가 픽업 엣지 위에 도달했을 때 (또는 배차 타임아웃)
             elif state == "dispatched":
@@ -738,7 +839,13 @@ class SimulationManager:
                         route = traci.simulation.findRoute(road_id, passenger.dropoff_edge)
                         if not route.edges:
                             continue
-                        traci.vehicle.setRoute(veh_id, list(route.edges))
+                        trip_edges = list(route.edges)
+                        # Buffer past dropoff edge: prevents network exit if taxi traverses
+                        # dropoff edge in one step before our dropoff detection fires.
+                        buf = self._random_route_from(passenger.dropoff_edge)
+                        if buf and len(buf) > 1:
+                            trip_edges = trip_edges + buf[1:]
+                        traci.vehicle.setRoute(veh_id, trip_edges)
                     except traci.exceptions.TraCIException:
                         continue
                     passenger.state = "picked_up"
@@ -787,6 +894,9 @@ class SimulationManager:
                         "expected_fare": passenger.expected_fare,
                         "completion": "trip_timeout",
                     })
+                    self._taxi_last_dropoff_cells[veh_id] = (
+                        passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
+                    )
                     del self._passengers[passenger_id]
                     del self._active_trips[veh_id]
                     del self._taxi_targets[veh_id]
@@ -795,7 +905,11 @@ class SimulationManager:
                     route = self._random_route_from(road_id)
                     if route:
                         traci.vehicle.setRoute(veh_id, route)
-                        self._taxi_last_edges[veh_id] = route[-1]
+                        self._taxi_last_edges[veh_id] = self._trigger_edge(route)
+                    else:
+                        # Buffer from pickup already extends past dropoff; register current
+                        # edge so _extend_vehicle_routes picks up this taxi next step.
+                        self._taxi_last_edges[veh_id] = road_id
                     continue
                 if road_id == passenger.dropoff_edge:
                     accum = self._active_trips[veh_id]
@@ -823,6 +937,9 @@ class SimulationManager:
                         "expected_fare": passenger.expected_fare,
                         "completion": "normal",
                     })
+                    self._taxi_last_dropoff_cells[veh_id] = (
+                        passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
+                    )
                     del self._passengers[passenger_id]
                     del self._active_trips[veh_id]
                     del self._taxi_targets[veh_id]
@@ -831,7 +948,26 @@ class SimulationManager:
                     route = self._random_route_from(road_id)
                     if route:
                         traci.vehicle.setRoute(veh_id, route)
-                        self._taxi_last_edges[veh_id] = route[-1]
+                        self._taxi_last_edges[veh_id] = self._trigger_edge(route)
+                    else:
+                        self._taxi_last_edges[veh_id] = road_id
+
+        # Detect dispatched taxis that have exited the network (not in sub_results)
+        for veh_id, state in list(self._taxi_states.items()):
+            if state != "dispatched":
+                continue
+            if veh_id in sub_results:
+                continue
+            print(f"[WARN] dispatched taxi {veh_id} not found in sub_results — vehicle lost", flush=True)
+            passenger_id = self._taxi_targets.pop(veh_id, None)
+            if passenger_id:
+                passenger = self._passengers.get(passenger_id)
+                if passenger and passenger.state == "assigned":
+                    passenger.state = "waiting"
+                    waiting_passengers.append(passenger)
+            self._taxi_states[veh_id] = "empty"
+            self._taxi_dispatch_times.pop(veh_id, None)
+            self._taxi_dispatch_ids.pop(veh_id, None)
 
         return fare_updates
 
@@ -840,7 +976,8 @@ class SimulationManager:
         for taxi_id, accum in list(self._active_trips.items()):
             vals = sub_results.get(taxi_id)
             if vals is None:
-                # 택시가 목적지 엣지 끝에 도달해 SUMO가 제거한 경우 → fare 기록
+                # 택시가 네트워크에서 제거됨 (경로 끝 도달) — 버퍼 경로가 누락된 경우
+                print(f"[WARN] taxi {taxi_id} removed from network while occupied — vehicle lost", flush=True)
                 passenger_id = self._taxi_targets.pop(taxi_id, None)
                 passenger = self._passengers.pop(passenger_id, None) if passenger_id else None
                 if passenger:
@@ -868,6 +1005,9 @@ class SimulationManager:
                         "expected_fare": passenger.expected_fare,
                         "completion": "sumo_removed",
                     })
+                    self._taxi_last_dropoff_cells[taxi_id] = (
+                        passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
+                    )
                 self._active_trips.pop(taxi_id, None)
                 self._taxi_states.pop(taxi_id, None)
                 self._taxi_dispatch_times.pop(taxi_id, None)
@@ -957,7 +1097,7 @@ class SimulationManager:
                 departSpeed="max",
             )
             traci.vehicle.subscribe(f"bg_{i}", [tc.VAR_ROAD_ID])
-            self._bg_last_edges[f"bg_{i}"] = route_edges[-1]
+            self._bg_last_edges[f"bg_{i}"] = self._trigger_edge(route_edges)
 
         for i in range(N_TAXIS):
             route_edges = self._random_route(edges)
@@ -973,7 +1113,11 @@ class SimulationManager:
                 departPos="random_free",
                 departSpeed="max",
             )
-            self._taxi_last_edges[f"taxi_{i}"] = route_edges[-1]
+            self._taxi_last_edges[f"taxi_{i}"] = self._trigger_edge(route_edges)
+            pt = self._get_edge_midpoint(route_edges[0])
+            if pt:
+                lat, lng = self._latlng(*pt)
+                self._taxi_last_dropoff_cells[f"taxi_{i}"] = get_cell(lat, lng)
 
     def _extend_vehicle_routes(self, sub_results: dict) -> None:
         """마지막 엣지에 진입한 bg 차량·empty 택시에 새 경로를 할당해 리스폰 점프를 방지."""
@@ -989,12 +1133,13 @@ class SimulationManager:
                 if new_route:
                     try:
                         traci.vehicle.setRoute(veh_id, new_route)
-                        self._bg_last_edges[veh_id] = new_route[-1]
+                        self._bg_last_edges[veh_id] = self._trigger_edge(new_route)
                     except traci.exceptions.TraCIException:
                         pass
 
             elif veh_id.startswith("taxi_"):
-                if self._taxi_states.get(veh_id, "empty") != "empty":
+                # Extend route for empty AND dispatched taxis (occupied routes managed by trip logic)
+                if self._taxi_states.get(veh_id, "empty") not in ("empty", "dispatched"):
                     continue
                 if road_id != self._taxi_last_edges.get(veh_id):
                     continue
@@ -1002,9 +1147,13 @@ class SimulationManager:
                 if new_route:
                     try:
                         traci.vehicle.setRoute(veh_id, new_route)
-                        self._taxi_last_edges[veh_id] = new_route[-1]
+                        self._taxi_last_edges[veh_id] = self._trigger_edge(new_route)
                     except traci.exceptions.TraCIException:
-                        pass
+                        # setRoute failed: re-arm trigger so we retry next step
+                        self._taxi_last_edges[veh_id] = road_id
+                else:
+                    # No route found: re-arm trigger so we retry next step
+                    self._taxi_last_edges[veh_id] = road_id
 
     def _compute_edge_weights(self) -> list[float]:
         """Compute weighted destination probability for each routable edge.
@@ -1037,37 +1186,47 @@ class SimulationManager:
         return weights
 
     def _random_route_from(self, current_edge: str, attempts: int = 10) -> list[str] | None:
-        """Return a routable edge list starting from current_edge to a weighted-random destination."""
+        """3개 이상 엣지 경로를 current_edge에서 시작해 반환. 실패 시 2개, 불가 시 None."""
         edges = self._routable_edges
         weights = self._edge_weights if len(self._edge_weights) == len(edges) else None
-        for _ in range(attempts):
-            if weights:
-                dst = _random.choices(edges, weights=weights, k=1)[0]
-            else:
-                dst = _random.choice(edges)
-            if dst == current_edge:
-                continue
-            try:
-                result = traci.simulation.findRoute(current_edge, dst)
-                if result.edges:
-                    return list(result.edges)
-            except traci.exceptions.TraCIException:
-                continue
+
+        def _pick() -> str:
+            return _random.choices(edges, weights=weights, k=1)[0] if weights else _random.choice(edges)
+
+        for min_len in (3, 2):
+            for _ in range(attempts):
+                dst = _pick()
+                if dst == current_edge:
+                    continue
+                try:
+                    result = traci.simulation.findRoute(current_edge, dst)
+                    if len(result.edges) >= min_len:
+                        return list(result.edges)
+                except traci.exceptions.TraCIException:
+                    continue
         return None
 
+    @staticmethod
+    def _trigger_edge(route: list[str]) -> str:
+        """끝에서 두 번째 엣지를 반환. 경로가 2개 이하면 마지막 엣지.
+        2-edge 경로 [A,B]에서 trigger=A이면 A 위에서 연장 후 B로 이동 시
+        trigger 불일치로 연장이 누락되므로, 2-edge는 마지막 엣지를 trigger로 사용한다."""
+        return route[-2] if len(route) >= 3 else route[-1]
+
     def _random_route(self, edges: list[str], attempts: int = 10) -> list[str]:
-        """Return a routable edge list between two random edges, falling back to one edge."""
-        for _ in range(attempts):
-            src = _random.choice(edges)
-            dst = _random.choice(edges)
-            if src == dst:
-                continue
-            try:
-                result = traci.simulation.findRoute(src, dst)
-                if result.edges:
-                    return list(result.edges)
-            except traci.exceptions.TraCIException:
-                continue
+        """3개 이상의 엣지로 구성된 경로를 반환. 실패 시 2개, 최후엔 1개로 폴백."""
+        for min_len in (3, 2, 1):
+            for _ in range(attempts):
+                src = _random.choice(edges)
+                dst = _random.choice(edges)
+                if src == dst:
+                    continue
+                try:
+                    result = traci.simulation.findRoute(src, dst)
+                    if len(result.edges) >= min_len:
+                        return list(result.edges)
+                except traci.exceptions.TraCIException:
+                    continue
         return [_random.choice(edges)]
 
     def _capture_state(
