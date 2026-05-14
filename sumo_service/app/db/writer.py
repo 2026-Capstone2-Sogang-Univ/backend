@@ -44,12 +44,13 @@ async def _handle(event: dict) -> None:
                     """
                     INSERT INTO dispatch (
                         id, run_id, passenger_id, taxi_id,
-                        dispatch_sim_time, estimated_pickup_distance_m
-                    ) VALUES ($1,$2,$3,$4,$5,$6)
+                        dispatch_sim_time, estimated_pickup_distance_m, accepted
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7)
                     ON CONFLICT DO NOTHING
                     """,
                     event["id"], event["run_id"], event["passenger_id"], event["taxi_id"],
                     event["dispatch_sim_time"], event.get("estimated_pickup_distance_m"),
+                    event.get("accepted", True),
                 )
             elif t == "dispatch_timeout":
                 await conn.execute(

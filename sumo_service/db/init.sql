@@ -39,6 +39,7 @@ CREATE TABLE dispatch (
     dispatch_sim_time           DOUBLE PRECISION NOT NULL,
     estimated_pickup_distance_m DOUBLE PRECISION,
     timed_out                   BOOLEAN NOT NULL DEFAULT FALSE,
+    accepted                    BOOLEAN NOT NULL DEFAULT TRUE,
     FOREIGN KEY (run_id, passenger_id) REFERENCES passenger(run_id, passenger_id),
     FOREIGN KEY (run_id, taxi_id)      REFERENCES taxi(run_id, taxi_id)
 );
