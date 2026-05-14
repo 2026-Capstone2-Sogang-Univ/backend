@@ -1,30 +1,26 @@
 from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
-# NYC Taxi Meter — all monetary amounts in USD cents
+# NYC Taxi Meter — 2013 TLC rate card — all monetary amounts in USD cents
 # ---------------------------------------------------------------------------
 
-# Base meter rate
-BASE_FARE = 300            # $3.00 initial charge
+BASE_FARE = 250            # $2.50 initial charge
 DIST_UNIT_M = 321.869      # 1/5 mile in meters
-DIST_UNIT_FARE = 70        # $0.70 per 1/5 mile
+DIST_UNIT_FARE = 50        # $0.50 per 1/5 mile
 SPEED_THRESHOLD_MPS = 12 * 1609.344 / 3600  # 12 mph ≈ 5.364 m/s
 TIME_UNIT_S = 60.0         # 60 seconds at low speed
-TIME_UNIT_FARE = 70        # $0.70 per 60 s
+TIME_UNIT_FARE = 50        # $0.50 per 60 s
 
-# Mandatory surcharges (unconditional)
-SURCHARGE_IMPROVEMENT = 100   # $1.00 — improvement surcharge (all trips)
-SURCHARGE_MTA = 50            # $0.50 — MTA surcharge (NYC trips, always in Manhattan)
-FIXED_SURCHARGES = SURCHARGE_IMPROVEMENT + SURCHARGE_MTA  # $1.50 = 150¢
+# Fixed surcharge (unconditional)
+SURCHARGE_MTA = 50                # $0.50 — NY State Tax (all trips)
+FIXED_SURCHARGES = SURCHARGE_MTA  # $0.50 total fixed
 
-# Conditional surcharges — not applied in simulation (geographic check omitted)
-#   NYS Congestion Surcharge : $2.50  (south of 96th St, Manhattan)
-#   CBD Congestion Toll       : $0.75  (south of 60th St, Manhattan)
+# Time-based surcharges (2013) — not applied;
+#   Peak hour : $1.00  (weekday 4 pm – 8 pm)
+#   Night     : $0.50  (8 pm – 6 am)
 
-# Time-based surcharges — not applied in simulation
-#   Night surcharge      : $1.00  (8 pm – 6 am)
-#   Rush hour surcharge  : $2.50  (weekdays 4 pm – 8 pm)
-
+# Tip — not applied;
+# 15% ~ 20%
 
 @dataclass
 class TripAccumulator:

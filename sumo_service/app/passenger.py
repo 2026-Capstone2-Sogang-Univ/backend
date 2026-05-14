@@ -21,3 +21,4 @@ class Passenger:
     state: str  # "waiting" | "assigned" | "picked_up" | "completed"
     taxi_id: Optional[str] = None
     h3_pickup: Optional[str] = None
+    h3_dropoff: Optional[str] = None
