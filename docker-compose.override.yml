@@ -7,6 +7,11 @@ services:
       - WATCHFILES_FORCE_POLLING=true
       - PASSENGER_SOURCE=random
       - DATABASE_URL=postgresql://sumo:sumo@postgres:5432/sumo
+      # Simulation tuning (defaults match code)
+      - SIM_DURATION=604800     # 1-week simulation
+      - SIMULATION_SPEED=20     # sim-seconds per real-second (higher=faster run)
+      - N_TAXIS=300
+      - PASSENGER_LAMBDA=5      # Poisson λ per spawn interval
     command:
       [
         "uv", "run", "uvicorn", "app.main:app",

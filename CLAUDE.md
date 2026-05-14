@@ -19,7 +19,7 @@ Internal communication between services uses gRPC. External communication with t
 - **Simulation speed**: real 1 second = simulated 1 minute (accelerated mode). WebSocket broadcasts at 60 fps (`FRAME_RATE = 60` in `simulation.py`).
 - **Passenger generation**: dual-mode — `PASSENGER_SOURCE=random` uses Poisson(λ=5) every 5 simulated minutes; `PASSENGER_SOURCE=parquet` replays preprocessed NYC taxi trip data from `sumo_configs/NY/trips_processed.json`.
 - **Dispatch algorithm**: empty taxis are matched to the nearest waiting passenger by Euclidean distance; dispatched taxi retargets to pickup edge via `traci.vehicle.changeTarget`.
-- **Fare model**: NYC taxi meter (amounts in USD cents) — base $3.00, $0.70 per 1/5 mile (322 m), $0.70 per 60 s at low speed (<12 mph / 5.36 m/s), plus fixed surcharges $1.50 (improvement $1.00 + MTA $0.50). Conditional surcharges (NYS congestion, CBD toll) and time-based surcharges (night, rush hour) are documented but not applied.
+- **Fare model**: 2013 NYC TLC rates (amounts in USD cents) — base $2.50, $0.50 per 1/5 mile (322 m), $0.50 per 60 s at low speed (<12 mph / 5.36 m/s), plus MTA surcharge $0.50. Peak/night time surcharges are documented in `fare.py` as comments but not applied (simulation is fixed to 2013-07-08 08:00 time window).
 
 ### gRPC Communication Flow
 
@@ -81,15 +81,16 @@ curl      http://localhost:8080/simulation/fare/{passenger_id}
 ```
 
 ### Preprocess NYC taxi data (parquet mode only)
+Sample = 24h × 7days × N_TAXIS × 5.5 passengers/taxi/h = 277,200 for a 1-week run.
 
 ```bash
 python scripts/preprocess_trips.py \
   --input  real_taxi_data/od_month=07/consolidated.parquet \
   --net    back/sumo_service/sumo_configs/NY/manhattan_car_only.net.xml \
   --output back/sumo_service/sumo_configs/NY/trips_processed.json \
-  --start  "2024-01-15 08-00-00" \
-  --end    "2024-01-15 09-00-00" \
-  --sample 5000
+  --start  "2013-07-08 08-00-00" \
+  --end    "2013-07-15 08-00-00" \
+  --sample 277200
 ```
 
 ## Analysis & Scripting Principles

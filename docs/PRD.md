@@ -6,7 +6,7 @@
 
 ## Solution
 
-SUMO(Simulation of Urban MObility) 시뮬레이터를 백엔드 핵심 엔진으로 사용하여 역삼동 실제 도로 네트워크 위에서 택시·승객·일반 차량의 이동을 시뮬레이션한다. 딥러닝 기반 수요 예측 결과를 5분 주기로 반영하여 승객을 동적으로 생성하고, 수급 불균형 지표에 따라 빈 택시에 확률론적 인센티브를 부여해 수요 지역으로 유도한다. 시뮬레이션 상태는 WebSocket을 통해 Unity 기반 3D Digital Twin 프론트엔드에 실시간으로 전달된다. 전체 시스템은 세 개의 독립된 마이크로서비스(SUMO Service, Prediction Service, Dispatch Service)로 구성되며 gRPC로 내부 통신한다.
+SUMO(Simulation of Urban MObility) 시뮬레이터를 백엔드 핵심 엔진으로 사용하여 역삼동 실제 도로 네트워크 위에서 택시·승객·일반 차량의 이동을 시뮬레이션한다. 딥러닝 기반 수요 예측 결과를 5분 주기로 반영하여 승객을 동적으로 생성하고, 수급 불균형 지표에 따라 빈 택시에 확률론적 인센티브를 부여해 수요 지역으로 유도한다. 시뮬레이션 상태는 WebSocket을 통해 웹 프론트엔드에 실시간으로 전달된다. 전체 시스템은 세 개의 독립된 마이크로서비스(SUMO Service, Prediction Service, Dispatch Service)로 구성되며 gRPC로 내부 통신한다.
 
 ## User Stories
 
@@ -19,12 +19,12 @@ SUMO(Simulation of Urban MObility) 시뮬레이터를 백엔드 핵심 엔진으
 6. As a developer, I want to start the simulation by typing a command in the console, so that I can run the simulation without a frontend client.
 7. As a developer, I want to pause and restart the simulation by typing a command in the console, so that I can control simulation state during local development and debugging.
 
-### WebSocket 데이터 수신 (Unity / Digital Twin)
-6. As a Unity client, I want to receive the network boundary coordinates once on connection, so that I can correctly map simulation coordinates to 3D world space.
-7. As a Unity client, I want to receive a snapshot of all vehicles every 100ms, so that I can render smooth vehicle movement in the 3D scene.
-8. As a Unity client, I want each vehicle's state (car / empty / dispatched / occupied) included in the snapshot, so that I can color-code vehicles appropriately.
-9. As a Unity client, I want to receive the full list of waiting passengers every 100ms, so that I can render and remove passenger markers automatically.
-10. As a Unity client, I want passengers that have been picked up to disappear from the passenger list, so that the scene stays consistent with simulation state.
+### WebSocket 데이터 수신 (Web Frontend)
+6. As a web client, I want to receive the network boundary coordinates once on connection, so that I can correctly map simulation coordinates to the map view.
+7. As a web client, I want to receive a snapshot of all vehicles every 100ms, so that I can render smooth vehicle movement.
+8. As a web client, I want each vehicle's state (car / empty / dispatched / occupied) included in the snapshot, so that I can color-code vehicles appropriately.
+9. As a web client, I want to receive the full list of waiting passengers every 100ms, so that I can render and remove passenger markers automatically.
+10. As a web client, I want passengers that have been picked up to disappear from the passenger list, so that the view stays consistent with simulation state.
 
 ### 수요 예측 연동
 11. As the dispatch service, I want to receive demand predictions (t+1 ~ t+6, 5-minute intervals) from the prediction service every 5 simulated minutes, so that I can plan incentives ahead of time.
@@ -129,7 +129,7 @@ state 값: `car` (일반 차량) / `empty` (빈 택시) / `dispatched` (픽업 �
   ]
 }
 ```
-목록에서 사라진 승객은 Unity 측에서 자동 제거.
+목록에서 사라진 승객은 웹 클라이언트 측에서 자동 제거.
 
 ### 인프라
 - 각 서비스는 독립된 Docker 컨테이너로 배포

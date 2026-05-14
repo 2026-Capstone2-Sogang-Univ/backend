@@ -279,6 +279,20 @@ def main() -> None:
         print("ERROR: 필터 결과가 비어있습니다. --start/--end 범위를 확인하세요.")
         sys.exit(1)
 
+    # 2.5. 샘플링 — 엣지 변환 전에 수행해 불필요한 변환을 줄인다.
+    # 변환 실패율을 감안해 요청 수의 1.2배를 먼저 뽑고, 변환 후 최종 트림. (선착장/부두, gps오차)
+    OVERSAMPLE_FACTOR = 1.2
+    presample = (
+        min(len(df), int(args.sample * OVERSAMPLE_FACTOR))
+        if len(df) > args.sample
+        else len(df)
+    )
+    if presample < len(df):
+        df = df.sample(n=presample, random_state=42)
+        print(f"      사전 샘플링: {presample:,}행 선택 (변환 실패 여유 {OVERSAMPLE_FACTOR:.0%})")
+    else:
+        print(f"      전체 사용: {len(df):,}행 (요청 샘플 수 {args.sample}보다 적음)")
+
     # 3. GPS → SUMO 엣지 변환
     print(
         f"[3/5] GPS→SUMO 엣지 변환 중... (workers={args.workers}, 수만 행이면 수 분 소요)"
@@ -313,12 +327,12 @@ def main() -> None:
     print(f"[4/5] sim_time 정규화")
     df["sim_time"] = (df["pickup_datetime"] - pd.Timestamp(start_dt)).dt.total_seconds()
 
-    # 5. 샘플링
+    # 4.5. 최종 트림 — 변환 성공 행 기준으로 목표 샘플 수에 맞춤
     if len(df) > args.sample:
         df = df.sample(n=args.sample, random_state=42)
-        print(f"      샘플링: {len(df):,}행 → {args.sample}행 선택")
+        print(f"      최종 트림: {len(df):,}행으로 축소")
     else:
-        print(f"      전체 사용: {len(df):,}행 (요청 샘플 수 {args.sample}보다 적음)")
+        print(f"      전체 사용: {len(df):,}행 (목표 {args.sample}건 미만)")
 
     # 6. 저장
     print(f"[5/5] 저장: {args.output}")
