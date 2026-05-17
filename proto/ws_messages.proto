@@ -1,0 +1,96 @@
+syntax = "proto3";
+
+// ── 진입점 ─────────────────────────────────────────────
+message ServerMessage {
+  oneof payload {
+    Boundary   boundary    = 1;
+    Snapshot   snapshot    = 2;
+    Surge      surge       = 3;
+    FareUpdate fare_update = 4;
+    Finished   finished    = 5;
+  }
+}
+
+// ── Vehicle ────────────────────────────────────────────
+// ⚠️ 0번은 sentinel. 의미 있는 state는 1번부터.
+enum VehicleState {
+  VEHICLE_STATE_UNKNOWN = 0;
+  EMPTY                 = 1;
+  DISPATCHED            = 2;
+  OCCUPIED              = 3;
+  CAR                   = 4;
+}
+
+message Vehicle {
+  string       id    = 1;
+  double       lat   = 2;  // float 사용 금지 — GPS 정밀도 ±10m 오차
+  double       lng   = 3;
+  float        angle = 4;
+  float        speed = 5;
+  VehicleState state = 6;
+}
+
+// ── Passenger ──────────────────────────────────────────
+message PassengerMsg {
+  string id                  = 1;
+  double lat                 = 2;
+  double lng                 = 3;
+  int32  expected_fare       = 4;
+  double expected_distance_m = 5;
+}
+
+// ── Snapshot (60 fps) ──────────────────────────────────
+message Snapshot {
+  repeated Vehicle      vehicles   = 1;
+  repeated PassengerMsg passengers = 2;
+  double                sim_time   = 3;
+}
+
+// ── Boundary (접속 시 1회) ─────────────────────────────
+message SumoRect {
+  double min_x = 1;
+  double min_y = 2;
+  double max_x = 3;
+  double max_y = 4;
+}
+
+message GeoRect {
+  double min_lat = 1;
+  double min_lng = 2;
+  double max_lat = 3;
+  double max_lng = 4;
+}
+
+message Boundary {
+  SumoRect sumo = 1;
+  GeoRect  geo  = 2;
+}
+
+// ── Surge (5 sim초마다) ────────────────────────────────
+message SurgeCell {
+  string h3_index    = 1;
+  int32  supply      = 2;
+  int32  demand      = 3;
+  float  surge_coeff = 4;
+  double center_lat  = 5;
+  double center_lng  = 6;
+}
+
+message Surge {
+  int32              h3_resolution = 1;
+  repeated SurgeCell cells         = 2;
+  double             sim_time      = 3;
+}
+
+// ── FareUpdate (운행 완료 시) ──────────────────────────
+message FareUpdate {
+  string passenger_id  = 1;
+  string taxi_id       = 2;
+  int32  fare          = 3;
+  int32  expected_fare = 4;
+  double distance_m    = 5;
+  double sim_time      = 6;
+}
+
+// ── Finished (시뮬레이션 종료 시) ─────────────────────
+message Finished {}
