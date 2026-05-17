@@ -22,8 +22,9 @@ SmartTaxi Module 4 — 기사 콜 수락 확률 함수.
 """
 import json
 import os
+from dataclasses import dataclass
 from datetime import datetime
-from math import exp
+from math import exp, log
 
 import pandas as pd
 
@@ -51,6 +52,16 @@ _V_GLOBAL = float(_V_DF['V_value'].mean())
 _S_GLOBAL = float(_S_DF['s_value'].mean())
 
 
+# 역산 실험에서는 fare만 바꿔가며 같은 비가격 효용항을 재사용한다.
+# 이 구조체는 정방향 확률 계산과 목표 확률 역산이 같은 feature 계산을 공유하게 한다.
+@dataclass(frozen=True)
+class AcceptanceFeatures:
+    dV_without_fare: float
+    t_pu: float
+    t_c: float
+    z_without_fare: float
+
+
 def _sigmoid(x: float) -> float:
     if x >= 0:
         z = exp(-x)
@@ -67,6 +78,58 @@ def _get_s(cell: str, dow: int, bn: int) -> float:
     return _S_LOOKUP.get((cell, int(dow), int(bn)), _S_GLOBAL)
 
 
+# PU 보정은 sigmoid 결과를 관측 가능한 최종 수락확률로 변환한다.
+# 역산 시에는 같은 보정상수를 반대로 적용해야 target_p와 정방향 계산이 어긋나지 않는다.
+def probability_from_z(z: float, c: float = _C) -> float:
+    p_apparent = _sigmoid(z)
+    return min(1.0, max(0.0, p_apparent / c))
+
+
+def pu_corrected_logit(target_p: float, c: float = _C) -> float:
+    apparent_p = target_p * c
+    if apparent_p <= 0 or apparent_p >= 1:
+        raise ValueError("target_p * c must be between 0 and 1")
+    return log(apparent_p / (1.0 - apparent_p))
+
+
+def acceptance_features(
+    last_dropoff_cell: str,
+    pickup_cell: str,
+    dropoff_cell: str,
+    call_datetime: datetime,
+    D_pu: float,
+    trip_distance: float,
+) -> AcceptanceFeatures:
+    """Return fare-independent feature terms used by the acceptance model."""
+    dow = call_datetime.weekday()
+    pickup_min = call_datetime.hour * 60 + call_datetime.minute
+    pickup_bin = (pickup_min // 15) % 96
+
+    T_pu = D_pu / _AVG_SPEED_MPH * 60.0
+    T_c = trip_distance / _AVG_SPEED_MPH * 60.0
+
+    arrival_bin = int((pickup_min + T_pu + T_c) // 15) % 96
+    V_acc_without_fare = _get_V(dropoff_cell, dow, arrival_bin)
+
+    s_val = _get_s(last_dropoff_cell, dow, pickup_bin)
+    reject_bin = int((pickup_min + s_val) // 15) % 96
+    V_rej = _get_V(last_dropoff_cell, dow, reject_bin)
+
+    dV_without_fare = V_acc_without_fare - V_rej
+    z_without_fare = (
+        _BETA_0
+        + _BETA_DV * dV_without_fare
+        + _BETA_DPU * D_pu
+        + _BETA_TPU * T_pu
+    )
+    return AcceptanceFeatures(
+        dV_without_fare=dV_without_fare,
+        t_pu=T_pu,
+        t_c=T_c,
+        z_without_fare=z_without_fare,
+    )
+
+
 def acceptance_probability(
     last_dropoff_cell: str,
     pickup_cell: str,
@@ -75,6 +138,7 @@ def acceptance_probability(
     fare_amount: float,
     D_pu: float,
     trip_distance: float,
+    beta_f: float | None = None,
 ) -> float:
     """0~1 범위 P(수락) 반환.
 
@@ -87,32 +151,47 @@ def acceptance_probability(
         D_pu: 빈차로 픽업까지 가는 거리 (마일).
         trip_distance: 콜 운행 거리 (마일).
     """
-    dow = call_datetime.weekday()
-    pickup_min = call_datetime.hour * 60 + call_datetime.minute
-    pickup_bin = (pickup_min // 15) % 96
+    features = acceptance_features(
+        last_dropoff_cell=last_dropoff_cell,
+        pickup_cell=pickup_cell,
+        dropoff_cell=dropoff_cell,
+        call_datetime=call_datetime,
+        D_pu=D_pu,
+        trip_distance=trip_distance,
+    )
+    z = features.z_without_fare + (beta_f if beta_f is not None else _BETA_F) * fare_amount
+    return probability_from_z(z, _C)
 
-    T_pu = D_pu / _AVG_SPEED_MPH * 60.0
-    T_c = trip_distance / _AVG_SPEED_MPH * 60.0
 
-    # V_accept: dropoff 시점 셀 + 도착시 bin
-    arrival_bin = int((pickup_min + T_pu + T_c) // 15) % 96
-    V_acc = fare_amount + _get_V(dropoff_cell, dow, arrival_bin)
+# target_p를 만족하는 최종 fare_amount를 푸는 역함수.
+# 호출부는 이 값을 최종 운임으로 쓰지 않고, 현재 surged fare 대비 추가 인센티브 산정 기준으로 사용한다.
+def required_fare_for_target_p(
+    last_dropoff_cell: str,
+    pickup_cell: str,
+    dropoff_cell: str,
+    call_datetime: datetime,
+    target_p: float,
+    D_pu: float,
+    trip_distance: float,
+    beta_f: float | None = None,
+) -> float:
+    beta = beta_f if beta_f is not None else _BETA_F
+    if abs(beta) < 1e-9:
+        raise ValueError("beta_f too close to zero for inverse fare calculation")
+    features = acceptance_features(
+        last_dropoff_cell=last_dropoff_cell,
+        pickup_cell=pickup_cell,
+        dropoff_cell=dropoff_cell,
+        call_datetime=call_datetime,
+        D_pu=D_pu,
+        trip_distance=trip_distance,
+    )
+    z_target = pu_corrected_logit(target_p, _C)
+    return (z_target - features.z_without_fare) / beta
 
-    # V_reject: 거부 시 cruising → s(ℓ_0, t)분 후 같은 셀에서 다시 시도
-    s_val = _get_s(last_dropoff_cell, dow, pickup_bin)
-    reject_bin = int((pickup_min + s_val) // 15) % 96
-    V_rej = _get_V(last_dropoff_cell, dow, reject_bin)
 
-    dV = V_acc - V_rej
-
-    z = (_BETA_0
-         + _BETA_DV * dV
-         + _BETA_F * fare_amount
-         + _BETA_DPU * D_pu
-         + _BETA_TPU * T_pu)
-    p_apparent = _sigmoid(z)
-    p = min(1.0, max(0.0, p_apparent / _C))
-    return p
+def pu_correction_constant() -> float:
+    return _C
 
 
 if __name__ == '__main__':
