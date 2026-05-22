@@ -1,4 +1,5 @@
 import os
+import math
 
 import h3
 
@@ -17,11 +18,25 @@ def cell_boundary(cell: str) -> list[tuple[float, float]]:
     return list(h3.cell_to_boundary(cell))
 
 
-def compute_surge(supply: int, demand: int, max_surge: float = 5.0) -> float:
+def compute_surge(
+    supply: int,
+    demand: int,
+    min_active_surge: float = 1.2,
+    max_surge: float = 4.9,
+    increment: float = 0.1,
+    elasticity: float = 0.6,
+) -> float:
     if supply == 0 and demand == 0:
         return 1.0
     if supply == 0:
         return max_surge
     if demand == 0:
-        return 0.0
-    return min((demand / supply) ** (1 / 0.6), max_surge)
+        return 1.0
+
+    raw_surge = (demand / supply) ** (1 / elasticity)
+    if raw_surge <= 1.0:
+        return 1.0
+
+    active_surge = max(raw_surge, min_active_surge)
+    stepped_surge = math.ceil(active_surge / increment) * increment
+    return min(round(stepped_surge, 10), max_surge)

@@ -27,6 +27,7 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime as _datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -37,7 +38,10 @@ import traci.exceptions
 from traci import constants as tc
 
 from .coord import make_sumolib_converter, sumo_to_latlng
-from .driver.decision_function import acceptance_probability as _acceptance_probability
+from .driver.decision_function import (
+    acceptance_probability as _acceptance_probability,
+    required_fare_for_target_p as _required_fare_for_target_p,
+)
 
 _logger = logging.getLogger(__name__)
 from .db.engine import get_pool
@@ -178,9 +182,24 @@ class SimStatus(str, Enum):
     FINISHED = "finished"
 
 
+# FastAPI 실행과 분리된 실험 전용 설정.
+# None이면 기존 WebSocket/DB/실시간 pacing 경로를 그대로 사용하고, 값이 있으면 빠른 동기 실행 경로를 탄다.
+@dataclass(frozen=True)
+class ExperimentConfig:
+    target_p: float
+    elasticity: float
+    beta_f: float
+    seed: int = 42
+    sim_duration: float = SIM_DURATION
+    step_length: float = 1.0
+    real_sleep: float = 0.0
+    broadcast: bool = False
+
+
 class SimulationManager:
-    def __init__(self) -> None:
+    def __init__(self, experiment_config: ExperimentConfig | None = None) -> None:
         self.status = SimStatus.IDLE
+        self.experiment_config = experiment_config
         self.connection_manager: Optional[ConnectionManager] = None
         self._paused = False
         self._stop_event = threading.Event()
@@ -201,6 +220,8 @@ class SimulationManager:
         self._last_surge_interval: int = -1
         self._routable_edges: list[str] = []
         self._surge_cells: list[dict] = []
+        # WebSocket은 list 형태가 필요하지만 배차 판단은 pickup H3로 즉시 조회해야 하므로 dict 캐시를 함께 둔다.
+        self._surge_by_h3: dict[str, float] = {}
         self._completed_passengers: list[dict] = []
         self._trip_queue: list[dict] = []
         self._latlng: Callable[[float, float], tuple[float, float]] | None = None
@@ -215,6 +236,10 @@ class SimulationManager:
         self._taxi_last_dropoff_cells: dict[str, str] = {}
         self._taxi_appeared: set[str] = set()   # taxis that have appeared in sub_results at least once
         self._taxi_missing_since: dict[str, float] = {}  # veh_id → sim_time when first detected missing
+        # 실험 모드는 DB 대신 메모리 이벤트 로그로 KPI를 집계한다.
+        self._event_log: list[dict] = []
+        # 기사 빈차 대기시간은 이전 하차 시각과 다음 수락 시각의 차이로 계산한다.
+        self._taxi_previous_dropoff_times: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Public async API (called from FastAPI endpoints)
@@ -272,6 +297,17 @@ class SimulationManager:
 
     async def stop(self) -> None:
         await self._shutdown()
+
+    def run_experiment(self) -> list[dict]:
+        """Run a synchronous fast-path simulation and return in-memory events."""
+        if self.experiment_config is None:
+            raise RuntimeError("run_experiment requires experiment_config")
+        _random.seed(self.experiment_config.seed)
+        self._event_log = []
+        self._stop_event.clear()
+        self.status = SimStatus.RUNNING
+        self._run_loop()
+        return list(self._event_log)
 
     def get_state(self) -> dict:
         with self._lock:
@@ -350,6 +386,7 @@ class SimulationManager:
             self._last_surge_interval = -1
             self._routable_edges = []
             self._surge_cells = []
+            self._surge_by_h3 = {}
             self._completed_passengers = []
             self._trip_queue = []
             self._latlng = None
@@ -363,6 +400,8 @@ class SimulationManager:
             self._taxi_last_dropoff_cells = {}
             self._taxi_appeared.clear()
             self._taxi_missing_since.clear()
+            self._event_log = []
+            self._taxi_previous_dropoff_times = {}
 
     # ------------------------------------------------------------------
     # Async broadcast loop — runs in the event loop
@@ -399,6 +438,13 @@ class SimulationManager:
 
     def _run_loop(self) -> None:
         try:
+            # 일반 모드는 기존 상수와 broadcast queue를 사용하고,
+            # 실험 모드는 SUMO step만 최대한 빠르게 진행한 뒤 메모리 이벤트만 남긴다.
+            experiment = self.experiment_config is not None
+            step_length = self.experiment_config.step_length if experiment else STEP_LENGTH
+            sim_duration = self.experiment_config.sim_duration if experiment else SIM_DURATION
+            real_step_sleep = self.experiment_config.real_sleep if experiment else REAL_STEP_SLEEP
+            broadcast_enabled = (not experiment) or bool(self.experiment_config.broadcast)
             cmd = [
                 SUMO_BINARY,
                 "-c",
@@ -406,7 +452,7 @@ class SimulationManager:
                 "--no-step-log",
                 "--no-warnings",
                 "--step-length",
-                str(STEP_LENGTH),
+                str(step_length),
             ]
             traci.start(cmd, label="main")
             (min_x, min_y), (max_x, max_y) = traci.simulation.getNetBoundary()
@@ -459,7 +505,7 @@ class SimulationManager:
                     next_deadline = time.perf_counter()  # pause 중 누적 방지
                     continue
 
-                next_deadline += REAL_STEP_SLEEP
+                next_deadline += real_step_sleep
                 traci.simulationStep()
                 sim_time = traci.simulation.getTime()
 
@@ -530,9 +576,10 @@ class SimulationManager:
                         state["surge"] = None
 
                 # Push state immediately after each step; broadcast loop sends it.
-                self._loop.call_soon_threadsafe(self._state_queue.put_nowait, state)
+                if broadcast_enabled and self._loop is not None and self._state_queue is not None:
+                    self._loop.call_soon_threadsafe(self._state_queue.put_nowait, state)
 
-                if sim_time >= SIM_DURATION:
+                if sim_time >= sim_duration:
                     # Force-complete all trips still in progress so their fares are recorded.
                     with self._lock:
                         for taxi_id, accum in list(self._active_trips.items()):
@@ -568,7 +615,8 @@ class SimulationManager:
                             self._taxi_dispatch_ids.pop(taxi_id, None)
                         self._active_trips.clear()
                     self.status = SimStatus.FINISHED
-                    self._loop.call_soon_threadsafe(self._state_queue.put_nowait, None)
+                    if broadcast_enabled and self._loop is not None and self._state_queue is not None:
+                        self._loop.call_soon_threadsafe(self._state_queue.put_nowait, None)
                     break
 
                 remaining = next_deadline - time.perf_counter()
@@ -588,9 +636,33 @@ class SimulationManager:
                 pass
 
     def _push_db_event(self, event: dict) -> None:
+        # 실험 모드는 DB writer를 띄우지 않으므로 기존 DB 이벤트 중 KPI에 필요한 완료 이벤트만 메모리에 투영한다.
+        if self.experiment_config is not None:
+            if event.get("type") == "trip":
+                self._emit_event("trip_completed", {
+                    "sim_time": event.get("dropoff_sim_time"),
+                    "passenger_id": event.get("passenger_id"),
+                    "taxi_id": event.get("taxi_id"),
+                    "dispatch_id": event.get("dispatch_id"),
+                    "dispatch_sim_time": event.get("dispatch_sim_time"),
+                    "pickup_sim_time": event.get("pickup_sim_time"),
+                    "dropoff_sim_time": event.get("dropoff_sim_time"),
+                    "fare_usd": (event.get("fare") or 0) / 100.0,
+                    "completion": event.get("completion"),
+                })
+                if event.get("completion") != "forced_at_end":
+                    taxi_id = event.get("taxi_id")
+                    dropoff_time = event.get("dropoff_sim_time")
+                    if taxi_id is not None and dropoff_time is not None:
+                        self._taxi_previous_dropoff_times[taxi_id] = float(dropoff_time)
         if self._run_id is None or self._db_queue is None or self._loop is None:
             return
         self._loop.call_soon_threadsafe(self._db_queue.put_nowait, event)
+
+    def _emit_event(self, event_type: str, payload: dict) -> None:
+        if self.experiment_config is None:
+            return
+        self._event_log.append({"type": event_type, **payload})
 
     def _spawn_passengers(self, sim_time: float) -> None:
         if PASSENGER_SOURCE == "parquet":
@@ -676,6 +748,15 @@ class SimulationManager:
             "h3_pickup": h3,
             "source": "random",
         })
+        # 승객 생성 수와 unique matched passenger denominator를 계산하기 위한 실험 이벤트.
+        self._emit_event("passenger_spawned", {
+            "sim_time": sim_time,
+            "passenger_id": pid,
+            "pickup_h3": h3,
+            "dropoff_h3": h3_dropoff,
+            "expected_fare_usd": expected_fare / 100.0,
+            "expected_distance_m": route.length,
+        })
 
     def _create_passenger_from_trip(self, trip: dict, sim_time: float) -> None:
         pickup_edge = trip["pickup_edge"]
@@ -732,6 +813,15 @@ class SimulationManager:
             "h3_pickup": h3,
             "source": "parquet",
         })
+        # parquet replay도 random spawn과 동일한 이벤트 스키마로 남겨 집계 코드를 공유한다.
+        self._emit_event("passenger_spawned", {
+            "sim_time": sim_time,
+            "passenger_id": pid,
+            "pickup_h3": h3,
+            "dropoff_h3": h3_dropoff,
+            "expected_fare_usd": expected_fare / 100.0,
+            "expected_distance_m": route.length,
+        })
 
     def _update_taxi_states(self, sim_time: float, sub_results: dict) -> list[dict]:
         fare_updates: list[dict] = []
@@ -768,10 +858,64 @@ class SimulationManager:
                         "dispatch_sim_time": sim_time,
                         "estimated_pickup_distance_m": route.length,
                     }
+                    self._emit_event("dispatch_attempted", {
+                        "sim_time": sim_time,
+                        "dispatch_id": dispatch_id,
+                        "passenger_id": candidate.id,
+                        "taxi_id": veh_id,
+                        "estimated_pickup_distance_m": route.length,
+                    })
 
+                    # decision_payload는 수락/거절 모두 같은 스키마로 기록되어 cap, gap, 확률 진단 지표를 집계한다.
+                    accepted = True
+                    decision_payload = {
+                        "sim_time": sim_time,
+                        "dispatch_id": dispatch_id,
+                        "passenger_id": candidate.id,
+                        "taxi_id": veh_id,
+                        "target_p": self.experiment_config.target_p if self.experiment_config else None,
+                        "p_actual": 1.0,
+                        "base_fare_usd": candidate.expected_fare / 100.0,
+                        "surge": 1.0,
+                        "surged_fare_usd": candidate.expected_fare / 100.0,
+                        "required_fare_usd": None,
+                        "raw_incentive_usd": 0.0,
+                        "incentive_usd": 0.0,
+                        "capped": False,
+                        "target_gap": 0.0,
+                        "estimated_pickup_distance_m": route.length,
+                    }
                     if candidate.h3_pickup and candidate.h3_dropoff:
                         D_pu_miles = route.length / 1609.344
-                        fare_usd   = candidate.expected_fare / 100.0
+                        base_fare_usd = candidate.expected_fare / 100.0
+                        surge = self._surge_by_h3.get(candidate.h3_pickup, 1.0)
+                        fare_usd = base_fare_usd
+                        required_fare_usd = None
+                        raw_incentive_usd = 0.0
+                        incentive_usd = 0.0
+                        capped = False
+                        if self.experiment_config is not None:
+                            # 실험 모드에서는 target_p를 만족하는 운임을 역산한 뒤,
+                            # 현재 pickup cell surge 운임에 필요한 추가분만 인센티브로 지급한다.
+                            fare_usd = base_fare_usd * surge
+                            required_fare_usd = _required_fare_for_target_p(
+                                last_dropoff_cell=(
+                                    self._taxi_last_dropoff_cells.get(veh_id)
+                                    or get_cell(*self._latlng(tx, ty))
+                                ),
+                                pickup_cell=candidate.h3_pickup,
+                                dropoff_cell=candidate.h3_dropoff,
+                                call_datetime=SIM_BASE_DATETIME + timedelta(seconds=sim_time),
+                                target_p=self.experiment_config.target_p,
+                                D_pu=D_pu_miles,
+                                trip_distance=candidate.expected_distance_m / 1609.344,
+                                beta_f=self.experiment_config.beta_f,
+                            )
+                            raw_incentive_usd = required_fare_usd - fare_usd
+                            incentive_cap_usd = min(10.0, base_fare_usd)
+                            incentive_usd = min(max(raw_incentive_usd, 0.0), incentive_cap_usd)
+                            capped = not math.isclose(incentive_usd, raw_incentive_usd, abs_tol=1e-9)
+                            fare_usd += incentive_usd
                         trip_miles = candidate.expected_distance_m / 1609.344
                         call_dt    = SIM_BASE_DATETIME + timedelta(seconds=sim_time)
                         last_cell  = (self._taxi_last_dropoff_cells.get(veh_id)
@@ -785,6 +929,7 @@ class SimulationManager:
                                 fare_amount=fare_usd,
                                 D_pu=D_pu_miles,
                                 trip_distance=trip_miles,
+                                beta_f=self.experiment_config.beta_f if self.experiment_config else None,
                             )
                         except Exception as e:
                             _logger.warning(
@@ -793,9 +938,25 @@ class SimulationManager:
                                 candidate.h3_pickup, candidate.h3_dropoff, e,
                             )
                             p = 1.0
-                        if _random.random() >= p:
-                            self._push_db_event({**dispatch_payload, "accepted": False})
-                            continue
+                        accepted = _random.random() < p
+                        decision_payload.update({
+                            "p_actual": p,
+                            "base_fare_usd": base_fare_usd,
+                            "surge": surge,
+                            "surged_fare_usd": base_fare_usd * surge,
+                            "required_fare_usd": required_fare_usd,
+                            "raw_incentive_usd": raw_incentive_usd,
+                            "incentive_usd": incentive_usd,
+                            "capped": capped,
+                            "target_gap": (
+                                self.experiment_config.target_p - p
+                                if self.experiment_config else 0.0
+                            ),
+                        })
+                    if not accepted:
+                        self._emit_event("dispatch_decision", {**decision_payload, "accepted": False})
+                        self._push_db_event({**dispatch_payload, "accepted": False})
+                        continue
 
                     dispatch_edges = list(route.edges)
                     # Buffer past pickup edge: prevents network exit if taxi traverses
@@ -811,6 +972,11 @@ class SimulationManager:
                     self._taxi_states[veh_id] = "dispatched"
                     self._taxi_dispatch_times[veh_id] = sim_time
                     self._taxi_dispatch_ids[veh_id] = dispatch_id
+                    previous_dropoff_time = self._taxi_previous_dropoff_times.get(veh_id)
+                    if previous_dropoff_time is not None:
+                        # 첫 승객 전 대기시간은 정의상 제외하고, 하차 이후 다음 수락까지의 search time만 기록한다.
+                        decision_payload["empty_wait_time_s"] = sim_time - previous_dropoff_time
+                    self._emit_event("dispatch_decision", {**decision_payload, "accepted": True})
                     self._push_db_event({**dispatch_payload, "accepted": True})
                     break
 
@@ -1019,7 +1185,8 @@ class SimulationManager:
                 accum.distance_m += delta
             accum.last_distance_snapshot = dist
             if vals[tc.VAR_SPEED] < SPEED_THRESHOLD_MPS:
-                accum.low_speed_seconds += STEP_LENGTH
+                step_length = self.experiment_config.step_length if self.experiment_config else STEP_LENGTH
+                accum.low_speed_seconds += step_length
         return fare_updates
 
     def _get_routable_edges(self) -> list[str]:
@@ -1271,13 +1438,23 @@ class SimulationManager:
         self, grid_supply: dict[str, int], grid_demand: dict[str, int]
     ) -> None:
         surge_cells = []
+        surge_by_h3 = {}
+        # 일반 실행은 기존 기본 탄력성 0.6을 유지하고, 실험 실행만 sweep 입력값으로 override한다.
+        elasticity = self.experiment_config.elasticity if self.experiment_config else 0.6
         for cell in set(grid_supply) | set(grid_demand):
             lat_c, lng_c = cell_center_latlng(cell)
+            surge = compute_surge(
+                grid_supply.get(cell, 0),
+                grid_demand.get(cell, 0),
+                elasticity=elasticity,
+            )
+            surge_by_h3[cell] = surge
             surge_cells.append({
                 "h3": cell,
                 "supply": grid_supply.get(cell, 0),
                 "demand": grid_demand.get(cell, 0),
-                "surge": compute_surge(grid_supply.get(cell, 0), grid_demand.get(cell, 0)),
+                "surge": surge,
                 "center": {"lat": lat_c, "lng": lng_c},
             })
         self._surge_cells = surge_cells
+        self._surge_by_h3 = surge_by_h3
