@@ -191,7 +191,8 @@ class ExperimentConfig:
     beta_f: float
     seed: int = 42
     sim_duration: float = SIM_DURATION
-    step_length: float = 1.0
+    # 운영(start)과 같은 step rate를 기본값으로 둬야 sweep 결과를 운영에 옮길 수 있다.
+    step_length: float = STEP_LENGTH
     real_sleep: float = 0.0
     broadcast: bool = False
 
@@ -297,6 +298,17 @@ class SimulationManager:
 
     async def stop(self) -> None:
         await self._shutdown()
+
+    @classmethod
+    def fresh_experiment(
+        cls,
+        config: ExperimentConfig,
+        connection_manager: Optional[ConnectionManager] = None,
+    ) -> "SimulationManager":
+        """실험 sweep용 인스턴스 팩토리. 매 조합마다 새 매니저를 강제해 누적 상태 오염을 막는다."""
+        inst = cls(experiment_config=config)
+        inst.connection_manager = connection_manager
+        return inst
 
     def run_experiment(self) -> list[dict]:
         """Run a synchronous fast-path simulation and return in-memory events."""

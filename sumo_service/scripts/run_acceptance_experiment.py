@@ -13,7 +13,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.driver.decision_function import pu_correction_constant
-from app.simulation import ExperimentConfig, N_TAXIS, SimulationManager
+from app.simulation import (
+    ExperimentConfig,
+    N_TAXIS,
+    SIM_DURATION,
+    STEP_LENGTH,
+    SimulationManager,
+)
 
 # CSV는 sweep을 여러 번 이어 붙일 수 있도록 JSON 결과의 params/metrics를 평탄화한 고정 컬럼을 쓴다.
 CSV_COLUMNS = [
@@ -30,6 +36,8 @@ CSV_COLUMNS = [
     "acceptances_per_driver_hour",
     "driver_revenue_per_hour_usd",
     "avg_empty_wait_time_s",
+    "p50_empty_wait_time_s",
+    "p95_empty_wait_time_s",
     "incentive_cost_total_usd",
     "capped_dispatch_attempt_rate",
     "avg_target_gap_when_capped",
@@ -143,7 +151,7 @@ def _run_one(
     if reason:
         return {"status": "invalid", "reason": reason, "params": params, "metrics": None}
 
-    manager = SimulationManager(
+    manager = SimulationManager.fresh_experiment(
         ExperimentConfig(
             target_p=target_p,
             elasticity=elasticity,
@@ -196,8 +204,8 @@ def main() -> int:
     parser.add_argument("--beta-f", type=float)
     parser.add_argument("--beta-f-list")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--sim-duration", type=float, default=3600.0)
-    parser.add_argument("--step-length", type=float, default=1.0)
+    parser.add_argument("--sim-duration", type=float, default=SIM_DURATION)
+    parser.add_argument("--step-length", type=float, default=STEP_LENGTH)
     parser.add_argument("--csv-output", type=Path)
     parser.add_argument(
         "--json-output",
