@@ -47,7 +47,7 @@ _logger = logging.getLogger(__name__)
 from .db.engine import get_pool
 from .db.writer import db_writer_task as _db_writer_task
 from .fare import SPEED_THRESHOLD_MPS, TripAccumulator, calculate_fare, estimate_fare
-from .grid import H3_RESOLUTION, cell_center_latlng, compute_surge, get_cell
+from .grid import DEFAULT_ELASTICITY, H3_RESOLUTION, cell_center_latlng, compute_surge, get_cell
 from .passenger import Passenger
 
 if TYPE_CHECKING:
@@ -915,13 +915,13 @@ class SimulationManager:
                                     self._taxi_last_dropoff_cells.get(veh_id)
                                     or get_cell(*self._latlng(tx, ty))
                                 ),
-                                pickup_cell=candidate.h3_pickup,
                                 dropoff_cell=candidate.h3_dropoff,
                                 call_datetime=SIM_BASE_DATETIME + timedelta(seconds=sim_time),
                                 target_p=self.experiment_config.target_p,
                                 D_pu=D_pu_miles,
                                 trip_distance=candidate.expected_distance_m / 1609.344,
                                 beta_f=self.experiment_config.beta_f,
+                                pickup_cell=candidate.h3_pickup,
                             )
                             raw_incentive_usd = required_fare_usd - fare_usd
                             incentive_cap_usd = min(10.0, base_fare_usd)
@@ -936,13 +936,13 @@ class SimulationManager:
                         try:
                             p = _acceptance_probability(
                                 last_dropoff_cell=last_cell,
-                                pickup_cell=candidate.h3_pickup,
                                 dropoff_cell=candidate.h3_dropoff,
                                 call_datetime=call_dt,
                                 fare_amount=fare_usd,
                                 D_pu=D_pu_miles,
                                 trip_distance=trip_miles,
                                 beta_f=self.experiment_config.beta_f if self.experiment_config else None,
+                                pickup_cell=candidate.h3_pickup,
                             )
                         except Exception as e:
                             _logger.warning(
@@ -1452,8 +1452,10 @@ class SimulationManager:
     ) -> None:
         surge_cells = []
         surge_by_h3 = {}
-        # 일반 실행은 기존 기본 탄력성 0.6을 유지하고, 실험 실행만 sweep 입력값으로 override한다.
-        elasticity = self.experiment_config.elasticity if self.experiment_config else 0.6
+        # 일반 실행은 기본 탄력성을 유지하고, 실험 실행만 sweep 입력값으로 override한다.
+        elasticity = (
+            self.experiment_config.elasticity if self.experiment_config else DEFAULT_ELASTICITY
+        )
         for cell in set(grid_supply) | set(grid_demand):
             lat_c, lng_c = cell_center_latlng(cell)
             surge = compute_surge(

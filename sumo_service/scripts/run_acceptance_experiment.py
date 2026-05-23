@@ -8,6 +8,9 @@ import sys
 from pathlib import Path
 from statistics import mean, median, quantiles
 
+# 빈차 대기 분포는 long-tail이라 표본이 너무 적으면 p95가 사실상 max에 가까워 무의미.
+MIN_SAMPLES_FOR_PERCENTILE = 20
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -89,7 +92,7 @@ def _aggregate(events: list[dict], sim_duration: float) -> dict:
         e["empty_wait_time_s"] for e in accepted if e.get("empty_wait_time_s") is not None
     ]
     p95_empty_wait = None
-    if len(empty_waits) >= 2:
+    if len(empty_waits) >= MIN_SAMPLES_FOR_PERCENTILE:
         p95_empty_wait = quantiles(empty_waits, n=20, method="inclusive")[18]
 
     return {

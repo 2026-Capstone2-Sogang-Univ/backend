@@ -3,7 +3,7 @@ SmartTaxi Module 4 — 기사 콜 수락 확률 함수.
 
 모듈1이 매 콜마다 호출:
     from decision_function import acceptance_probability
-    p = acceptance_probability(last_dropoff_cell, pickup_cell, dropoff_cell,
+    p = acceptance_probability(last_dropoff_cell, dropoff_cell,
                                call_datetime, fare_amount, D_pu, trip_distance)
     if random.random() < p: 수락 else 거부
 
@@ -94,13 +94,15 @@ def pu_corrected_logit(target_p: float, c: float = _C) -> float:
 
 def acceptance_features(
     last_dropoff_cell: str,
-    pickup_cell: str,
     dropoff_cell: str,
     call_datetime: datetime,
     D_pu: float,
     trip_distance: float,
+    *,
+    pickup_cell: str | None = None,  # 예약 인자: 추후 pickup-cell 기반 feature 도입 시 사용.
 ) -> AcceptanceFeatures:
     """Return fare-independent feature terms used by the acceptance model."""
+    del pickup_cell  # 현재 계산엔 미사용. 시그니처는 미래 사용을 위해 유지.
     dow = call_datetime.weekday()
     pickup_min = call_datetime.hour * 60 + call_datetime.minute
     pickup_bin = (pickup_min // 15) % 96
@@ -132,32 +134,33 @@ def acceptance_features(
 
 def acceptance_probability(
     last_dropoff_cell: str,
-    pickup_cell: str,
     dropoff_cell: str,
     call_datetime: datetime,
     fare_amount: float,
     D_pu: float,
     trip_distance: float,
     beta_f: float | None = None,
+    *,
+    pickup_cell: str | None = None,  # 예약 인자: 추후 pickup-cell 기반 feature 도입 시 사용.
 ) -> float:
     """0~1 범위 P(수락) 반환.
 
     Args:
         last_dropoff_cell: 후보 기사의 직전 dropoff H3 셀 (lvl 9). vacant 시작 위치.
-        pickup_cell: 콜 출발 H3 셀.
         dropoff_cell: 콜 도착 H3 셀.
         call_datetime: 콜 발생 시각 (datetime, 분 단위).
         fare_amount: 서지 반영된 최종 요금. 모듈1이 이미 계산.
         D_pu: 빈차로 픽업까지 가는 거리 (마일).
         trip_distance: 콜 운행 거리 (마일).
+        pickup_cell: (예약) 콜 출발 H3 셀. 현재 계산엔 미사용.
     """
     features = acceptance_features(
         last_dropoff_cell=last_dropoff_cell,
-        pickup_cell=pickup_cell,
         dropoff_cell=dropoff_cell,
         call_datetime=call_datetime,
         D_pu=D_pu,
         trip_distance=trip_distance,
+        pickup_cell=pickup_cell,
     )
     z = features.z_without_fare + (beta_f if beta_f is not None else _BETA_F) * fare_amount
     return probability_from_z(z, _C)
@@ -167,24 +170,25 @@ def acceptance_probability(
 # 호출부는 이 값을 최종 운임으로 쓰지 않고, 현재 surged fare 대비 추가 인센티브 산정 기준으로 사용한다.
 def required_fare_for_target_p(
     last_dropoff_cell: str,
-    pickup_cell: str,
     dropoff_cell: str,
     call_datetime: datetime,
     target_p: float,
     D_pu: float,
     trip_distance: float,
     beta_f: float | None = None,
+    *,
+    pickup_cell: str | None = None,  # 예약 인자: 추후 pickup-cell 기반 feature 도입 시 사용.
 ) -> float:
     beta = beta_f if beta_f is not None else _BETA_F
     if abs(beta) < 1e-9:
         raise ValueError("beta_f too close to zero for inverse fare calculation")
     features = acceptance_features(
         last_dropoff_cell=last_dropoff_cell,
-        pickup_cell=pickup_cell,
         dropoff_cell=dropoff_cell,
         call_datetime=call_datetime,
         D_pu=D_pu,
         trip_distance=trip_distance,
+        pickup_cell=pickup_cell,
     )
     z_target = pu_corrected_logit(target_p, _C)
     return (z_target - features.z_without_fare) / beta
@@ -200,7 +204,6 @@ if __name__ == '__main__':
     cell_test = h3.latlng_to_cell(40.7580, -73.9855, 9)  # Times Square
     p = acceptance_probability(
         last_dropoff_cell=cell_test,
-        pickup_cell=cell_test,
         dropoff_cell=cell_test,
         call_datetime=datetime(2013, 7, 1, 18, 30),
         fare_amount=12.5,

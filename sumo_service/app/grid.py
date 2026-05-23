@@ -5,6 +5,9 @@ import h3
 
 H3_RESOLUTION = int(os.getenv("H3_RESOLUTION", "9"))
 
+# 운영(experiment_config=None)과 실험 모드 fallback이 같은 값을 쓰도록 한 곳에서 관리.
+DEFAULT_ELASTICITY = 0.6
+
 
 def get_cell(lat: float, lng: float) -> str:
     return h3.latlng_to_cell(lat, lng, H3_RESOLUTION)
@@ -21,10 +24,12 @@ def cell_boundary(cell: str) -> list[tuple[float, float]]:
 def compute_surge(
     supply: int,
     demand: int,
+    # min_active_surge가 1.2면 수요>공급이 발생하는 순간 1.0→1.2로 점프해 UI 상 작은 잡음을
+    # 만들지 않는다. 0.1 단위 ceil도 가격 표시 안정성을 위한 정책 결정.
     min_active_surge: float = 1.2,
     max_surge: float = 4.9,
     increment: float = 0.1,
-    elasticity: float = 0.6,
+    elasticity: float = DEFAULT_ELASTICITY,
 ) -> float:
     if supply == 0 and demand == 0:
         return 1.0
