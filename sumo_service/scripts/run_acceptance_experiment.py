@@ -5,7 +5,6 @@ import csv
 import itertools
 import json
 import sys
-from contextlib import redirect_stdout
 from pathlib import Path
 from statistics import mean, median, quantiles
 
@@ -154,9 +153,11 @@ def _run_one(
             step_length=step_length,
         )
     )
-    with redirect_stdout(sys.stderr):
-        # stdout은 JSON 배열 전용 계약이므로 SUMO 초기화 로그는 stderr로 격리한다.
+    try:
         events = manager.run_experiment()
+    except Exception as e:  # noqa: BLE001 — SUMO/TraCI 측 예외 종류가 다양해 광범위 캐치 필요
+        # 한 조합이 죽어도 sweep 전체가 망가지지 않도록 error row로 남긴다.
+        return {"status": "error", "reason": repr(e), "params": params, "metrics": None}
     return {
         "status": "ok",
         "reason": None,
@@ -198,20 +199,31 @@ def main() -> int:
     parser.add_argument("--sim-duration", type=float, default=3600.0)
     parser.add_argument("--step-length", type=float, default=1.0)
     parser.add_argument("--csv-output", type=Path)
+    parser.add_argument(
+        "--json-output",
+        type=Path,
+        help="JSON 결과를 파일로 저장. 미지정 시 stdout으로 출력 (SUMO 로그와 섞일 수 있음).",
+    )
     args = parser.parse_args()
 
     target_ps = _parse_float_list(args.target_p_list, args.target_p)
     elasticities = _parse_float_list(args.elasticity_list, args.elasticity)
     beta_fs = _parse_float_list(args.beta_f_list, args.beta_f)
 
-    # 단일 입력도 길이 1 sweep으로 취급하고, 여러 리스트는 Cartesian product로 실행한다.
-    rows = [
-        _run_one(target_p, elasticity, beta_f, args.seed, args.sim_duration, args.step_length)
-        for target_p, elasticity, beta_f in itertools.product(target_ps, elasticities, beta_fs)
-    ]
-    if args.csv_output:
-        _append_csv(args.csv_output, rows)
-    print(json.dumps(rows, ensure_ascii=False, indent=2))
+    # 조합별로 즉시 CSV append 한다. sweep 도중 SUMO/TraCI가 죽어도 완료된 row는 보존된다.
+    rows: list[dict] = []
+    for target_p, elasticity, beta_f in itertools.product(target_ps, elasticities, beta_fs):
+        row = _run_one(target_p, elasticity, beta_f, args.seed, args.sim_duration, args.step_length)
+        rows.append(row)
+        if args.csv_output:
+            _append_csv(args.csv_output, [row])
+
+    payload = json.dumps(rows, ensure_ascii=False, indent=2)
+    if args.json_output:
+        args.json_output.parent.mkdir(parents=True, exist_ok=True)
+        args.json_output.write_text(payload, encoding="utf-8")
+    else:
+        print(payload)
     return 0
 
 

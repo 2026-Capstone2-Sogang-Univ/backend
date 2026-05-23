@@ -914,7 +914,8 @@ class SimulationManager:
                             raw_incentive_usd = required_fare_usd - fare_usd
                             incentive_cap_usd = min(10.0, base_fare_usd)
                             incentive_usd = min(max(raw_incentive_usd, 0.0), incentive_cap_usd)
-                            capped = not math.isclose(incentive_usd, raw_incentive_usd, abs_tol=1e-9)
+                            # raw_incentive_usd가 음수(이미 target_p 초과 달성)일 때는 capped로 간주하지 않음.
+                            capped = raw_incentive_usd > incentive_cap_usd
                             fare_usd += incentive_usd
                         trip_miles = candidate.expected_distance_m / 1609.344
                         call_dt    = SIM_BASE_DATETIME + timedelta(seconds=sim_time)
