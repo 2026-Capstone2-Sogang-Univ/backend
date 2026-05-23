@@ -947,7 +947,7 @@ class SimulationManager:
                         except Exception as e:
                             _logger.warning(
                                 "acceptance_probability failed (pickup=%s dropoff=%s): %s"
-                                " — defaulting to accept",
+                                " - defaulting to accept",
                                 candidate.h3_pickup, candidate.h3_dropoff, e,
                             )
                             p = 1.0
@@ -1137,7 +1137,7 @@ class SimulationManager:
                 continue
             if veh_id in sub_results:
                 continue
-            print(f"[WARN] dispatched taxi {veh_id} not found in sub_results — vehicle lost", flush=True)
+            _logger.warning("dispatched taxi %s not found in sub_results - vehicle lost", veh_id)
             passenger_id = self._taxi_targets.pop(veh_id, None)
             if passenger_id:
                 passenger = self._passengers.get(passenger_id)
@@ -1155,8 +1155,8 @@ class SimulationManager:
         for taxi_id, accum in list(self._active_trips.items()):
             vals = sub_results.get(taxi_id)
             if vals is None:
-                # 택시가 네트워크에서 제거됨 (경로 끝 도달) — 버퍼 경로가 누락된 경우
-                print(f"[WARN] taxi {taxi_id} removed from network while occupied — vehicle lost", flush=True)
+                # 택시가 네트워크에서 제거됨 (경로 끝 도달) - 버퍼 경로가 누락된 경우
+                _logger.warning("taxi %s removed from network while occupied - vehicle lost", taxi_id)
                 passenger_id = self._taxi_targets.pop(taxi_id, None)
                 passenger = self._passengers.pop(passenger_id, None) if passenger_id else None
                 if passenger:
