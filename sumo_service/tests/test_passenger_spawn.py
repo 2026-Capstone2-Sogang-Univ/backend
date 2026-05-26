@@ -24,7 +24,7 @@ def _make_traci_stub():
     traci_mod.exceptions.TraCIException = Exception
     traci_mod.exceptions.FatalTraCIError = Exception
     traci_mod.constants = types.ModuleType("traci.constants")
-    for attr in ("VAR_POSITION", "VAR_ANGLE", "VAR_SPEED", "VAR_DISTANCE", "VAR_ROAD_ID"):
+    for attr in ("VAR_POSITION", "VAR_ANGLE", "VAR_SPEED", "VAR_DISTANCE", "VAR_ROAD_ID", "VAR_ROUTE_INDEX"):
         setattr(traci_mod.constants, attr, attr)
     sys.modules["traci"] = traci_mod
     sys.modules["traci.exceptions"] = traci_mod.exceptions
