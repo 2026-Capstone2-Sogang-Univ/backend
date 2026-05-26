@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import random as _random
+import sys
 import threading
 import time
 import uuid
@@ -38,6 +39,7 @@ import traci.exceptions
 from traci import constants as tc
 
 from .coord import make_sumolib_converter, sumo_to_latlng
+from .demand_history import DemandHistoryStore
 from .driver.decision_function import (
     acceptance_probability as _acceptance_probability,
     required_fare_for_target_p as _required_fare_for_target_p,
@@ -49,6 +51,8 @@ from .db.writer import db_writer_task as _db_writer_task
 from .fare import SPEED_THRESHOLD_MPS, TripAccumulator, calculate_fare, estimate_fare
 from .grid import DEFAULT_ELASTICITY, H3_RESOLUTION, cell_center_latlng, compute_surge, get_cell
 from .passenger import Passenger
+from .prediction import PredictionDemandProvider
+from .weather import StaticWeatherProvider
 
 if TYPE_CHECKING:
     from .connection_manager import ConnectionManager
@@ -135,6 +139,10 @@ def _poisson_sample(lam: float) -> int:
     return k - 1
 
 
+def _traci_module():
+    return sys.modules.get("traci", traci)
+
+
 def _kosaraju_scc(graph: dict[str, set[str]]) -> list[set[str]]:
     """Iterative Kosaraju's algorithm — returns list of SCCs.
 
@@ -198,15 +206,21 @@ class SimStatus(str, Enum):
 # None이면 기존 WebSocket/DB/실시간 pacing 경로를 그대로 사용하고, 값이 있으면 빠른 동기 실행 경로를 탄다.
 @dataclass(frozen=True)
 class ExperimentConfig:
-    target_p: float
-    elasticity: float
-    beta_f: float
+    target_p: float = 0.8
+    elasticity: float = DEFAULT_ELASTICITY
+    beta_f: float = 0.006
     seed: int = 42
     sim_duration: float = SIM_DURATION
     # 운영(start)과 같은 step rate를 기본값으로 둬야 sweep 결과를 운영에 옮길 수 있다.
     step_length: float = STEP_LENGTH
     real_sleep: float = 0.0
     broadcast: bool = False
+    demand_source: str = "actual"
+    prediction_mode: str = "none"
+    prediction_url: str = "https://module3-ml.onrender.com/predict"
+    prediction_horizon_min: int = 15
+    prediction_fallback_policy: str = "error"
+    weather_source: str = "static"
 
 
 class SimulationManager:
@@ -235,6 +249,9 @@ class SimulationManager:
         self._surge_cells: list[dict] = []
         # WebSocket은 list 형태가 필요하지만 배차 판단은 pickup H3로 즉시 조회해야 하므로 dict 캐시를 함께 둔다.
         self._surge_by_h3: dict[str, float] = {}
+        self._history_store: DemandHistoryStore | None = None
+        self._prediction_demand_provider: PredictionDemandProvider | None = None
+        self._surge_diagnostics: list[dict] = []
         self._completed_passengers: list[dict] = []
         self._trip_queue: list[dict] = []
         self._latlng: Callable[[float, float], tuple[float, float]] | None = None
@@ -265,6 +282,7 @@ class SimulationManager:
     async def start(self) -> None:
         if self.status == SimStatus.RUNNING:
             return
+        self._reset_run_state()
         self._paused = False
         self._stop_event.clear()
         self._loop = asyncio.get_event_loop()
@@ -331,7 +349,7 @@ class SimulationManager:
         if self.experiment_config is None:
             raise RuntimeError("run_experiment requires experiment_config")
         _random.seed(self.experiment_config.seed)
-        self._event_log = []
+        self._reset_run_state()
         self._stop_event.clear()
         self.status = SimStatus.RUNNING
         self._run_loop()
@@ -402,6 +420,11 @@ class SimulationManager:
         self.status = SimStatus.IDLE
         if self.connection_manager is not None:
             self.connection_manager.clear_boundary()
+        self._reset_run_state()
+
+    def _reset_run_state(self) -> None:
+        """Clear per-run mutable state while preserving manager configuration."""
+        self._close_prediction_demand_provider()
         with self._lock:
             self._state = {"vehicles": [], "passengers": [], "sim_time": 0.0}
             self._passengers = {}
@@ -415,6 +438,8 @@ class SimulationManager:
             self._routable_edges = []
             self._surge_cells = []
             self._surge_by_h3 = {}
+            self._history_store = None
+            self._surge_diagnostics = []
             self._completed_passengers = []
             self._trip_queue = []
             self._latlng = None
@@ -423,7 +448,12 @@ class SimulationManager:
             self._edge_weights = []
             self._routable_edges_set = set()
             self._run_id = None
+            self._loop = None
+            self._state_queue = None
+            self._executor_task = None
+            self._broadcast_task = None
             self._db_queue = None
+            self._db_writer_task = None
             self._taxi_dispatch_ids = {}
             self._taxi_last_dropoff_cells = {}
             self._taxi_appeared.clear()
@@ -515,6 +545,7 @@ class SimulationManager:
                     flush=True,
                 )
             self._routable_edges_set = set(self._routable_edges)
+            self._initialize_prediction_components()
             self._edge_weights = self._compute_edge_weights()
             self._add_initial_vehicles()
 
@@ -630,7 +661,7 @@ class SimulationManager:
                     surge_interval = int(sim_time / 5.0)
                     if surge_interval > self._last_surge_interval:
                         self._last_surge_interval = surge_interval
-                        self._build_surge_cells(grid_supply, grid_demand)
+                        self._build_surge_cells(grid_supply, grid_demand, sim_time)
                         state["surge"] = self._surge_cells
                     else:
                         state["surge"] = None
@@ -646,6 +677,7 @@ class SimulationManager:
                             pid = self._taxi_targets.pop(taxi_id, None)
                             p = self._passengers.pop(pid, None) if pid else None
                             if p:
+                                dropoff_h3 = p.h3_dropoff or get_cell(p.dropoff_lat, p.dropoff_lng)
                                 fare = calculate_fare(accum)
                                 self._completed_passengers.append({
                                     "passenger_id": pid,
@@ -672,6 +704,7 @@ class SimulationManager:
                                     "expected_fare": p.expected_fare,
                                     "completion": "forced_at_end",
                                 })
+                                self._record_history_dropoff(sim_time, dropoff_h3)
                             self._taxi_dispatch_ids.pop(taxi_id, None)
                         self._active_trips.clear()
                     self.status = SimStatus.FINISHED
@@ -694,6 +727,8 @@ class SimulationManager:
                 traci.close()
             except Exception:
                 pass
+            if self.experiment_config is not None:
+                self._close_prediction_demand_provider()
 
     def _push_db_event(self, event: dict) -> None:
         # 실험 모드는 DB writer를 띄우지 않으므로 기존 DB 이벤트 중 KPI에 필요한 완료 이벤트만 메모리에 투영한다.
@@ -724,6 +759,75 @@ class SimulationManager:
             return
         self._event_log.append({"type": event_type, **payload})
 
+    def _close_prediction_demand_provider(self) -> None:
+        provider = self._prediction_demand_provider
+        if provider is None:
+            return
+        provider.close()
+        self._prediction_demand_provider = None
+
+    def _record_history_spawn(self, sim_time: float, h3_cell: str | None) -> None:
+        if self._history_store is None:
+            return
+        self._history_store.record_spawn(
+            SIM_BASE_DATETIME + timedelta(seconds=sim_time),
+            h3_cell,
+        )
+
+    def _record_history_dropoff(self, sim_time: float, h3_cell: str | None) -> None:
+        if self._history_store is None:
+            return
+        self._history_store.record_dropoff(
+            SIM_BASE_DATETIME + timedelta(seconds=sim_time),
+            h3_cell,
+        )
+
+    @staticmethod
+    def _provider_prediction_mode(mode: str) -> str:
+        return "sync" if mode == "none" else mode
+
+    def _initialize_prediction_components(self) -> None:
+        self._close_prediction_demand_provider()
+        config = self.experiment_config
+        if config is None:
+            self._history_store = None
+            self._surge_diagnostics = []
+            return
+
+        if self._latlng is None:
+            raise RuntimeError("lat/lng converter must be initialized before prediction components")
+
+        model_h3_cells: list[str] = []
+        seen_cells: set[str] = set()
+        for edge_id in self._routable_edges:
+            midpoint = self._get_edge_midpoint(edge_id)
+            if midpoint is None:
+                continue
+            lat, lng = self._latlng(*midpoint)
+            if not (math.isfinite(lat) and math.isfinite(lng)):
+                continue
+            h3_cell = get_cell(lat, lng)
+            if h3_cell not in seen_cells:
+                seen_cells.add(h3_cell)
+                model_h3_cells.append(h3_cell)
+
+        self._history_store = DemandHistoryStore(model_h3_cells=model_h3_cells)
+        self._surge_diagnostics = []
+
+        if config.demand_source != "predicted":
+            return
+        if config.weather_source != "static":
+            raise ValueError(f"unsupported weather source: {config.weather_source}")
+
+        self._prediction_demand_provider = PredictionDemandProvider(
+            prediction_url=config.prediction_url,
+            model_h3_cells=model_h3_cells,
+            history_store=self._history_store,
+            weather_provider=StaticWeatherProvider(),
+            prediction_horizon_min=config.prediction_horizon_min,
+            fallback_policy=config.prediction_fallback_policy,
+        )
+
     def _spawn_passengers(self, sim_time: float) -> None:
         if PASSENGER_SOURCE == "parquet":
             while self._trip_queue and self._trip_queue[0]["sim_time"] <= sim_time:
@@ -739,16 +843,17 @@ class SimulationManager:
                 self._create_passenger_random(sim_time)
 
     def _get_edge_midpoint(self, edge_id: str) -> tuple[float, float] | None:
+        traci_mod = _traci_module()
         try:
-            shape = traci.lane.getShape(f"{edge_id}_0")
-        except traci.exceptions.TraCIException:
-            n = traci.edge.getLaneNumber(edge_id)
+            shape = traci_mod.lane.getShape(f"{edge_id}_0")
+        except traci_mod.exceptions.TraCIException:
+            n = traci_mod.edge.getLaneNumber(edge_id)
             shape = None
             for i in range(1, n):
                 try:
-                    shape = traci.lane.getShape(f"{edge_id}_{i}")
+                    shape = traci_mod.lane.getShape(f"{edge_id}_{i}")
                     break
-                except traci.exceptions.TraCIException:
+                except traci_mod.exceptions.TraCIException:
                     continue
             if not shape:
                 return None
@@ -760,9 +865,10 @@ class SimulationManager:
         dropoff_edge = _random.choice(self._routable_edges)
         if pickup_edge == dropoff_edge:
             return
+        traci_mod = _traci_module()
         try:
-            route = traci.simulation.findRoute(pickup_edge, dropoff_edge)
-        except traci.exceptions.TraCIException:
+            route = traci_mod.simulation.findRoute(pickup_edge, dropoff_edge)
+        except traci_mod.exceptions.TraCIException:
             return
         if not route.edges:
             return
@@ -808,6 +914,7 @@ class SimulationManager:
             "h3_pickup": h3,
             "source": "random",
         })
+        self._record_history_spawn(sim_time, h3)
         # 승객 생성 수와 unique matched passenger denominator를 계산하기 위한 실험 이벤트.
         self._emit_event("passenger_spawned", {
             "sim_time": sim_time,
@@ -825,9 +932,10 @@ class SimulationManager:
         if pickup_edge not in self._routable_edges_set or \
            dropoff_edge not in self._routable_edges_set:
             return
+        traci_mod = _traci_module()
         try:
-            route = traci.simulation.findRoute(pickup_edge, dropoff_edge)
-        except traci.exceptions.TraCIException:
+            route = traci_mod.simulation.findRoute(pickup_edge, dropoff_edge)
+        except traci_mod.exceptions.TraCIException:
             return
         if not route.edges:
             return
@@ -873,6 +981,7 @@ class SimulationManager:
             "h3_pickup": h3,
             "source": "parquet",
         })
+        self._record_history_spawn(sim_time, h3)
         # parquet replay도 random spawn과 동일한 이벤트 스키마로 남겨 집계 코드를 공유한다.
         self._emit_event("passenger_spawned", {
             "sim_time": sim_time,
@@ -1097,6 +1206,7 @@ class SimulationManager:
                 accum = self._active_trips.get(veh_id)
                 # 트립 타임아웃: 누적된 요금으로 강제 완료
                 if accum and sim_time - accum.pickup_sim_time > TRIP_TIMEOUT_S:
+                    dropoff_h3 = passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
                     fare = calculate_fare(accum)
                     fare_updates.append({
                         "passenger_id": passenger_id,
@@ -1121,9 +1231,8 @@ class SimulationManager:
                         "expected_fare": passenger.expected_fare,
                         "completion": "trip_timeout",
                     })
-                    self._taxi_last_dropoff_cells[veh_id] = (
-                        passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
-                    )
+                    self._record_history_dropoff(sim_time, dropoff_h3)
+                    self._taxi_last_dropoff_cells[veh_id] = dropoff_h3
                     del self._passengers[passenger_id]
                     del self._active_trips[veh_id]
                     del self._taxi_targets[veh_id]
@@ -1140,6 +1249,7 @@ class SimulationManager:
                     continue
                 if road_id == passenger.dropoff_edge:
                     accum = self._active_trips[veh_id]
+                    dropoff_h3 = passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
                     fare = calculate_fare(accum)
                     fare_updates.append({
                         "passenger_id": passenger_id,
@@ -1164,9 +1274,8 @@ class SimulationManager:
                         "expected_fare": passenger.expected_fare,
                         "completion": "normal",
                     })
-                    self._taxi_last_dropoff_cells[veh_id] = (
-                        passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
-                    )
+                    self._record_history_dropoff(sim_time, dropoff_h3)
+                    self._taxi_last_dropoff_cells[veh_id] = dropoff_h3
                     del self._passengers[passenger_id]
                     del self._active_trips[veh_id]
                     del self._taxi_targets[veh_id]
@@ -1209,6 +1318,7 @@ class SimulationManager:
                 passenger_id = self._taxi_targets.pop(taxi_id, None)
                 passenger = self._passengers.pop(passenger_id, None) if passenger_id else None
                 if passenger:
+                    dropoff_h3 = passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
                     fare = calculate_fare(accum)
                     fare_updates.append({
                         "passenger_id": passenger_id,
@@ -1233,9 +1343,8 @@ class SimulationManager:
                         "expected_fare": passenger.expected_fare,
                         "completion": "sumo_removed",
                     })
-                    self._taxi_last_dropoff_cells[taxi_id] = (
-                        passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
-                    )
+                    self._record_history_dropoff(sim_time, dropoff_h3)
+                    self._taxi_last_dropoff_cells[taxi_id] = dropoff_h3
                 self._active_trips.pop(taxi_id, None)
                 self._taxi_states.pop(taxi_id, None)
                 self._taxi_dispatch_times.pop(taxi_id, None)
@@ -1497,28 +1606,54 @@ class SimulationManager:
         return state_dict, grid_supply, grid_demand
 
     def _build_surge_cells(
-        self, grid_supply: dict[str, int], grid_demand: dict[str, int]
+        self,
+        grid_supply: dict[str, int],
+        grid_demand: dict[str, int],
+        sim_time: float,
     ) -> None:
         surge_cells = []
         surge_by_h3 = {}
+        demand_for_surge: dict[str, float | int] = grid_demand
+        config = self.experiment_config
+        if config is not None and config.demand_source == "predicted":
+            if self._prediction_demand_provider is None:
+                raise RuntimeError("predicted demand source requires a prediction demand provider")
+            demand_for_surge = self._prediction_demand_provider.demand_by_h3(
+                SIM_BASE_DATETIME + timedelta(seconds=sim_time),
+                mode=self._provider_prediction_mode(config.prediction_mode),
+                actual_demand=grid_demand,
+            )
+
         # 일반 실행은 기본 탄력성을 유지하고, 실험 실행만 sweep 입력값으로 override한다.
         elasticity = (
             self.experiment_config.elasticity if self.experiment_config else DEFAULT_ELASTICITY
         )
-        for cell in set(grid_supply) | set(grid_demand):
+        for cell in set(grid_supply) | set(grid_demand) | set(demand_for_surge):
             lat_c, lng_c = cell_center_latlng(cell)
             surge = compute_surge(
                 grid_supply.get(cell, 0),
-                grid_demand.get(cell, 0),
+                demand_for_surge.get(cell, 0),
                 elasticity=elasticity,
             )
             surge_by_h3[cell] = surge
+            actual_demand = grid_demand.get(cell, 0)
+            selected_demand = demand_for_surge.get(cell, 0)
             surge_cells.append({
                 "h3": cell,
                 "supply": grid_supply.get(cell, 0),
-                "demand": grid_demand.get(cell, 0),
+                "demand": selected_demand,
+                "actual_demand": actual_demand,
                 "surge": surge,
                 "center": {"lat": lat_c, "lng": lng_c},
             })
+            if self.experiment_config is not None:
+                self._surge_diagnostics.append({
+                    "sim_time": sim_time,
+                    "h3": cell,
+                    "supply": grid_supply.get(cell, 0),
+                    "actual_demand": actual_demand,
+                    "demand_for_surge": selected_demand,
+                    "surge": surge,
+                })
         self._surge_cells = surge_cells
         self._surge_by_h3 = surge_by_h3
