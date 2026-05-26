@@ -1,4 +1,5 @@
 import csv
+import math
 
 import pytest
 
@@ -153,3 +154,147 @@ def test_run_one_uses_sync_when_predicted_demand_has_no_prediction_mode(monkeypa
 
     assert captured["config"].prediction_mode == "sync"
     assert row["params"]["prediction_mode"] == "sync"
+
+
+def test_run_one_returns_invalid_row_for_near_zero_alpha_sensitivity(monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("SimulationManager should not start for invalid alpha_sensitivity")
+
+    monkeypatch.setattr(
+        "scripts.run_acceptance_experiment.SimulationManager.fresh_experiment",
+        fail_if_called,
+    )
+
+    row = _run_one(
+        0.8,
+        0.5,
+        0.006,
+        7,
+        60.0,
+        1.0,
+        alpha_sensitivity=0.0,
+    )
+
+    assert row["status"] == "invalid"
+    assert "alpha_sensitivity" in row["reason"]
+    assert row["params"]["alpha_sensitivity"] == 0.0
+
+
+@pytest.mark.parametrize("target_p", [0.0, -0.1])
+def test_run_one_returns_invalid_row_for_non_positive_target_p(monkeypatch, target_p):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("SimulationManager should not start for invalid target_p")
+
+    monkeypatch.setattr(
+        "scripts.run_acceptance_experiment.SimulationManager.fresh_experiment",
+        fail_if_called,
+    )
+
+    row = _run_one(
+        target_p,
+        0.5,
+        0.006,
+        7,
+        60.0,
+        1.0,
+    )
+
+    assert row["status"] == "invalid"
+    assert "target_p" in row["reason"]
+    assert row["params"]["target_p"] == target_p
+
+
+def test_run_one_returns_invalid_row_for_target_p_above_one(monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("SimulationManager should not start for invalid target_p")
+
+    monkeypatch.setattr(
+        "scripts.run_acceptance_experiment.SimulationManager.fresh_experiment",
+        fail_if_called,
+    )
+
+    row = _run_one(
+        1.1,
+        0.5,
+        0.006,
+        7,
+        60.0,
+        1.0,
+    )
+
+    assert row["status"] == "invalid"
+    assert "target_p" in row["reason"]
+    assert row["params"]["target_p"] == 1.1
+
+
+@pytest.mark.parametrize("target_p", [math.inf, -math.inf, math.nan])
+def test_run_one_returns_invalid_row_for_non_finite_target_p(monkeypatch, target_p):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("SimulationManager should not start for invalid target_p")
+
+    monkeypatch.setattr(
+        "scripts.run_acceptance_experiment.SimulationManager.fresh_experiment",
+        fail_if_called,
+    )
+
+    row = _run_one(
+        target_p,
+        0.5,
+        0.006,
+        7,
+        60.0,
+        1.0,
+    )
+
+    assert row["status"] == "invalid"
+    assert "target_p" in row["reason"]
+
+
+@pytest.mark.parametrize("beta_f", [math.inf, -math.inf, math.nan])
+def test_run_one_returns_invalid_row_for_non_finite_beta_f(monkeypatch, beta_f):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("SimulationManager should not start for invalid beta_f")
+
+    monkeypatch.setattr(
+        "scripts.run_acceptance_experiment.SimulationManager.fresh_experiment",
+        fail_if_called,
+    )
+
+    row = _run_one(
+        0.8,
+        0.5,
+        beta_f,
+        7,
+        60.0,
+        1.0,
+    )
+
+    assert row["status"] == "invalid"
+    assert "beta_f" in row["reason"]
+
+
+@pytest.mark.parametrize("alpha_sensitivity", [-1.0, math.inf, -math.inf, math.nan])
+def test_run_one_returns_invalid_row_for_invalid_alpha_sensitivity(
+    monkeypatch,
+    alpha_sensitivity,
+):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("SimulationManager should not start for invalid alpha_sensitivity")
+
+    monkeypatch.setattr(
+        "scripts.run_acceptance_experiment.SimulationManager.fresh_experiment",
+        fail_if_called,
+    )
+
+    row = _run_one(
+        0.8,
+        0.5,
+        0.006,
+        7,
+        60.0,
+        1.0,
+        alpha_sensitivity=alpha_sensitivity,
+    )
+
+    assert row["status"] == "invalid"
+    assert "alpha_sensitivity" in row["reason"]

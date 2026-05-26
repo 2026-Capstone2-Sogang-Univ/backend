@@ -1098,6 +1098,7 @@ class SimulationManager:
                                 D_pu=D_pu_miles,
                                 trip_distance=candidate.expected_distance_m / 1609.344,
                                 beta_f=self.experiment_config.beta_f,
+                                alpha_sensitivity=self.experiment_config.alpha_sensitivity,
                                 pickup_cell=candidate.h3_pickup,
                             )
                             raw_incentive_usd = required_fare_usd - fare_usd
@@ -1119,6 +1120,10 @@ class SimulationManager:
                                 D_pu=D_pu_miles,
                                 trip_distance=trip_miles,
                                 beta_f=self.experiment_config.beta_f if self.experiment_config else None,
+                                alpha_sensitivity=(
+                                    self.experiment_config.alpha_sensitivity
+                                    if self.experiment_config else 1.0
+                                ),
                                 pickup_cell=candidate.h3_pickup,
                             )
                         except Exception as e:

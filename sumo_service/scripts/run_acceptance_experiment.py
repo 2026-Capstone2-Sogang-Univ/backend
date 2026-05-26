@@ -4,6 +4,7 @@ import argparse
 import csv
 import itertools
 import json
+import math
 import sys
 from pathlib import Path
 from statistics import mean, median, quantiles
@@ -168,13 +169,19 @@ def _mean_present(values) -> float | None:
     return mean(present) if present else None
 
 
-def _invalid_reason(target_p: float, beta_f: float) -> str | None:
+def _invalid_reason(target_p: float, beta_f: float, alpha_sensitivity: float) -> str | None:
     # 수학적으로 역산이 불가능한 조합은 SUMO를 띄우기 전에 invalid row로 남긴다.
     c = pu_correction_constant()
+    if not math.isfinite(target_p) or target_p <= 0:
+        return "target_p must be positive and finite"
+    if target_p > 1.0:
+        return "target_p must be <= 1.0"
     if target_p * c >= 1:
         return "target_p * c must be < 1"
-    if abs(beta_f) < 1e-9:
-        return "beta_f too close to zero for inverse fare calculation"
+    if not math.isfinite(beta_f) or abs(beta_f) < 1e-9:
+        return "beta_f must be finite and non-zero for inverse fare calculation"
+    if not math.isfinite(alpha_sensitivity) or alpha_sensitivity <= 1e-9:
+        return "alpha_sensitivity must be positive and finite"
     return None
 
 
@@ -211,7 +218,7 @@ def _run_one(
         "alpha_sensitivity": alpha_sensitivity,
         "weather_source": weather_source,
     }
-    reason = _invalid_reason(target_p, beta_f)
+    reason = _invalid_reason(target_p, beta_f, alpha_sensitivity)
     if reason:
         return {"status": "invalid", "reason": reason, "params": params, "metrics": None}
 
