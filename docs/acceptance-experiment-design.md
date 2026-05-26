@@ -87,12 +87,12 @@ broadcast = off
 ```text
 raw_surge = (demand / supply) ** (1 / elasticity)
 surge = 1.0 if raw_surge <= 1.0 else ceil(max(raw_surge, 1.2) / 0.1) * 0.1
-surge = min(surge, 4.9)
+surge = min(surge, 4.0)
 ```
 
 기존과 같이 5 simulated seconds마다 grid supply/demand를 갱신하고, 각 콜 계산에서는 최신 cached surge를 사용한다.
 
-수요가 공급 이하이면 할인 서지를 적용하지 않고 `1.0x`를 유지한다. 초과 수요가 발생하면 서지 발동 최솟값은 `1.2x`, 상승 단위는 `0.1x`, 상한은 `4.9x`로 둔다.
+수요가 공급 이하이면 할인 서지를 적용하지 않고 `1.0x`를 유지한다. 초과 수요가 발생하면 서지 발동 최솟값은 `1.2x`, 상승 단위는 `0.1x`, 상한은 `4.0x`로 둔다.
 
 서지는 pickup H3 cell 기준으로 적용한다.
 
