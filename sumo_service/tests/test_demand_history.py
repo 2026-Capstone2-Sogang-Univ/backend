@@ -1,3 +1,4 @@
+import threading
 from datetime import datetime
 
 from app.demand_history import (
@@ -92,6 +93,31 @@ def test_records_for_prediction_includes_recorded_spawn_and_dropoff_counts():
         "history_required_count": 14,
         "history_missing_count": 12,
         "history_missing_rate": 12 / 14,
+    }
+
+
+def test_recording_history_is_thread_safe():
+    store = DemandHistoryStore(model_h3_cells=["h3_a"])
+    event_time = datetime(2013, 7, 8, 8, 16)
+
+    def record_events() -> None:
+        for _ in range(1000):
+            store.record_spawn(event_time, "h3_a")
+            store.record_dropoff(event_time, "h3_a")
+
+    threads = [threading.Thread(target=record_events) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1.0)
+
+    records = store.records_for_prediction(datetime(2013, 7, 8, 8, 17))
+
+    assert records[0] == {
+        "h3": "h3_a",
+        "time_bucket": "2013-07-08T08:15:00",
+        "demand_count": 4000,
+        "dropoff_trip_count": 4000,
     }
 
 
