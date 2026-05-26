@@ -32,6 +32,13 @@ CSV_COLUMNS = [
     "elasticity",
     "beta_f",
     "seed",
+    "demand_source",
+    "prediction_mode",
+    "prediction_url",
+    "prediction_horizon_min",
+    "passenger_elasticity",
+    "alpha_sensitivity",
+    "weather_source",
     "spawned_passengers",
     "unique_matched_passengers",
     "matching_success_rate",
@@ -47,6 +54,22 @@ CSV_COLUMNS = [
     "avg_actual_acceptance_probability",
     "avg_required_fare_usd",
     "avg_incentive_usd",
+    "prediction_request_count",
+    "prediction_success_count",
+    "prediction_failure_count",
+    "prediction_latency_ms_avg",
+    "prediction_latency_ms_p95",
+    "prediction_fallback_count",
+    "prediction_stale_use_count",
+    "prediction_missing_h3_rate",
+    "history_required_count",
+    "history_missing_count",
+    "history_missing_rate",
+    "avg_actual_demand_for_surge",
+    "avg_predicted_demand_for_surge",
+    "avg_demand_bias",
+    "avg_abs_demand_error",
+    "avg_surge",
 ]
 
 
@@ -69,6 +92,12 @@ def _aggregate(events: list[dict], sim_duration: float) -> dict:
         e for e in events
         if e["type"] == "trip_completed" and e.get("completion") != "forced_at_end"
     ]
+    diagnostics = _latest_diagnostics(events)
+    surge_diagnostics = [e for e in events if e["type"] == "surge_diagnostic"]
+    actual_values = [e["actual_demand"] for e in surge_diagnostics]
+    predicted_values = [e["demand_for_surge"] for e in surge_diagnostics]
+    demand_errors = [p - a for a, p in zip(actual_values, predicted_values)]
+    surge_values = [e["surge"] for e in surge_diagnostics]
 
     spawned_count = len(spawned)
     matched_passengers = {e["passenger_id"] for e in accepted}
@@ -117,7 +146,21 @@ def _aggregate(events: list[dict], sim_duration: float) -> dict:
         "avg_incentive_usd": (
             mean(e.get("incentive_usd", 0.0) for e in decisions) if decisions else 0.0
         ),
+        **diagnostics,
+        "avg_actual_demand_for_surge": mean(actual_values) if actual_values else 0.0,
+        "avg_predicted_demand_for_surge": mean(predicted_values) if predicted_values else 0.0,
+        "avg_demand_bias": mean(demand_errors) if demand_errors else 0.0,
+        "avg_abs_demand_error": mean(abs(v) for v in demand_errors) if demand_errors else 0.0,
+        "avg_surge": mean(surge_values) if surge_values else 0.0,
     }
+
+
+def _latest_diagnostics(events: list[dict]) -> dict:
+    diagnostics = {}
+    for event in events:
+        if event["type"] == "diagnostics":
+            diagnostics.update({k: v for k, v in event.items() if k != "type"})
+    return diagnostics
 
 
 def _mean_present(values) -> float | None:
@@ -149,6 +192,13 @@ def _run_one(
         "elasticity": elasticity,
         "beta_f": beta_f,
         "seed": seed,
+        "demand_source": ExperimentConfig.demand_source,
+        "prediction_mode": ExperimentConfig.prediction_mode,
+        "prediction_url": ExperimentConfig.prediction_url,
+        "prediction_horizon_min": ExperimentConfig.prediction_horizon_min,
+        "passenger_elasticity": None,
+        "alpha_sensitivity": None,
+        "weather_source": ExperimentConfig.weather_source,
     }
     reason = _invalid_reason(target_p, beta_f)
     if reason:
@@ -180,9 +230,16 @@ def _run_one(
 def _append_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.exists()
+    if exists and path.stat().st_size > 0:
+        with path.open("r", newline="", encoding="utf-8") as f:
+            existing_header = next(csv.reader(f), None)
+        if existing_header != CSV_COLUMNS:
+            raise ValueError(
+                f"CSV header mismatch for {path}; refusing to append rows with a different schema"
+            )
     with path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        if not exists:
+        if not exists or path.stat().st_size == 0:
             writer.writeheader()
         for row in rows:
             params = row["params"]
@@ -190,11 +247,18 @@ def _append_csv(path: Path, rows: list[dict]) -> None:
             writer.writerow({
                 "status": row["status"],
                 "reason": row["reason"],
-                "target_p": params["target_p"],
-                "elasticity": params["elasticity"],
-                "beta_f": params["beta_f"],
-                "seed": params["seed"],
-                **{col: metrics.get(col) for col in CSV_COLUMNS[6:]},
+                "target_p": params.get("target_p"),
+                "elasticity": params.get("elasticity"),
+                "beta_f": params.get("beta_f"),
+                "seed": params.get("seed"),
+                "demand_source": params.get("demand_source"),
+                "prediction_mode": params.get("prediction_mode"),
+                "prediction_url": params.get("prediction_url"),
+                "prediction_horizon_min": params.get("prediction_horizon_min"),
+                "passenger_elasticity": params.get("passenger_elasticity"),
+                "alpha_sensitivity": params.get("alpha_sensitivity"),
+                "weather_source": params.get("weather_source"),
+                **{col: metrics.get(col) for col in CSV_COLUMNS[13:]},
             })
 
 

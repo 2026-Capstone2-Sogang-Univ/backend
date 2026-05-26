@@ -25,6 +25,12 @@ class FakePredictionDemandProvider:
         })
         return dict(self.demand)
 
+    def diagnostics(self):
+        return {"prediction_request_count": len(self.calls)}
+
+    def close(self):
+        pass
+
 
 def test_predicted_demand_source_uses_prediction_for_surge(monkeypatch):
     monkeypatch.setattr(simulation, "cell_center_latlng", lambda cell: (40.0, -73.0))
@@ -101,6 +107,13 @@ class FakeHistoryStore:
     def record_dropoff(self, sim_datetime, h3_cell):
         self.dropoff_records.append((sim_datetime, h3_cell))
 
+    def diagnostics(self):
+        return {
+            "history_required_count": len(self.spawn_records) + len(self.dropoff_records),
+            "history_missing_count": 0,
+            "history_missing_rate": 0.0,
+        }
+
 
 class ClosableProvider:
     def __init__(self) -> None:
@@ -108,6 +121,22 @@ class ClosableProvider:
 
     def close(self) -> None:
         self.closed = True
+
+
+class CloseSettledDiagnosticsProvider(ClosableProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.request_count = 0
+
+    def close(self) -> None:
+        super().close()
+        self.request_count = 3
+
+    def diagnostics(self):
+        return {
+            "prediction_request_count": self.request_count,
+            "prediction_success_count": self.request_count,
+        }
 
 
 def test_random_passenger_creation_records_spawn_history(monkeypatch):
@@ -228,6 +257,71 @@ def test_prediction_provider_is_closed_on_reinitialize_and_run_reset(monkeypatch
     assert reset_provider.closed
     assert manager._history_store is None
     assert manager._surge_diagnostics == []
+
+
+def test_run_experiment_emits_prediction_history_and_surge_diagnostics(monkeypatch):
+    manager = SimulationManager(ExperimentConfig())
+    provider = ClosableProvider()
+    provider.diagnostics = lambda: {"prediction_request_count": 2}
+    history = FakeHistoryStore()
+    history.record_spawn(SIM_BASE_DATETIME, "h3_a")
+
+    def fake_run_loop():
+        manager._prediction_demand_provider = provider
+        manager._history_store = history
+        manager._surge_diagnostics = [
+            {
+                "sim_time": 60.0,
+                "h3": "h3_a",
+                "supply": 1,
+                "actual_demand": 2.0,
+                "demand_for_surge": 3.0,
+                "surge": 1.2,
+            }
+        ]
+
+    monkeypatch.setattr(manager, "_run_loop", fake_run_loop)
+
+    assert manager.run_experiment() == [
+        {
+            "type": "diagnostics",
+            "prediction_request_count": 2,
+            "history_required_count": 1,
+            "history_missing_count": 0,
+            "history_missing_rate": 0.0,
+        },
+        {
+            "type": "surge_diagnostic",
+            "sim_time": 60.0,
+            "h3": "h3_a",
+            "supply": 1,
+            "actual_demand": 2.0,
+            "demand_for_surge": 3.0,
+            "surge": 1.2,
+        },
+    ]
+    assert provider.closed
+
+
+def test_run_experiment_closes_prediction_provider_before_diagnostics(monkeypatch):
+    manager = SimulationManager(ExperimentConfig())
+    provider = CloseSettledDiagnosticsProvider()
+
+    def fake_run_loop():
+        provider.request_count = 1
+        manager._prediction_demand_provider = provider
+
+    monkeypatch.setattr(manager, "_run_loop", fake_run_loop)
+
+    assert manager.run_experiment() == [
+        {
+            "type": "diagnostics",
+            "prediction_request_count": 3,
+            "prediction_success_count": 3,
+        }
+    ]
+    assert provider.closed
+    assert manager._prediction_demand_provider is None
 
 
 def test_run_experiment_resets_stale_run_state_before_loop(monkeypatch):

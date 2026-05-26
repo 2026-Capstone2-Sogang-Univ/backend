@@ -352,8 +352,13 @@ class SimulationManager:
         self._reset_run_state()
         self._stop_event.clear()
         self.status = SimStatus.RUNNING
-        self._run_loop()
-        return list(self._event_log)
+        try:
+            self._run_loop()
+            prediction_provider = self._close_prediction_demand_provider()
+            self._emit_experiment_diagnostics(prediction_provider=prediction_provider)
+            return list(self._event_log)
+        finally:
+            self._close_prediction_demand_provider()
 
     def get_state(self) -> dict:
         with self._lock:
@@ -727,8 +732,6 @@ class SimulationManager:
                 traci.close()
             except Exception:
                 pass
-            if self.experiment_config is not None:
-                self._close_prediction_demand_provider()
 
     def _push_db_event(self, event: dict) -> None:
         # 실험 모드는 DB writer를 띄우지 않으므로 기존 DB 이벤트 중 KPI에 필요한 완료 이벤트만 메모리에 투영한다.
@@ -759,12 +762,27 @@ class SimulationManager:
             return
         self._event_log.append({"type": event_type, **payload})
 
-    def _close_prediction_demand_provider(self) -> None:
+    def _emit_experiment_diagnostics(self, prediction_provider=None) -> None:
+        if self.experiment_config is None:
+            return
+        diagnostics: dict[str, float | int | str] = {}
+        provider = prediction_provider or self._prediction_demand_provider
+        if provider is not None:
+            diagnostics.update(provider.diagnostics())
+        if self._history_store is not None:
+            diagnostics.update(self._history_store.diagnostics())
+        if diagnostics:
+            self._emit_event("diagnostics", diagnostics)
+        for row in self._surge_diagnostics:
+            self._emit_event("surge_diagnostic", row)
+
+    def _close_prediction_demand_provider(self):
         provider = self._prediction_demand_provider
         if provider is None:
-            return
-        provider.close()
+            return None
         self._prediction_demand_provider = None
+        provider.close()
+        return provider
 
     def _record_history_spawn(self, sim_time: float, h3_cell: str | None) -> None:
         if self._history_store is None:
