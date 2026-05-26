@@ -6,6 +6,7 @@ import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from .connection_manager import ConnectionManager
 from .db.engine import close_pool, init_pool
@@ -110,5 +111,12 @@ manager.connection_manager = connection_manager
 app.state.manager = manager
 app.state.connection_manager = connection_manager
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(simulation_router.router, prefix="/simulation", tags=["simulation"])
 app.include_router(ws_router.router, tags=["websocket"])
