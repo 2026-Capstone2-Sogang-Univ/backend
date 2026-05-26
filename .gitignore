@@ -180,3 +180,8 @@ pyrightconfig.json
 
 # 원시 택시 데이터 (대용량, 로컬에서만 보관)
 real_taxi_data/
+
+# run_acceptance_experiment.py KPI 출력
+# sumo_service 루트의 csv/json만 무시한다.
+sumo_service/*.csv
+sumo_service/*.json
