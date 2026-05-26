@@ -2,7 +2,7 @@ import csv
 
 import pytest
 
-from scripts.run_acceptance_experiment import CSV_COLUMNS, _aggregate, _append_csv
+from scripts.run_acceptance_experiment import CSV_COLUMNS, _aggregate, _append_csv, _run_one
 
 
 def test_aggregate_includes_prediction_history_and_demand_diagnostics():
@@ -71,3 +71,85 @@ def test_append_csv_rejects_existing_file_with_old_header(tmp_path):
 
     with pytest.raises(ValueError, match="CSV header mismatch"):
         _append_csv(csv_path, [])
+
+
+def test_run_one_passes_prediction_mode_params_to_experiment_config(monkeypatch):
+    captured = {}
+
+    class FakeSimulationManager:
+        @classmethod
+        def fresh_experiment(cls, config):
+            captured["config"] = config
+            return cls()
+
+        def run_experiment(self):
+            return []
+
+    monkeypatch.setattr(
+        "scripts.run_acceptance_experiment.SimulationManager",
+        FakeSimulationManager,
+    )
+
+    row = _run_one(
+        0.8,
+        0.5,
+        0.006,
+        7,
+        60.0,
+        1.0,
+        demand_source="predicted",
+        prediction_mode="async",
+        prediction_url="https://example.test/predict",
+        prediction_horizon_min=30,
+        passenger_elasticity=0.25,
+        alpha_sensitivity=1.5,
+        weather_source="static",
+    )
+
+    config = captured["config"]
+    assert config.demand_source == "predicted"
+    assert config.prediction_mode == "async"
+    assert config.prediction_url == "https://example.test/predict"
+    assert config.prediction_horizon_min == 30
+    assert config.passenger_elasticity == 0.25
+    assert config.alpha_sensitivity == 1.5
+    assert config.weather_source == "static"
+    assert row["params"]["demand_source"] == "predicted"
+    assert row["params"]["prediction_mode"] == "async"
+    assert row["params"]["prediction_url"] == "https://example.test/predict"
+    assert row["params"]["prediction_horizon_min"] == 30
+    assert row["params"]["passenger_elasticity"] == 0.25
+    assert row["params"]["alpha_sensitivity"] == 1.5
+    assert row["params"]["weather_source"] == "static"
+
+
+def test_run_one_uses_sync_when_predicted_demand_has_no_prediction_mode(monkeypatch):
+    captured = {}
+
+    class FakeSimulationManager:
+        @classmethod
+        def fresh_experiment(cls, config):
+            captured["config"] = config
+            return cls()
+
+        def run_experiment(self):
+            return []
+
+    monkeypatch.setattr(
+        "scripts.run_acceptance_experiment.SimulationManager",
+        FakeSimulationManager,
+    )
+
+    row = _run_one(
+        0.8,
+        0.5,
+        0.006,
+        7,
+        60.0,
+        1.0,
+        demand_source="predicted",
+        prediction_mode="none",
+    )
+
+    assert captured["config"].prediction_mode == "sync"
+    assert row["params"]["prediction_mode"] == "sync"

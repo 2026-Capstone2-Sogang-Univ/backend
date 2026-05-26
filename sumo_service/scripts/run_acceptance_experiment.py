@@ -185,20 +185,31 @@ def _run_one(
     seed: int,
     sim_duration: float,
     step_length: float,
+    *,
+    demand_source: str = ExperimentConfig.demand_source,
+    prediction_mode: str = ExperimentConfig.prediction_mode,
+    prediction_url: str = ExperimentConfig.prediction_url,
+    prediction_horizon_min: int = ExperimentConfig.prediction_horizon_min,
+    passenger_elasticity: float = ExperimentConfig.passenger_elasticity,
+    alpha_sensitivity: float = ExperimentConfig.alpha_sensitivity,
+    weather_source: str = ExperimentConfig.weather_source,
 ) -> dict:
     # 각 조합은 독립 SimulationManager와 독립 SUMO/TraCI 연결을 사용해 상태 누수를 막는다.
+    effective_prediction_mode = (
+        "sync" if demand_source == "predicted" and prediction_mode == "none" else prediction_mode
+    )
     params = {
         "target_p": target_p,
         "elasticity": elasticity,
         "beta_f": beta_f,
         "seed": seed,
-        "demand_source": ExperimentConfig.demand_source,
-        "prediction_mode": ExperimentConfig.prediction_mode,
-        "prediction_url": ExperimentConfig.prediction_url,
-        "prediction_horizon_min": ExperimentConfig.prediction_horizon_min,
-        "passenger_elasticity": None,
-        "alpha_sensitivity": None,
-        "weather_source": ExperimentConfig.weather_source,
+        "demand_source": demand_source,
+        "prediction_mode": effective_prediction_mode,
+        "prediction_url": prediction_url,
+        "prediction_horizon_min": prediction_horizon_min,
+        "passenger_elasticity": passenger_elasticity,
+        "alpha_sensitivity": alpha_sensitivity,
+        "weather_source": weather_source,
     }
     reason = _invalid_reason(target_p, beta_f)
     if reason:
@@ -212,6 +223,13 @@ def _run_one(
             seed=seed,
             sim_duration=sim_duration,
             step_length=step_length,
+            demand_source=demand_source,
+            prediction_mode=effective_prediction_mode,
+            prediction_url=prediction_url,
+            prediction_horizon_min=prediction_horizon_min,
+            passenger_elasticity=passenger_elasticity,
+            alpha_sensitivity=alpha_sensitivity,
+            weather_source=weather_source,
         )
     )
     try:
@@ -273,6 +291,17 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sim-duration", type=float, default=SIM_DURATION)
     parser.add_argument("--step-length", type=float, default=STEP_LENGTH)
+    parser.add_argument("--demand-source", choices=("actual", "predicted"), default="actual")
+    parser.add_argument("--prediction-mode", choices=("none", "sync", "async"), default="none")
+    parser.add_argument(
+        "--prediction-url",
+        default="https://module3-ml.onrender.com/predict",
+    )
+    parser.add_argument("--prediction-horizon-min", type=int, default=15)
+    parser.add_argument("--passenger-elasticity", type=float, default=0.0)
+    parser.add_argument("--alpha-sensitivity", type=float, default=1.0)
+    parser.add_argument("--alpha-sensitivity-list")
+    parser.add_argument("--weather-source", choices=("static",), default="static")
     parser.add_argument("--csv-output", type=Path)
     parser.add_argument(
         "--json-output",
@@ -284,11 +313,34 @@ def main() -> int:
     target_ps = _parse_float_list(args.target_p_list, args.target_p)
     elasticities = _parse_float_list(args.elasticity_list, args.elasticity)
     beta_fs = _parse_float_list(args.beta_f_list, args.beta_f)
+    alpha_sensitivities = _parse_float_list(
+        args.alpha_sensitivity_list,
+        args.alpha_sensitivity,
+    )
 
     # 조합별로 즉시 CSV append 한다. sweep 도중 SUMO/TraCI가 죽어도 완료된 row는 보존된다.
     rows: list[dict] = []
-    for target_p, elasticity, beta_f in itertools.product(target_ps, elasticities, beta_fs):
-        row = _run_one(target_p, elasticity, beta_f, args.seed, args.sim_duration, args.step_length)
+    for target_p, elasticity, beta_f, alpha_sensitivity in itertools.product(
+        target_ps,
+        elasticities,
+        beta_fs,
+        alpha_sensitivities,
+    ):
+        row = _run_one(
+            target_p,
+            elasticity,
+            beta_f,
+            args.seed,
+            args.sim_duration,
+            args.step_length,
+            demand_source=args.demand_source,
+            prediction_mode=args.prediction_mode,
+            prediction_url=args.prediction_url,
+            prediction_horizon_min=args.prediction_horizon_min,
+            passenger_elasticity=args.passenger_elasticity,
+            alpha_sensitivity=alpha_sensitivity,
+            weather_source=args.weather_source,
+        )
         rows.append(row)
         if args.csv_output:
             _append_csv(args.csv_output, [row])

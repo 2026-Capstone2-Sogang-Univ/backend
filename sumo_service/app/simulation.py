@@ -220,6 +220,8 @@ class ExperimentConfig:
     prediction_url: str = "https://module3-ml.onrender.com/predict"
     prediction_horizon_min: int = 15
     prediction_fallback_policy: str = "error"
+    passenger_elasticity: float = 0.0
+    alpha_sensitivity: float = 1.0
     weather_source: str = "static"
 
 
