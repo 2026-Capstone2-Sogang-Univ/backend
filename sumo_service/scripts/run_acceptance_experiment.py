@@ -71,6 +71,9 @@ CSV_COLUMNS = [
     "avg_demand_bias",
     "avg_abs_demand_error",
     "avg_surge",
+    "raw_spawn_candidate_count",
+    "elasticity_removed_count",
+    "actual_spawned_passengers",
 ]
 
 
@@ -99,6 +102,7 @@ def _aggregate(events: list[dict], sim_duration: float) -> dict:
     predicted_values = [e["demand_for_surge"] for e in surge_diagnostics]
     demand_errors = [p - a for a, p in zip(actual_values, predicted_values)]
     surge_values = [e["surge"] for e in surge_diagnostics]
+    elasticity_events = [e for e in events if e["type"] == "passenger_elasticity"]
 
     spawned_count = len(spawned)
     matched_passengers = {e["passenger_id"] for e in accepted}
@@ -153,6 +157,9 @@ def _aggregate(events: list[dict], sim_duration: float) -> dict:
         "avg_demand_bias": mean(demand_errors) if demand_errors else 0.0,
         "avg_abs_demand_error": mean(abs(v) for v in demand_errors) if demand_errors else 0.0,
         "avg_surge": mean(surge_values) if surge_values else 0.0,
+        "raw_spawn_candidate_count": sum(e["raw_spawn_candidate_count"] for e in elasticity_events),
+        "elasticity_removed_count": sum(e["elasticity_removed_count"] for e in elasticity_events),
+        "actual_spawned_passengers": sum(e["actual_spawned_passengers"] for e in elasticity_events) if elasticity_events else spawned_count,
     }
 
 

@@ -848,6 +848,26 @@ class SimulationManager:
             fallback_policy=config.prediction_fallback_policy,
         )
 
+    def _adjust_spawn_count_for_elasticity(self, raw_count: int, h3_cell: str | None, sim_time: float) -> int:
+        passenger_elasticity = (
+            self.experiment_config.passenger_elasticity
+            if self.experiment_config is not None
+            else 0.0
+        )
+        if passenger_elasticity == 0.0 or raw_count <= 0:
+            adjusted = raw_count
+        else:
+            surge = self._surge_by_h3.get(h3_cell or "", 1.0)
+            adjusted = int(round(raw_count * (surge ** passenger_elasticity)))
+            adjusted = max(0, min(raw_count, adjusted))
+        self._emit_event("passenger_elasticity", {
+            "sim_time": sim_time,
+            "raw_spawn_candidate_count": raw_count,
+            "elasticity_removed_count": raw_count - adjusted,
+            "actual_spawned_passengers": adjusted,
+        })
+        return adjusted
+
     def _spawn_passengers(self, sim_time: float) -> None:
         if PASSENGER_SOURCE == "parquet":
             while self._trip_queue and self._trip_queue[0]["sim_time"] <= sim_time:
@@ -859,6 +879,7 @@ class SimulationManager:
                 return
             self._last_spawn_interval = interval
             n = _poisson_sample(PASSENGER_LAMBDA)
+            n = self._adjust_spawn_count_for_elasticity(n, None, sim_time)
             for _ in range(n):
                 self._create_passenger_random(sim_time)
 

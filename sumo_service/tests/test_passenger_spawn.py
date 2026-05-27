@@ -222,3 +222,37 @@ def test_parquet_outside_scc_trip_consumed_from_queue():
     # 외부 trip은 스킵되지만 큐에서 빠지고, 내부 trip 1개만 스폰
     assert len(mgr._passengers) == 1
     assert len(mgr._trip_queue) == 0
+
+
+def test_passenger_elasticity_zero_keeps_raw_spawn_count():
+    from app.simulation import ExperimentConfig
+    mgr = make_manager()
+    mgr.experiment_config = ExperimentConfig(
+        target_p=0.8,
+        elasticity=0.6,
+        beta_f=0.006,
+        passenger_elasticity=0.0,
+    )
+    mgr._surge_by_h3 = {"892830828cbffff": 4.0}
+
+    assert mgr._adjust_spawn_count_for_elasticity(5, "892830828cbffff", 300.0) == 5
+
+
+def test_negative_passenger_elasticity_removes_spawn_candidates():
+    from app.simulation import ExperimentConfig
+    mgr = make_manager()
+    mgr.experiment_config = ExperimentConfig(
+        target_p=0.8,
+        elasticity=0.6,
+        beta_f=0.006,
+        passenger_elasticity=-0.6,
+    )
+    mgr._surge_by_h3 = {"892830828cbffff": 4.0}
+
+    adjusted = mgr._adjust_spawn_count_for_elasticity(10, "892830828cbffff", 300.0)
+
+    assert adjusted == 4
+    assert mgr._event_log[-1]["type"] == "passenger_elasticity"
+    assert mgr._event_log[-1]["raw_spawn_candidate_count"] == 10
+    assert mgr._event_log[-1]["actual_spawned_passengers"] == 4
+
