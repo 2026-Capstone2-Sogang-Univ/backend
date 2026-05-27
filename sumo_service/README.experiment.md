@@ -276,6 +276,72 @@ CSV에도 invalid row가 남고 metric 컬럼은 비워진다.
 - `scripts/run_acceptance_experiment.py`: CLI 인자 파싱, sweep 실행, KPI 집계, JSON/CSV 출력
 - `tests/test_decision_function.py`: 역산 함수와 invalid 조건 테스트
 
+## Module 3 Prediction Modes
+
+### A. Acceptance-Only Baseline
+
+```powershell
+uv run scripts\run_acceptance_experiment.py `
+  --target-p 0.85 `
+  --elasticity 0.6 `
+  --beta-f 0.006 `
+  --demand-source actual `
+  --prediction-mode none `
+  --passenger-elasticity 0 `
+  --alpha-sensitivity 1.0
+```
+
+### B. Predicted-Demand Policy
+
+```powershell
+uv run scripts\run_acceptance_experiment.py `
+  --target-p 0.85 `
+  --elasticity 0.6 `
+  --beta-f 0.006 `
+  --demand-source predicted `
+  --prediction-mode sync `
+  --prediction-url https://module3-ml.onrender.com/predict `
+  --prediction-horizon-min 15 `
+  --passenger-elasticity 0 `
+  --alpha-sensitivity 1.0
+```
+
+### C. Driver-Sensitivity Sweep
+
+```powershell
+uv run scripts\run_acceptance_experiment.py `
+  --target-p 0.85 `
+  --elasticity 0.6 `
+  --beta-f 0.006 `
+  --demand-source predicted `
+  --prediction-mode sync `
+  --alpha-sensitivity-list 0.5,0.75,1.0,1.25,1.5
+```
+
+### D. Passenger-Elasticity Extension
+
+```powershell
+uv run scripts\run_acceptance_experiment.py `
+  --target-p 0.85 `
+  --elasticity 0.6 `
+  --beta-f 0.006 `
+  --demand-source predicted `
+  --prediction-mode sync `
+  --passenger-elasticity -0.6
+```
+
+Report D separately from A/B/C because passenger elasticity changes the number of passengers entering the system.
+
+Predicted demand improves the policy only when it improves at least one KPI under the same seed and parameters:
+
+- higher `matching_success_rate` at the same or lower `incentive_cost_total_usd`
+- lower `avg_empty_wait_time_s` at the same or lower cost
+- lower `cost_per_matched_passenger`
+- higher `acceptances_per_driver_hour`
+- higher `driver_revenue_per_hour_usd`
+
+When predicted mode is worse, inspect `prediction_missing_h3_rate`, `avg_demand_bias`, `avg_abs_demand_error`, `avg_surge`, `capped_dispatch_attempt_rate`, and `avg_target_gap_when_capped`.
+
 ## QnA
 
 ### 1. 승객의 콜이 거절당했을 때, 다른 택시한테 콜이 요청되는가?

@@ -526,82 +526,10 @@ surge = apply_surge_policy(raw_surge)
 
 비교 실험의 목적은 같은 `target_p`, `elasticity`, `beta_f`, `seed`, 승객 replay, 택시 초기 상태에서 **서지 계산에 쓰는 수요 입력만 바꿨을 때** KPI가 개선되는지 확인하는 것이다.
 
-### Module 3 예측 결과 파일 계약
+### Module 3 예측 방식
 
-실시간 모델 서빙은 필수 구현 범위로 두지 않는다. 우선 Module 3가 실험 기간 전체에 대한 예측 결과를 offline batch로 생성하고, 실험 runner가 이를 lookup한다.
-
-권장 파일:
-
-```text
-.temp/module3_predictions.parquet
-```
-
-필수 컬럼:
-
-```text
-target_time, h3, predicted_demand
-```
-
-여러 horizon을 한 파일에 담을 경우:
-
-```text
-base_time, target_time, horizon_min, h3, predicted_demand
-```
-
-정의:
-
-- `base_time`: 예측을 수행한 기준 시각
-- `target_time`: 예측 대상 시각 (`base_time + horizon_min`)
-- `horizon_min`: 예측 horizon. 기본값은 15
-- `h3`: H3 level 9 pickup cell
-- `predicted_demand`: 해당 target time과 H3 cell의 예측 수요량
-
-실험 runner는 `sim_time`을 `SIM_BASE_DATETIME + sim_time`으로 변환한 뒤, `prediction_horizon_min`을 더해 `target_time` bucket을 조회한다.
-
-```text
-lookup_time = floor_to_15min(SIM_BASE_DATETIME + sim_time + prediction_horizon_min)
-predicted_demand = predictions[(lookup_time, pickup_h3)]
-```
-
-예측값이 없는 cell은 기본값을 명시적으로 정한다.
-
-```text
-missing predicted demand -> 0.0
-```
-
-다만 이 정책은 예측 파일의 커버리지 문제를 KPI에 직접 반영하므로, 진단 지표로 missing rate를 함께 기록한다.
-
-### 실시간 추론이 필요한 경우
-
-현재 acceptance experiment의 비교 목적만 놓고 보면 실시간 추론은 필수 조건이 아니다. 시뮬레이션은 과거 승객 데이터를 replay하고, Module 3 예측 대상도 `target_time`, `h3` 기준의 미래 수요이므로 실험 기간 전체 예측값을 미리 생성해 lookup할 수 있다.
-
-```text
-Module 3 offline batch inference
--> module3_predictions.parquet
--> experiment runner lookup
--> predicted-demand policy 실행
-```
-
-실시간 추론은 다음 조건 중 하나 이상을 만족할 때 필요하다.
-
-- 모델 입력에 시뮬레이션 중 동적으로 변하는 상태가 포함되는 경우
-  - 예: 현재 빈 택시 공급, 현재 미매칭 승객 수, 최근 정책 적용 결과, 현재 서지/인센티브, 현재 매칭 실패율
-- 정책이 수요를 바꿀 수 있다고 가정하고, 바뀐 정책 상태를 다시 모델 입력으로 넣는 closed-loop 구조를 실험하는 경우
-  - 예: 인센티브를 올린 결과 특정 cell의 공급이 증가하고, 그 공급 변화가 다음 15분 수요/매칭 예측에 반영되어야 하는 경우
-- 실험이 과거 replay가 아니라 온라인 생성 환경인 경우
-  - 예: 승객 발생이 고정 파일이 아니라 시뮬레이션 상태, 외부 이벤트, 사용자 입력에 따라 매번 달라지는 경우
-- 예측 feature가 실행 시점의 외부 데이터에 의존하는 경우
-  - 예: 실시간 날씨 API, 실시간 교통량, 이벤트 API, 장애/공사 정보
-- 최종 데모 요구사항이 "현재 시뮬레이션 상태를 모델 서버에 보내고 즉시 예측 응답을 받는다"는 시스템 연동 자체를 보여주는 것인 경우
-- 실제 운영 시스템처럼 미래 기간의 입력 데이터를 사전에 모두 알 수 없는 경우
-
-위 조건이 없다면 실시간 gRPC/API 서빙은 실험의 필수 구현 범위가 아니라 선택 확장으로 둔다. 우선순위는 다음과 같이 잡는다.
-
-```text
-1. offline prediction lookup으로 actual vs predicted KPI 비교
-2. 필요 시 같은 입출력 계약을 유지한 채 file lookup을 API/gRPC client로 교체
-3. closed-loop 실시간 추론은 최종 확장 실험으로 분리
-```
+The first Module 3 integration path is real-time HTTP prediction through `PredictionDemandProvider`.
+The provider builds request payloads from `DemandHistoryStore` and `StaticWeatherProvider`, caches returned predictions by target 15-minute bucket and H3, and reports latency, failure, fallback, stale-use, missing-H3, and history coverage diagnostics.
 
 ### demand source 옵션 추가
 
