@@ -288,3 +288,30 @@ def _wait_for_success(provider: PredictionDemandProvider) -> None:
             return
         time.sleep(0.01)
     raise AssertionError("prediction request did not complete")
+
+
+def test_async_mode_uses_actual_fallback_while_background_request_runs():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"predictions": []})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    provider = PredictionDemandProvider(
+        prediction_url="https://module3-ml.onrender.com/predict",
+        model_h3_cells=["h3_a", "h3_b"],
+        history_store=DemandHistoryStore(model_h3_cells=["h3_a", "h3_b"]),
+        weather_provider=StaticWeatherProvider(),
+        client=client,
+        fallback_policy="last_prediction",
+    )
+
+    demand = provider.demand_by_h3(
+        datetime(2013, 7, 8, 8, 0),
+        mode="async",
+        actual_demand={"h3_a": 1},
+    )
+
+    assert demand == {"h3_a": 1.0, "h3_b": 0.0}
+    assert provider.diagnostics()["prediction_fallback_count"] == 1
+    assert provider.diagnostics()["prediction_stale_use_count"] == 1
+    provider.close()
+

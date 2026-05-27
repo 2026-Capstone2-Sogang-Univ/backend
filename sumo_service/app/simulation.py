@@ -839,13 +839,17 @@ class SimulationManager:
         if config.weather_source != "static":
             raise ValueError(f"unsupported weather source: {config.weather_source}")
 
+        fallback_policy = config.prediction_fallback_policy
+        if config.prediction_mode == "async" and fallback_policy == "error":
+            fallback_policy = "last_prediction"
+
         self._prediction_demand_provider = PredictionDemandProvider(
             prediction_url=config.prediction_url,
             model_h3_cells=model_h3_cells,
             history_store=self._history_store,
             weather_provider=StaticWeatherProvider(),
             prediction_horizon_min=config.prediction_horizon_min,
-            fallback_policy=config.prediction_fallback_policy,
+            fallback_policy=fallback_policy,
         )
 
     def _adjust_spawn_count_for_elasticity(self, raw_count: int, h3_cell: str | None, sim_time: float) -> int:
