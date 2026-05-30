@@ -24,7 +24,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from math import exp, log
+from math import exp, isfinite, log
 
 import pandas as pd
 
@@ -86,6 +86,8 @@ def probability_from_z(z: float, c: float = _C) -> float:
 
 
 def pu_corrected_logit(target_p: float, c: float = _C) -> float:
+    if not isfinite(target_p) or target_p <= 0 or target_p > 1.0:
+        raise ValueError("target_p must be finite and in (0, 1]")
     apparent_p = target_p * c
     if apparent_p <= 0 or apparent_p >= 1:
         raise ValueError("target_p * c must be between 0 and 1")
@@ -141,6 +143,7 @@ def acceptance_probability(
     trip_distance: float,
     beta_f: float | None = None,
     *,
+    alpha_sensitivity: float = 1.0,
     pickup_cell: str | None = None,  # 예약 인자: 추후 pickup-cell 기반 feature 도입 시 사용.
 ) -> float:
     """0~1 범위 P(수락) 반환.
@@ -162,7 +165,10 @@ def acceptance_probability(
         trip_distance=trip_distance,
         pickup_cell=pickup_cell,
     )
-    z = features.z_without_fare + (beta_f if beta_f is not None else _BETA_F) * fare_amount
+    beta = beta_f if beta_f is not None else _BETA_F
+    z = _BETA_0 + alpha_sensitivity * (
+        (features.z_without_fare - _BETA_0) + beta * fare_amount
+    )
     return probability_from_z(z, _C)
 
 
@@ -177,11 +183,14 @@ def required_fare_for_target_p(
     trip_distance: float,
     beta_f: float | None = None,
     *,
+    alpha_sensitivity: float = 1.0,
     pickup_cell: str | None = None,  # 예약 인자: 추후 pickup-cell 기반 feature 도입 시 사용.
 ) -> float:
     beta = beta_f if beta_f is not None else _BETA_F
-    if abs(beta) < 1e-9:
-        raise ValueError("beta_f too close to zero for inverse fare calculation")
+    if not isfinite(beta) or abs(beta) < 1e-9:
+        raise ValueError("beta_f must be finite and non-zero for inverse fare calculation")
+    if not isfinite(alpha_sensitivity) or alpha_sensitivity <= 1e-9:
+        raise ValueError("alpha_sensitivity must be positive and finite for inverse fare calculation")
     features = acceptance_features(
         last_dropoff_cell=last_dropoff_cell,
         dropoff_cell=dropoff_cell,
@@ -191,7 +200,7 @@ def required_fare_for_target_p(
         pickup_cell=pickup_cell,
     )
     z_target = pu_corrected_logit(target_p, _C)
-    return (z_target - features.z_without_fare) / beta
+    return ((z_target - _BETA_0) / alpha_sensitivity - (features.z_without_fare - _BETA_0)) / beta
 
 
 def pu_correction_constant() -> float:

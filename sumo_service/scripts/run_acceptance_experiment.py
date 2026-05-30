@@ -4,6 +4,7 @@ import argparse
 import csv
 import itertools
 import json
+import math
 import sys
 from pathlib import Path
 from statistics import mean, median, quantiles
@@ -32,6 +33,13 @@ CSV_COLUMNS = [
     "elasticity",
     "beta_f",
     "seed",
+    "demand_source",
+    "prediction_mode",
+    "prediction_url",
+    "prediction_horizon_min",
+    "passenger_elasticity",
+    "alpha_sensitivity",
+    "weather_source",
     "spawned_passengers",
     "unique_matched_passengers",
     "matching_success_rate",
@@ -47,6 +55,25 @@ CSV_COLUMNS = [
     "avg_actual_acceptance_probability",
     "avg_required_fare_usd",
     "avg_incentive_usd",
+    "prediction_request_count",
+    "prediction_success_count",
+    "prediction_failure_count",
+    "prediction_latency_ms_avg",
+    "prediction_latency_ms_p95",
+    "prediction_fallback_count",
+    "prediction_stale_use_count",
+    "prediction_missing_h3_rate",
+    "history_required_count",
+    "history_missing_count",
+    "history_missing_rate",
+    "avg_actual_demand_for_surge",
+    "avg_predicted_demand_for_surge",
+    "avg_demand_bias",
+    "avg_abs_demand_error",
+    "avg_surge",
+    "raw_spawn_candidate_count",
+    "elasticity_removed_count",
+    "actual_spawned_passengers",
 ]
 
 
@@ -69,6 +96,13 @@ def _aggregate(events: list[dict], sim_duration: float) -> dict:
         e for e in events
         if e["type"] == "trip_completed" and e.get("completion") != "forced_at_end"
     ]
+    diagnostics = _latest_diagnostics(events)
+    surge_diagnostics = [e for e in events if e["type"] == "surge_diagnostic"]
+    actual_values = [e["actual_demand"] for e in surge_diagnostics]
+    predicted_values = [e["demand_for_surge"] for e in surge_diagnostics]
+    demand_errors = [p - a for a, p in zip(actual_values, predicted_values)]
+    surge_values = [e["surge"] for e in surge_diagnostics]
+    elasticity_events = [e for e in events if e["type"] == "passenger_elasticity"]
 
     spawned_count = len(spawned)
     matched_passengers = {e["passenger_id"] for e in accepted}
@@ -117,7 +151,24 @@ def _aggregate(events: list[dict], sim_duration: float) -> dict:
         "avg_incentive_usd": (
             mean(e.get("incentive_usd", 0.0) for e in decisions) if decisions else 0.0
         ),
+        **diagnostics,
+        "avg_actual_demand_for_surge": mean(actual_values) if actual_values else 0.0,
+        "avg_predicted_demand_for_surge": mean(predicted_values) if predicted_values else 0.0,
+        "avg_demand_bias": mean(demand_errors) if demand_errors else 0.0,
+        "avg_abs_demand_error": mean(abs(v) for v in demand_errors) if demand_errors else 0.0,
+        "avg_surge": mean(surge_values) if surge_values else 0.0,
+        "raw_spawn_candidate_count": sum(e["raw_spawn_candidate_count"] for e in elasticity_events),
+        "elasticity_removed_count": sum(e["elasticity_removed_count"] for e in elasticity_events),
+        "actual_spawned_passengers": sum(e["actual_spawned_passengers"] for e in elasticity_events) if elasticity_events else spawned_count,
     }
+
+
+def _latest_diagnostics(events: list[dict]) -> dict:
+    diagnostics = {}
+    for event in events:
+        if event["type"] == "diagnostics":
+            diagnostics.update({k: v for k, v in event.items() if k != "type"})
+    return diagnostics
 
 
 def _mean_present(values) -> float | None:
@@ -125,13 +176,19 @@ def _mean_present(values) -> float | None:
     return mean(present) if present else None
 
 
-def _invalid_reason(target_p: float, beta_f: float) -> str | None:
+def _invalid_reason(target_p: float, beta_f: float, alpha_sensitivity: float) -> str | None:
     # 수학적으로 역산이 불가능한 조합은 SUMO를 띄우기 전에 invalid row로 남긴다.
     c = pu_correction_constant()
+    if not math.isfinite(target_p) or target_p <= 0:
+        return "target_p must be positive and finite"
+    if target_p > 1.0:
+        return "target_p must be <= 1.0"
     if target_p * c >= 1:
         return "target_p * c must be < 1"
-    if abs(beta_f) < 1e-9:
-        return "beta_f too close to zero for inverse fare calculation"
+    if not math.isfinite(beta_f) or abs(beta_f) < 1e-9:
+        return "beta_f must be finite and non-zero for inverse fare calculation"
+    if not math.isfinite(alpha_sensitivity) or alpha_sensitivity <= 1e-9:
+        return "alpha_sensitivity must be positive and finite"
     return None
 
 
@@ -142,15 +199,33 @@ def _run_one(
     seed: int,
     sim_duration: float,
     step_length: float,
+    *,
+    demand_source: str = ExperimentConfig.demand_source,
+    prediction_mode: str = ExperimentConfig.prediction_mode,
+    prediction_url: str = ExperimentConfig.prediction_url,
+    prediction_horizon_min: int = ExperimentConfig.prediction_horizon_min,
+    passenger_elasticity: float = ExperimentConfig.passenger_elasticity,
+    alpha_sensitivity: float = ExperimentConfig.alpha_sensitivity,
+    weather_source: str = ExperimentConfig.weather_source,
 ) -> dict:
     # 각 조합은 독립 SimulationManager와 독립 SUMO/TraCI 연결을 사용해 상태 누수를 막는다.
+    effective_prediction_mode = (
+        "sync" if demand_source == "predicted" and prediction_mode == "none" else prediction_mode
+    )
     params = {
         "target_p": target_p,
         "elasticity": elasticity,
         "beta_f": beta_f,
         "seed": seed,
+        "demand_source": demand_source,
+        "prediction_mode": effective_prediction_mode,
+        "prediction_url": prediction_url,
+        "prediction_horizon_min": prediction_horizon_min,
+        "passenger_elasticity": passenger_elasticity,
+        "alpha_sensitivity": alpha_sensitivity,
+        "weather_source": weather_source,
     }
-    reason = _invalid_reason(target_p, beta_f)
+    reason = _invalid_reason(target_p, beta_f, alpha_sensitivity)
     if reason:
         return {"status": "invalid", "reason": reason, "params": params, "metrics": None}
 
@@ -162,6 +237,13 @@ def _run_one(
             seed=seed,
             sim_duration=sim_duration,
             step_length=step_length,
+            demand_source=demand_source,
+            prediction_mode=effective_prediction_mode,
+            prediction_url=prediction_url,
+            prediction_horizon_min=prediction_horizon_min,
+            passenger_elasticity=passenger_elasticity,
+            alpha_sensitivity=alpha_sensitivity,
+            weather_source=weather_source,
         )
     )
     try:
@@ -180,9 +262,16 @@ def _run_one(
 def _append_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.exists()
+    if exists and path.stat().st_size > 0:
+        with path.open("r", newline="", encoding="utf-8") as f:
+            existing_header = next(csv.reader(f), None)
+        if existing_header != CSV_COLUMNS:
+            raise ValueError(
+                f"CSV header mismatch for {path}; refusing to append rows with a different schema"
+            )
     with path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        if not exists:
+        if not exists or path.stat().st_size == 0:
             writer.writeheader()
         for row in rows:
             params = row["params"]
@@ -190,11 +279,18 @@ def _append_csv(path: Path, rows: list[dict]) -> None:
             writer.writerow({
                 "status": row["status"],
                 "reason": row["reason"],
-                "target_p": params["target_p"],
-                "elasticity": params["elasticity"],
-                "beta_f": params["beta_f"],
-                "seed": params["seed"],
-                **{col: metrics.get(col) for col in CSV_COLUMNS[6:]},
+                "target_p": params.get("target_p"),
+                "elasticity": params.get("elasticity"),
+                "beta_f": params.get("beta_f"),
+                "seed": params.get("seed"),
+                "demand_source": params.get("demand_source"),
+                "prediction_mode": params.get("prediction_mode"),
+                "prediction_url": params.get("prediction_url"),
+                "prediction_horizon_min": params.get("prediction_horizon_min"),
+                "passenger_elasticity": params.get("passenger_elasticity"),
+                "alpha_sensitivity": params.get("alpha_sensitivity"),
+                "weather_source": params.get("weather_source"),
+                **{col: metrics.get(col) for col in CSV_COLUMNS[13:]},
             })
 
 
@@ -209,6 +305,17 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sim-duration", type=float, default=SIM_DURATION)
     parser.add_argument("--step-length", type=float, default=STEP_LENGTH)
+    parser.add_argument("--demand-source", choices=("actual", "predicted"), default="actual")
+    parser.add_argument("--prediction-mode", choices=("none", "sync", "async"), default="none")
+    parser.add_argument(
+        "--prediction-url",
+        default="https://module3-ml.onrender.com/predict",
+    )
+    parser.add_argument("--prediction-horizon-min", type=int, default=15)
+    parser.add_argument("--passenger-elasticity", type=float, default=0.0)
+    parser.add_argument("--alpha-sensitivity", type=float, default=1.0)
+    parser.add_argument("--alpha-sensitivity-list")
+    parser.add_argument("--weather-source", choices=("static",), default="static")
     parser.add_argument("--csv-output", type=Path)
     parser.add_argument(
         "--json-output",
@@ -220,11 +327,34 @@ def main() -> int:
     target_ps = _parse_float_list(args.target_p_list, args.target_p)
     elasticities = _parse_float_list(args.elasticity_list, args.elasticity)
     beta_fs = _parse_float_list(args.beta_f_list, args.beta_f)
+    alpha_sensitivities = _parse_float_list(
+        args.alpha_sensitivity_list,
+        args.alpha_sensitivity,
+    )
 
     # 조합별로 즉시 CSV append 한다. sweep 도중 SUMO/TraCI가 죽어도 완료된 row는 보존된다.
     rows: list[dict] = []
-    for target_p, elasticity, beta_f in itertools.product(target_ps, elasticities, beta_fs):
-        row = _run_one(target_p, elasticity, beta_f, args.seed, args.sim_duration, args.step_length)
+    for target_p, elasticity, beta_f, alpha_sensitivity in itertools.product(
+        target_ps,
+        elasticities,
+        beta_fs,
+        alpha_sensitivities,
+    ):
+        row = _run_one(
+            target_p,
+            elasticity,
+            beta_f,
+            args.seed,
+            args.sim_duration,
+            args.step_length,
+            demand_source=args.demand_source,
+            prediction_mode=args.prediction_mode,
+            prediction_url=args.prediction_url,
+            prediction_horizon_min=args.prediction_horizon_min,
+            passenger_elasticity=args.passenger_elasticity,
+            alpha_sensitivity=alpha_sensitivity,
+            weather_source=args.weather_source,
+        )
         rows.append(row)
         if args.csv_output:
             _append_csv(args.csv_output, [row])
