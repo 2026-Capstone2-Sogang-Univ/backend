@@ -6,7 +6,9 @@ import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .connection_manager import ConnectionManager
 from .db.engine import close_pool, init_pool
@@ -103,6 +105,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="SUMO Service", version="0.1.0", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "invalid_request",
+            "message": "Request validation failed",
+        },
+    )
 
 connection_manager = ConnectionManager()
 manager = SimulationManager()

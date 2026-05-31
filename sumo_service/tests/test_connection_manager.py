@@ -400,3 +400,73 @@ async def test_broadcast_fare_update_payload():
     assert fu.expected_fare == 775
     assert fu.distance_m == pytest.approx(1500.0)
     assert fu.sim_time == pytest.approx(500.0)
+
+
+# ---------------------------------------------------------------------------
+# lifecycle messages
+# ---------------------------------------------------------------------------
+
+async def test_broadcast_passenger_created_payload():
+    manager = ConnectionManager()
+    ws = make_ws()
+    await manager.connect(ws)
+    ws.send_bytes.reset_mock()
+
+    await manager.broadcast_passenger_created("upax_1", 40.75, -73.98, 5200, 1800)
+
+    msg = sent_messages(ws)[0]
+    assert payload_case(msg) == "passenger_created"
+    assert msg.passenger_created.passenger_id == "upax_1"
+    assert msg.passenger_created.expected_fare == 5200
+
+
+async def test_broadcast_taxi_created_payload():
+    manager = ConnectionManager()
+    ws = make_ws()
+    await manager.connect(ws)
+    ws.send_bytes.reset_mock()
+
+    await manager.broadcast_taxi_created("utaxi_1", 40.748, -73.985)
+
+    msg = sent_messages(ws)[0]
+    assert payload_case(msg) == "taxi_created"
+    assert msg.taxi_created.taxi_id == "utaxi_1"
+
+
+async def test_broadcast_passenger_creation_failed_payload():
+    manager = ConnectionManager()
+    ws = make_ws()
+    await manager.connect(ws)
+    ws.send_bytes.reset_mock()
+
+    await manager.broadcast_passenger_creation_failed("upax_1", "out_of_network")
+
+    msg = sent_messages(ws)[0]
+    assert payload_case(msg) == "passenger_creation_failed"
+    assert msg.passenger_creation_failed.reason == "out_of_network"
+
+
+async def test_broadcast_dispatch_assigned_payload():
+    manager = ConnectionManager()
+    ws = make_ws()
+    await manager.connect(ws)
+    ws.send_bytes.reset_mock()
+
+    await manager.broadcast_dispatch_assigned("upax_1", "taxi_1", 120)
+
+    msg = sent_messages(ws)[0]
+    assert payload_case(msg) == "dispatch_assigned"
+    assert msg.dispatch_assigned.eta == 120
+
+
+async def test_broadcast_passenger_boarded_payload():
+    manager = ConnectionManager()
+    ws = make_ws()
+    await manager.connect(ws)
+    ws.send_bytes.reset_mock()
+
+    await manager.broadcast_passenger_boarded("upax_1", "taxi_1", 42.0)
+
+    msg = sent_messages(ws)[0]
+    assert payload_case(msg) == "passenger_boarded"
+    assert msg.passenger_boarded.sim_time == pytest.approx(42.0)

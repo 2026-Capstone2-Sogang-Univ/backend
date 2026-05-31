@@ -21,15 +21,50 @@ def make_manager(status: SimStatus) -> MagicMock:
     """Return a stub SimulationManager with async control methods."""
     mgr = MagicMock()
     mgr.status = status
-    mgr.start = AsyncMock(side_effect=lambda: setattr(mgr, "status", SimStatus.RUNNING))
+    mgr.start = AsyncMock(side_effect=lambda *args, **kwargs: setattr(mgr, "status", SimStatus.RUNNING))
     mgr.pause = AsyncMock(side_effect=lambda: setattr(mgr, "status", SimStatus.PAUSED))
     mgr.resume = AsyncMock(side_effect=lambda: setattr(mgr, "status", SimStatus.RUNNING))
-    mgr.restart = AsyncMock(side_effect=lambda: setattr(mgr, "status", SimStatus.RUNNING))
+    mgr.restart = AsyncMock(side_effect=lambda *args, **kwargs: setattr(mgr, "status", SimStatus.RUNNING))
     mgr.stop = AsyncMock(side_effect=lambda: setattr(mgr, "status", SimStatus.IDLE))
     mgr.get_state = MagicMock(return_value={"vehicles": [], "passengers": [], "sim_time": 0.0})
+    mgr.get_status_summary = MagicMock(side_effect=lambda: {
+        "status": mgr.status,
+        "vehicles": [],
+        "passengers": [],
+        "sim_time": 0.0,
+        "frame_rate": 60.0,
+        "simulation_speed": 20.0,
+        "vehicle_count": 0,
+        "taxi_count": 0,
+        "empty_taxi_count": 0,
+        "dispatched_taxi_count": 0,
+        "occupied_taxi_count": 0,
+        "waiting_passenger_count": 0,
+        "assigned_passenger_count": 0,
+        "completed_trip_count": 0,
+        "h3_resolution": 9,
+        "passenger_source": "random",
+    })
     mgr.get_passengers = MagicMock(return_value=[])
     mgr.get_surge = MagicMock(return_value=[])
     mgr.get_fare = MagicMock(return_value=None)
+    mgr.get_kpi_summary = MagicMock(return_value={
+        "sim_time": 0.0,
+        "h3_resolution": 9,
+        "matching": {
+            "target_rate": 0.725,
+            "actual_rate": 0.0,
+            "matching_rate_error": -0.725,
+            "request_count": 0,
+            "matched_count": 0,
+            "by_raw_bucket": [],
+        },
+        "idle_time": {},
+        "driver_revenue": {},
+        "passenger_waiting_incentive": {},
+    })
+    mgr.enqueue_manual_passenger = MagicMock(return_value="upax_1")
+    mgr.enqueue_manual_taxi = MagicMock(return_value="utaxi_1")
     return mgr
 
 
@@ -45,6 +80,17 @@ def test_start_from_idle_returns_200():
     assert resp.json()["status"] == SimStatus.RUNNING
 
 
+def test_start_response_contains_status_summary_fields():
+    app.state.manager = make_manager(SimStatus.IDLE)
+    with TestClient(app) as client:
+        resp = client.post("/simulation/start")
+    body = resp.json()
+    assert body["vehicle_count"] == 0
+    assert body["waiting_passenger_count"] == 0
+    assert body["h3_resolution"] == 9
+    assert body["passenger_source"] == "random"
+
+
 def test_start_when_already_running_returns_409():
     app.state.manager = make_manager(SimStatus.RUNNING)
     with TestClient(app) as client:
@@ -57,6 +103,95 @@ def test_start_when_already_running_does_not_call_start():
     app.state.manager = mgr
     with TestClient(app) as client:
         client.post("/simulation/start")
+    mgr.start.assert_not_called()
+
+
+def test_start_accepts_frontend_lab_body():
+    mgr = make_manager(SimStatus.IDLE)
+    app.state.manager = mgr
+    payload = {
+        "duration": 1200,
+        "seed": 7,
+        "passenger_source": "random",
+        "target_matching_rates": {
+            "raw_lt_1_5": 0.55,
+            "raw_lt_2_5": 0.70,
+            "raw_lt_3_5": 0.80,
+            "raw_gte_3_5": 0.85,
+        },
+        "pricing_policy": {
+            "epsilon": -0.6,
+            "surge_min": 1.2,
+            "surge_max": 4.9,
+            "alpha_sensitivity": 1.0,
+        },
+        "taxi_count": 150,
+        "initial_passenger_count": 60,
+    }
+    with TestClient(app) as client:
+        resp = client.post("/simulation/start", json=payload)
+    assert resp.status_code == 200
+    assert mgr.start.call_args.args[0].duration == 1200
+    assert mgr.start.call_args.args[0].target_matching_rates["raw_gte_3_5"] == 0.85
+
+
+def test_start_rejects_invalid_passenger_source():
+    mgr = make_manager(SimStatus.IDLE)
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        resp = client.post("/simulation/start", json={"passenger_source": "invalid"})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+    mgr.start.assert_not_called()
+
+
+def test_start_rejects_taxi_count_above_limit():
+    mgr = make_manager(SimStatus.IDLE)
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        resp = client.post("/simulation/start", json={"taxi_count": 1001})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+    mgr.start.assert_not_called()
+
+
+def test_start_rejects_initial_passenger_count_above_limit():
+    mgr = make_manager(SimStatus.IDLE)
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        resp = client.post("/simulation/start", json={"initial_passenger_count": 5001})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+    mgr.start.assert_not_called()
+
+
+def test_start_rejects_zero_pricing_epsilon():
+    mgr = make_manager(SimStatus.IDLE)
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        resp = client.post("/simulation/start", json={"pricing_policy": {"epsilon": 0}})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+    mgr.start.assert_not_called()
+
+
+def test_start_rejects_surge_min_above_default_max():
+    mgr = make_manager(SimStatus.IDLE)
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        resp = client.post("/simulation/start", json={"pricing_policy": {"surge_min": 5.0}})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+    mgr.start.assert_not_called()
+
+
+def test_start_rejects_surge_max_below_default_min():
+    mgr = make_manager(SimStatus.IDLE)
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        resp = client.post("/simulation/start", json={"pricing_policy": {"surge_max": 1.1}})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
     mgr.start.assert_not_called()
 
 
@@ -257,11 +392,94 @@ def test_get_status_contains_snapshot_fields():
     assert "sim_time" in body
 
 
+def test_get_status_uses_manager_status_summary():
+    mgr = make_manager(SimStatus.RUNNING)
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        client.get("/simulation/status")
+    mgr.get_status_summary.assert_called_once()
+
+
+def test_get_status_contains_summary_fields():
+    app.state.manager = make_manager(SimStatus.RUNNING)
+    with TestClient(app) as client:
+        resp = client.get("/simulation/status")
+    body = resp.json()
+    assert "vehicle_count" in body
+    assert "taxi_count" in body
+    assert "empty_taxi_count" in body
+    assert "dispatched_taxi_count" in body
+    assert "occupied_taxi_count" in body
+    assert "waiting_passenger_count" in body
+    assert "assigned_passenger_count" in body
+    assert "completed_trip_count" in body
+
+
 def test_get_status_reflects_paused_state():
     app.state.manager = make_manager(SimStatus.PAUSED)
     with TestClient(app) as client:
         resp = client.get("/simulation/status")
     assert resp.json()["status"] == SimStatus.PAUSED
+
+
+# ---------------------------------------------------------------------------
+# GET /simulation/kpi
+# ---------------------------------------------------------------------------
+
+def test_get_kpi_returns_200():
+    app.state.manager = make_manager(SimStatus.RUNNING)
+    with TestClient(app) as client:
+        resp = client.get("/simulation/kpi")
+    assert resp.status_code == 200
+    assert "matching" in resp.json()
+
+
+# ---------------------------------------------------------------------------
+# POST /simulation/passengers and /taxis
+# ---------------------------------------------------------------------------
+
+def test_create_passenger_returns_reserved_id():
+    app.state.manager = make_manager(SimStatus.RUNNING)
+    with TestClient(app) as client:
+        resp = client.post("/simulation/passengers", json={
+            "pickup": {"lat": 40.75, "lng": -73.98},
+            "dropoff": {"lat": 40.76, "lng": -73.97},
+        })
+    assert resp.status_code == 200
+    assert resp.json() == {"passenger_id": "upax_1"}
+
+
+def test_create_passenger_requires_running_simulation():
+    app.state.manager = make_manager(SimStatus.IDLE)
+    with TestClient(app) as client:
+        resp = client.post("/simulation/passengers", json={
+            "pickup": {"lat": 40.75, "lng": -73.98},
+            "dropoff": {"lat": 40.76, "lng": -73.97},
+        })
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "simulation_not_running"
+
+
+def test_create_passenger_validation_error_uses_frontend_error_shape():
+    app.state.manager = make_manager(SimStatus.RUNNING)
+    with TestClient(app) as client:
+        resp = client.post("/simulation/passengers", json={
+            "pickup": {"lat": "not-a-number", "lng": -73.98},
+            "dropoff": {"lat": 40.76, "lng": -73.97},
+        })
+    assert resp.status_code == 422
+    assert resp.json() == {
+        "error": "invalid_request",
+        "message": "Request validation failed",
+    }
+
+
+def test_create_taxi_returns_reserved_id():
+    app.state.manager = make_manager(SimStatus.RUNNING)
+    with TestClient(app) as client:
+        resp = client.post("/simulation/taxis", json={"lat": 40.748, "lng": -73.985})
+    assert resp.status_code == 200
+    assert resp.json() == {"taxi_id": "utaxi_1"}
 
 
 # ---------------------------------------------------------------------------

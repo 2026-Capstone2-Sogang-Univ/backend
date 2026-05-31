@@ -3,11 +3,17 @@ syntax = "proto3";
 // ── 진입점 ─────────────────────────────────────────────
 message ServerMessage {
   oneof payload {
-    Boundary   boundary    = 1;
-    Snapshot   snapshot    = 2;
-    Surge      surge       = 3;
-    FareUpdate fare_update = 4;
-    Finished   finished    = 5;
+    Boundary               boundary                  = 1;
+    Snapshot               snapshot                  = 2;
+    Surge                  surge                     = 3;
+    FareUpdate             fare_update               = 4;
+    Finished               finished                  = 5;
+    PassengerCreated       passenger_created         = 6;
+    TaxiCreated            taxi_created              = 7;
+    PassengerCreationFailed passenger_creation_failed = 8;
+    DispatchAssigned       dispatch_assigned         = 9;
+    PassengerBoarded       passenger_boarded         = 10;
+    PassengerCancelled     passenger_cancelled       = 11;
   }
 }
 
@@ -80,6 +86,43 @@ message Surge {
   int32              h3_resolution = 1;
   repeated SurgeCell cells         = 2;
   double             sim_time      = 3;
+}
+
+// ── Interactive lifecycle (REST 생성 후 이벤트) ────────
+message PassengerCreated {
+  string passenger_id        = 1;
+  double pickup_lat          = 2;
+  double pickup_lng          = 3;
+  int32  expected_fare       = 4;
+  int32  expected_distance_m = 5;
+}
+
+message TaxiCreated {
+  string taxi_id = 1;
+  double lat     = 2;
+  double lng     = 3;
+}
+
+message PassengerCreationFailed {
+  string passenger_id = 1;
+  string reason       = 2;
+}
+
+message DispatchAssigned {
+  string passenger_id = 1;
+  string taxi_id      = 2;
+  int32  eta          = 3;
+}
+
+message PassengerBoarded {
+  string passenger_id = 1;
+  string taxi_id      = 2;
+  double sim_time     = 3;
+}
+
+message PassengerCancelled {
+  string passenger_id = 1;
+  string reason       = 2;
 }
 
 // ── FareUpdate (운행 완료 시) ──────────────────────────

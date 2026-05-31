@@ -360,6 +360,7 @@ def test_run_experiment_resets_stale_run_state_before_loop(monkeypatch):
     manager._bg_route_len = {"bg_1": 2}
     manager._trip_queue = [{"sim_time": 1.0}]
     manager._completed_passengers = [{"passenger_id": "p_stale"}]
+    manager._completed_trip_count = 3
     manager._surge_cells = [{"h3": "old"}]
     manager._surge_by_h3 = {"old": 2.0}
     manager._raw_surge_by_h3 = {"old": 2.0}
@@ -392,6 +393,7 @@ def test_run_experiment_resets_stale_run_state_before_loop(monkeypatch):
         assert manager._bg_route_len == {}
         assert manager._trip_queue == []
         assert manager._completed_passengers == []
+        assert manager._completed_trip_count == 0
         assert manager._surge_cells == []
         assert manager._surge_by_h3 == {}
         assert manager._raw_surge_by_h3 == {}
@@ -404,6 +406,157 @@ def test_run_experiment_resets_stale_run_state_before_loop(monkeypatch):
 
     assert manager.run_experiment() == []
     assert stale_provider.closed
+
+
+def test_status_summary_contains_runtime_counts():
+    manager = SimulationManager()
+    manager.status = simulation.SimStatus.RUNNING
+    manager._state = {
+        "vehicles": [
+            {"id": "taxi_0", "state": "empty"},
+            {"id": "taxi_1", "state": "occupied"},
+            {"id": "car_0", "state": "car"},
+        ],
+        "passengers": [],
+        "sim_time": 42.5,
+    }
+    manager._taxi_states = {
+        "taxi_0": "empty",
+        "taxi_1": "occupied",
+        "taxi_2": "dispatched",
+    }
+    manager._passengers = {
+        "p_waiting": Passenger(
+            id="p_waiting",
+            x=0.0,
+            y=0.0,
+            lat=40.0,
+            lng=-73.0,
+            pickup_edge="pickup_edge",
+            dropoff_edge="dropoff_edge",
+            dropoff_x=1.0,
+            dropoff_y=1.0,
+            dropoff_lat=40.1,
+            dropoff_lng=-73.1,
+            expected_distance_m=1000.0,
+            expected_fare=1000,
+            spawn_time=0.0,
+            state="waiting",
+        ),
+        "p_assigned": Passenger(
+            id="p_assigned",
+            x=0.0,
+            y=0.0,
+            lat=40.0,
+            lng=-73.0,
+            pickup_edge="pickup_edge",
+            dropoff_edge="dropoff_edge",
+            dropoff_x=1.0,
+            dropoff_y=1.0,
+            dropoff_lat=40.1,
+            dropoff_lng=-73.1,
+            expected_distance_m=1000.0,
+            expected_fare=1000,
+            spawn_time=0.0,
+            state="assigned",
+            taxi_id="taxi_0",
+        ),
+    }
+    manager._completed_trip_count = 5
+
+    summary = manager.get_status_summary()
+
+    assert summary["status"] == simulation.SimStatus.RUNNING
+    assert summary["sim_time"] == 42.5
+    assert summary["vehicle_count"] == 3
+    assert summary["taxi_count"] == 3
+    assert summary["empty_taxi_count"] == 1
+    assert summary["dispatched_taxi_count"] == 1
+    assert summary["occupied_taxi_count"] == 1
+    assert summary["waiting_passenger_count"] == 1
+    assert summary["assigned_passenger_count"] == 1
+    assert summary["completed_trip_count"] == 5
+    assert summary["h3_resolution"] == simulation.H3_RESOLUTION
+    assert summary["passenger_source"] == simulation.PASSENGER_SOURCE
+
+
+def test_kpi_summary_groups_matching_by_raw_surge_bucket():
+    manager = SimulationManager()
+    manager._record_dispatch_kpi({
+        "raw_surge": 1.2,
+        "passenger_id": "p_low",
+    }, accepted=True)
+    manager._record_dispatch_kpi({
+        "raw_surge": 2.8,
+        "passenger_id": "p_high",
+    }, accepted=False)
+
+    summary = manager.get_kpi_summary()
+    buckets = {row["bucket"]: row for row in summary["matching"]["by_raw_bucket"]}
+
+    assert buckets["raw_lt_1_5"]["request_count"] == 1
+    assert buckets["raw_lt_1_5"]["matched_count"] == 1
+    assert buckets["raw_lt_1_5"]["actual_rate"] == 1.0
+    assert buckets["raw_lt_3_5"]["request_count"] == 1
+    assert buckets["raw_lt_3_5"]["matched_count"] == 0
+    assert summary["matching"]["request_count"] == 2
+    assert summary["matching"]["matched_count"] == 1
+
+
+def test_kpi_summary_records_bucket_wait_and_revenue():
+    manager = SimulationManager()
+    passenger = Passenger(
+        id="p_wait",
+        x=0.0,
+        y=0.0,
+        lat=40.0,
+        lng=-73.0,
+        pickup_edge="pickup_edge",
+        dropoff_edge="dropoff_edge",
+        dropoff_x=1.0,
+        dropoff_y=1.0,
+        dropoff_lat=40.1,
+        dropoff_lng=-73.1,
+        expected_distance_m=1000.0,
+        expected_fare=1000,
+        spawn_time=10.0,
+        state="assigned",
+    )
+    manager._record_dispatch_kpi({
+        "raw_surge": 1.8,
+        "passenger_id": passenger.id,
+    }, accepted=True)
+    manager._record_passenger_boarded_kpi(passenger, 40.0)
+    manager._record_trip_kpi(fare=2500, meter_fare=2000)
+
+    summary = manager.get_kpi_summary()
+    bucket = {
+        row["bucket"]: row for row in summary["matching"]["by_raw_bucket"]
+    }["raw_lt_2_5"]
+
+    assert bucket["average_wait_seconds"] == 30.0
+    assert summary["passenger_waiting_incentive"]["average_wait_seconds"] == 30.0
+    assert summary["driver_revenue"]["completed_trip_count"] == 1
+    assert summary["driver_revenue"]["total_cents"] == 2500
+
+
+def test_estimate_pickup_eta_uses_route_travel_time_when_available():
+    route = SimpleNamespace(length=800.0, travelTime=123.4)
+
+    assert SimulationManager._estimate_pickup_eta_seconds(route) == 123
+
+
+def test_estimate_pickup_eta_falls_back_to_route_length():
+    route = SimpleNamespace(length=800.0)
+
+    assert SimulationManager._estimate_pickup_eta_seconds(route) == 100
+
+
+def test_manual_entity_detection_only_matches_manual_ids():
+    assert SimulationManager._is_manual_entity("upax_1")
+    assert SimulationManager._is_manual_entity("utaxi_1")
+    assert SimulationManager._is_manual_entity("p_1", "utaxi_1")
+    assert not SimulationManager._is_manual_entity("p_1", "taxi_1")
 
 
 @pytest.mark.asyncio

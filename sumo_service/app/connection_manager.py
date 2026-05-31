@@ -11,15 +11,21 @@ from fastapi import WebSocket
 from .grid import H3_RESOLUTION
 from .ws_messages_pb2 import (
     Boundary,
+    DispatchAssigned,
     FareUpdate,
     Finished,
     GeoRect,
+    PassengerBoarded,
+    PassengerCreated,
+    PassengerCreationFailed,
     PassengerMsg,
+    PassengerCancelled,
     ServerMessage,
     Snapshot,
     Surge,
     SurgeCell,
     SumoRect,
+    TaxiCreated,
     Vehicle,
     VehicleState,
 )
@@ -130,6 +136,79 @@ class ConnectionManager:
             expected_fare=expected_fare,
             distance_m=distance_m,
             sim_time=sim_time,
+        ))
+        await self._broadcast(msg)
+
+    async def broadcast_passenger_created(
+        self,
+        passenger_id: str,
+        pickup_lat: float,
+        pickup_lng: float,
+        expected_fare: int,
+        expected_distance_m: int,
+    ) -> None:
+        msg = ServerMessage(passenger_created=PassengerCreated(
+            passenger_id=passenger_id,
+            pickup_lat=pickup_lat,
+            pickup_lng=pickup_lng,
+            expected_fare=expected_fare,
+            expected_distance_m=expected_distance_m,
+        ))
+        await self._broadcast(msg)
+
+    async def broadcast_taxi_created(self, taxi_id: str, lat: float, lng: float) -> None:
+        msg = ServerMessage(taxi_created=TaxiCreated(
+            taxi_id=taxi_id,
+            lat=lat,
+            lng=lng,
+        ))
+        await self._broadcast(msg)
+
+    async def broadcast_passenger_creation_failed(
+        self,
+        passenger_id: str,
+        reason: str,
+    ) -> None:
+        msg = ServerMessage(passenger_creation_failed=PassengerCreationFailed(
+            passenger_id=passenger_id,
+            reason=reason,
+        ))
+        await self._broadcast(msg)
+
+    async def broadcast_dispatch_assigned(
+        self,
+        passenger_id: str,
+        taxi_id: str,
+        eta: int,
+    ) -> None:
+        msg = ServerMessage(dispatch_assigned=DispatchAssigned(
+            passenger_id=passenger_id,
+            taxi_id=taxi_id,
+            eta=eta,
+        ))
+        await self._broadcast(msg)
+
+    async def broadcast_passenger_boarded(
+        self,
+        passenger_id: str,
+        taxi_id: str,
+        sim_time: float,
+    ) -> None:
+        msg = ServerMessage(passenger_boarded=PassengerBoarded(
+            passenger_id=passenger_id,
+            taxi_id=taxi_id,
+            sim_time=sim_time,
+        ))
+        await self._broadcast(msg)
+
+    async def broadcast_passenger_cancelled(
+        self,
+        passenger_id: str,
+        reason: str,
+    ) -> None:
+        msg = ServerMessage(passenger_cancelled=PassengerCancelled(
+            passenger_id=passenger_id,
+            reason=reason,
         ))
         await self._broadcast(msg)
 

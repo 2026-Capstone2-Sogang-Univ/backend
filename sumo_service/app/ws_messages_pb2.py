@@ -24,35 +24,47 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x11ws_messages.proto\"\xb4\x01\n\rServerMessage\x12\x1d\n\x08\x62oundary\x18\x01 \x01(\x0b\x32\t.BoundaryH\x00\x12\x1d\n\x08snapshot\x18\x02 \x01(\x0b\x32\t.SnapshotH\x00\x12\x17\n\x05surge\x18\x03 \x01(\x0b\x32\x06.SurgeH\x00\x12\"\n\x0b\x66\x61re_update\x18\x04 \x01(\x0b\x32\x0b.FareUpdateH\x00\x12\x1d\n\x08\x66inished\x18\x05 \x01(\x0b\x32\t.FinishedH\x00\x42\t\n\x07payload\"k\n\x07Vehicle\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0b\n\x03lat\x18\x02 \x01(\x01\x12\x0b\n\x03lng\x18\x03 \x01(\x01\x12\r\n\x05\x61ngle\x18\x04 \x01(\x02\x12\r\n\x05speed\x18\x05 \x01(\x02\x12\x1c\n\x05state\x18\x06 \x01(\x0e\x32\r.VehicleState\"h\n\x0cPassengerMsg\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0b\n\x03lat\x18\x02 \x01(\x01\x12\x0b\n\x03lng\x18\x03 \x01(\x01\x12\x15\n\rexpected_fare\x18\x04 \x01(\x05\x12\x1b\n\x13\x65xpected_distance_m\x18\x05 \x01(\x01\"[\n\x08Snapshot\x12\x1a\n\x08vehicles\x18\x01 \x03(\x0b\x32\x08.Vehicle\x12!\n\npassengers\x18\x02 \x03(\x0b\x32\r.PassengerMsg\x12\x10\n\x08sim_time\x18\x03 \x01(\x01\"F\n\x08SumoRect\x12\r\n\x05min_x\x18\x01 \x01(\x01\x12\r\n\x05min_y\x18\x02 \x01(\x01\x12\r\n\x05max_x\x18\x03 \x01(\x01\x12\r\n\x05max_y\x18\x04 \x01(\x01\"M\n\x07GeoRect\x12\x0f\n\x07min_lat\x18\x01 \x01(\x01\x12\x0f\n\x07min_lng\x18\x02 \x01(\x01\x12\x0f\n\x07max_lat\x18\x03 \x01(\x01\x12\x0f\n\x07max_lng\x18\x04 \x01(\x01\":\n\x08\x42oundary\x12\x17\n\x04sumo\x18\x01 \x01(\x0b\x32\t.SumoRect\x12\x15\n\x03geo\x18\x02 \x01(\x0b\x32\x08.GeoRect\"z\n\tSurgeCell\x12\x10\n\x08h3_index\x18\x01 \x01(\t\x12\x0e\n\x06supply\x18\x02 \x01(\x05\x12\x0e\n\x06\x64\x65mand\x18\x03 \x01(\x05\x12\x13\n\x0bsurge_coeff\x18\x04 \x01(\x02\x12\x12\n\ncenter_lat\x18\x05 \x01(\x01\x12\x12\n\ncenter_lng\x18\x06 \x01(\x01\"K\n\x05Surge\x12\x15\n\rh3_resolution\x18\x01 \x01(\x05\x12\x19\n\x05\x63\x65lls\x18\x02 \x03(\x0b\x32\n.SurgeCell\x12\x10\n\x08sim_time\x18\x03 \x01(\x01\"~\n\nFareUpdate\x12\x14\n\x0cpassenger_id\x18\x01 \x01(\t\x12\x0f\n\x07taxi_id\x18\x02 \x01(\t\x12\x0c\n\x04\x66\x61re\x18\x03 \x01(\x05\x12\x15\n\rexpected_fare\x18\x04 \x01(\x05\x12\x12\n\ndistance_m\x18\x05 \x01(\x01\x12\x10\n\x08sim_time\x18\x06 \x01(\x01\"\n\n\x08\x46inished*[\n\x0cVehicleState\x12\x19\n\x15VEHICLE_STATE_UNKNOWN\x10\x00\x12\t\n\x05\x45MPTY\x10\x01\x12\x0e\n\nDISPATCHED\x10\x02\x12\x0c\n\x08OCCUPIED\x10\x03\x12\x07\n\x03\x43\x41R\x10\x04\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x11ws_messages.proto\"\xdd\x03\n\rServerMessage\x12\x1d\n\x08\x62oundary\x18\x01 \x01(\x0b\x32\t.BoundaryH\x00\x12\x1d\n\x08snapshot\x18\x02 \x01(\x0b\x32\t.SnapshotH\x00\x12\x17\n\x05surge\x18\x03 \x01(\x0b\x32\x06.SurgeH\x00\x12\"\n\x0b\x66\x61re_update\x18\x04 \x01(\x0b\x32\x0b.FareUpdateH\x00\x12\x1d\n\x08\x66inished\x18\x05 \x01(\x0b\x32\t.FinishedH\x00\x12.\n\x11passenger_created\x18\x06 \x01(\x0b\x32\x11.PassengerCreatedH\x00\x12$\n\x0ctaxi_created\x18\x07 \x01(\x0b\x32\x0c.TaxiCreatedH\x00\x12=\n\x19passenger_creation_failed\x18\x08 \x01(\x0b\x32\x18.PassengerCreationFailedH\x00\x12.\n\x11\x64ispatch_assigned\x18\t \x01(\x0b\x32\x11.DispatchAssignedH\x00\x12.\n\x11passenger_boarded\x18\n \x01(\x0b\x32\x11.PassengerBoardedH\x00\x12\x32\n\x13passenger_cancelled\x18\x0b \x01(\x0b\x32\x13.PassengerCancelledH\x00\x42\t\n\x07payload\"k\n\x07Vehicle\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0b\n\x03lat\x18\x02 \x01(\x01\x12\x0b\n\x03lng\x18\x03 \x01(\x01\x12\r\n\x05\x61ngle\x18\x04 \x01(\x02\x12\r\n\x05speed\x18\x05 \x01(\x02\x12\x1c\n\x05state\x18\x06 \x01(\x0e\x32\r.VehicleState\"h\n\x0cPassengerMsg\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0b\n\x03lat\x18\x02 \x01(\x01\x12\x0b\n\x03lng\x18\x03 \x01(\x01\x12\x15\n\rexpected_fare\x18\x04 \x01(\x05\x12\x1b\n\x13\x65xpected_distance_m\x18\x05 \x01(\x01\"[\n\x08Snapshot\x12\x1a\n\x08vehicles\x18\x01 \x03(\x0b\x32\x08.Vehicle\x12!\n\npassengers\x18\x02 \x03(\x0b\x32\r.PassengerMsg\x12\x10\n\x08sim_time\x18\x03 \x01(\x01\"F\n\x08SumoRect\x12\r\n\x05min_x\x18\x01 \x01(\x01\x12\r\n\x05min_y\x18\x02 \x01(\x01\x12\r\n\x05max_x\x18\x03 \x01(\x01\x12\r\n\x05max_y\x18\x04 \x01(\x01\"M\n\x07GeoRect\x12\x0f\n\x07min_lat\x18\x01 \x01(\x01\x12\x0f\n\x07min_lng\x18\x02 \x01(\x01\x12\x0f\n\x07max_lat\x18\x03 \x01(\x01\x12\x0f\n\x07max_lng\x18\x04 \x01(\x01\":\n\x08\x42oundary\x12\x17\n\x04sumo\x18\x01 \x01(\x0b\x32\t.SumoRect\x12\x15\n\x03geo\x18\x02 \x01(\x0b\x32\x08.GeoRect\"z\n\tSurgeCell\x12\x10\n\x08h3_index\x18\x01 \x01(\t\x12\x0e\n\x06supply\x18\x02 \x01(\x05\x12\x0e\n\x06\x64\x65mand\x18\x03 \x01(\x05\x12\x13\n\x0bsurge_coeff\x18\x04 \x01(\x02\x12\x12\n\ncenter_lat\x18\x05 \x01(\x01\x12\x12\n\ncenter_lng\x18\x06 \x01(\x01\"K\n\x05Surge\x12\x15\n\rh3_resolution\x18\x01 \x01(\x05\x12\x19\n\x05\x63\x65lls\x18\x02 \x03(\x0b\x32\n.SurgeCell\x12\x10\n\x08sim_time\x18\x03 \x01(\x01\"\x84\x01\n\x10PassengerCreated\x12\x14\n\x0cpassenger_id\x18\x01 \x01(\t\x12\x12\n\npickup_lat\x18\x02 \x01(\x01\x12\x12\n\npickup_lng\x18\x03 \x01(\x01\x12\x15\n\rexpected_fare\x18\x04 \x01(\x05\x12\x1b\n\x13\x65xpected_distance_m\x18\x05 \x01(\x05\"8\n\x0bTaxiCreated\x12\x0f\n\x07taxi_id\x18\x01 \x01(\t\x12\x0b\n\x03lat\x18\x02 \x01(\x01\x12\x0b\n\x03lng\x18\x03 \x01(\x01\"?\n\x17PassengerCreationFailed\x12\x14\n\x0cpassenger_id\x18\x01 \x01(\t\x12\x0e\n\x06reason\x18\x02 \x01(\t\"F\n\x10\x44ispatchAssigned\x12\x14\n\x0cpassenger_id\x18\x01 \x01(\t\x12\x0f\n\x07taxi_id\x18\x02 \x01(\t\x12\x0b\n\x03\x65ta\x18\x03 \x01(\x05\"K\n\x10PassengerBoarded\x12\x14\n\x0cpassenger_id\x18\x01 \x01(\t\x12\x0f\n\x07taxi_id\x18\x02 \x01(\t\x12\x10\n\x08sim_time\x18\x03 \x01(\x01\":\n\x12PassengerCancelled\x12\x14\n\x0cpassenger_id\x18\x01 \x01(\t\x12\x0e\n\x06reason\x18\x02 \x01(\t\"~\n\nFareUpdate\x12\x14\n\x0cpassenger_id\x18\x01 \x01(\t\x12\x0f\n\x07taxi_id\x18\x02 \x01(\t\x12\x0c\n\x04\x66\x61re\x18\x03 \x01(\x05\x12\x15\n\rexpected_fare\x18\x04 \x01(\x05\x12\x12\n\ndistance_m\x18\x05 \x01(\x01\x12\x10\n\x08sim_time\x18\x06 \x01(\x01\"\n\n\x08\x46inished*[\n\x0cVehicleState\x12\x19\n\x15VEHICLE_STATE_UNKNOWN\x10\x00\x12\t\n\x05\x45MPTY\x10\x01\x12\x0e\n\nDISPATCHED\x10\x02\x12\x0c\n\x08OCCUPIED\x10\x03\x12\x07\n\x03\x43\x41R\x10\x04\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'ws_messages_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_VEHICLESTATE']._serialized_start=1064
-  _globals['_VEHICLESTATE']._serialized_end=1155
+  _globals['_VEHICLESTATE']._serialized_start=1828
+  _globals['_VEHICLESTATE']._serialized_end=1919
   _globals['_SERVERMESSAGE']._serialized_start=22
-  _globals['_SERVERMESSAGE']._serialized_end=202
-  _globals['_VEHICLE']._serialized_start=204
-  _globals['_VEHICLE']._serialized_end=311
-  _globals['_PASSENGERMSG']._serialized_start=313
-  _globals['_PASSENGERMSG']._serialized_end=417
-  _globals['_SNAPSHOT']._serialized_start=419
-  _globals['_SNAPSHOT']._serialized_end=510
-  _globals['_SUMORECT']._serialized_start=512
-  _globals['_SUMORECT']._serialized_end=582
-  _globals['_GEORECT']._serialized_start=584
-  _globals['_GEORECT']._serialized_end=661
-  _globals['_BOUNDARY']._serialized_start=663
-  _globals['_BOUNDARY']._serialized_end=721
-  _globals['_SURGECELL']._serialized_start=723
-  _globals['_SURGECELL']._serialized_end=845
-  _globals['_SURGE']._serialized_start=847
-  _globals['_SURGE']._serialized_end=922
-  _globals['_FAREUPDATE']._serialized_start=924
-  _globals['_FAREUPDATE']._serialized_end=1050
-  _globals['_FINISHED']._serialized_start=1052
-  _globals['_FINISHED']._serialized_end=1062
+  _globals['_SERVERMESSAGE']._serialized_end=499
+  _globals['_VEHICLE']._serialized_start=501
+  _globals['_VEHICLE']._serialized_end=608
+  _globals['_PASSENGERMSG']._serialized_start=610
+  _globals['_PASSENGERMSG']._serialized_end=714
+  _globals['_SNAPSHOT']._serialized_start=716
+  _globals['_SNAPSHOT']._serialized_end=807
+  _globals['_SUMORECT']._serialized_start=809
+  _globals['_SUMORECT']._serialized_end=879
+  _globals['_GEORECT']._serialized_start=881
+  _globals['_GEORECT']._serialized_end=958
+  _globals['_BOUNDARY']._serialized_start=960
+  _globals['_BOUNDARY']._serialized_end=1018
+  _globals['_SURGECELL']._serialized_start=1020
+  _globals['_SURGECELL']._serialized_end=1142
+  _globals['_SURGE']._serialized_start=1144
+  _globals['_SURGE']._serialized_end=1219
+  _globals['_PASSENGERCREATED']._serialized_start=1222
+  _globals['_PASSENGERCREATED']._serialized_end=1354
+  _globals['_TAXICREATED']._serialized_start=1356
+  _globals['_TAXICREATED']._serialized_end=1412
+  _globals['_PASSENGERCREATIONFAILED']._serialized_start=1414
+  _globals['_PASSENGERCREATIONFAILED']._serialized_end=1477
+  _globals['_DISPATCHASSIGNED']._serialized_start=1479
+  _globals['_DISPATCHASSIGNED']._serialized_end=1549
+  _globals['_PASSENGERBOARDED']._serialized_start=1551
+  _globals['_PASSENGERBOARDED']._serialized_end=1626
+  _globals['_PASSENGERCANCELLED']._serialized_start=1628
+  _globals['_PASSENGERCANCELLED']._serialized_end=1686
+  _globals['_FAREUPDATE']._serialized_start=1688
+  _globals['_FAREUPDATE']._serialized_end=1814
+  _globals['_FINISHED']._serialized_start=1816
+  _globals['_FINISHED']._serialized_end=1826
 # @@protoc_insertion_point(module_scope)

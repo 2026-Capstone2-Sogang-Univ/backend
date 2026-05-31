@@ -1,23 +1,182 @@
 import asyncio
 import os
 import signal
+import math
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from ..db.engine import get_pool
 from ..grid import H3_RESOLUTION
-from ..simulation import SimStatus
+from ..simulation import DEFAULT_PRICING_POLICY, SimStatus, SimulationStartOptions
 
 router = APIRouter()
 
+MAX_DURATION_S = 604800.0
+MAX_TAXI_COUNT = 1000
+MAX_INITIAL_PASSENGER_COUNT = 5000
+PASSENGER_SOURCES = {"random", "parquet"}
+
+
+class TargetMatchingRatesBody(BaseModel):
+    raw_lt_1_5: float | None = None
+    raw_lt_2_5: float | None = None
+    raw_lt_3_5: float | None = None
+    raw_gte_3_5: float | None = None
+
+
+class PricingPolicyBody(BaseModel):
+    epsilon: float | None = None
+    surge_min: float | None = None
+    surge_max: float | None = None
+    alpha_sensitivity: float | None = None
+
+
+class StartSimulationBody(BaseModel):
+    duration: float | None = Field(default=None, gt=0)
+    seed: int | None = None
+    passenger_source: str | None = None
+    target_matching_rates: TargetMatchingRatesBody | None = None
+    pricing_policy: PricingPolicyBody | None = None
+    taxi_count: int | None = Field(default=None, gt=0)
+    initial_passenger_count: int | None = Field(default=None, ge=0)
+
+
+class LatLngBody(BaseModel):
+    lat: float
+    lng: float
+
+
+class CreatePassengerBody(BaseModel):
+    pickup: LatLngBody
+    dropoff: LatLngBody
+
+
+class CreateTaxiBody(BaseModel):
+    lat: float
+    lng: float
+
+
+def _status_payload(manager):
+    return manager.get_status_summary()
+
+
+def _start_options(body: StartSimulationBody | None) -> SimulationStartOptions | None:
+    if body is None:
+        return None
+    return SimulationStartOptions(
+        duration=body.duration,
+        seed=body.seed,
+        passenger_source=body.passenger_source,
+        target_matching_rates=(
+            body.target_matching_rates.model_dump(exclude_none=True)
+            if body.target_matching_rates else None
+        ),
+        pricing_policy=(
+            body.pricing_policy.model_dump(exclude_none=True)
+            if body.pricing_policy else None
+        ),
+        taxi_count=body.taxi_count,
+        initial_passenger_count=body.initial_passenger_count,
+    )
+
+
+def _validate_lat_lng(lat: float, lng: float) -> bool:
+    return (
+        math.isfinite(lat)
+        and math.isfinite(lng)
+        and -90.0 <= lat <= 90.0
+        and -180.0 <= lng <= 180.0
+    )
+
+
+def _error(status_code: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": code, "message": message},
+    )
+
+
+def _validate_start_body(body: StartSimulationBody | None) -> JSONResponse | None:
+    if body is None:
+        return None
+    if body.duration is not None and body.duration > MAX_DURATION_S:
+        return _error(
+            400,
+            "invalid_request",
+            f"duration must be <= {int(MAX_DURATION_S)} seconds",
+        )
+    if body.passenger_source is not None and body.passenger_source not in PASSENGER_SOURCES:
+        return _error(
+            400,
+            "invalid_request",
+            "passenger_source must be one of: random, parquet",
+        )
+    if body.taxi_count is not None and body.taxi_count > MAX_TAXI_COUNT:
+        return _error(
+            400,
+            "invalid_request",
+            f"taxi_count must be <= {MAX_TAXI_COUNT}",
+        )
+    if (
+        body.initial_passenger_count is not None
+        and body.initial_passenger_count > MAX_INITIAL_PASSENGER_COUNT
+    ):
+        return _error(
+            400,
+            "invalid_request",
+            f"initial_passenger_count must be <= {MAX_INITIAL_PASSENGER_COUNT}",
+        )
+    if body.target_matching_rates is not None:
+        for key, value in body.target_matching_rates.model_dump(exclude_none=True).items():
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                return _error(
+                    400,
+                    "invalid_request",
+                    f"target_matching_rates.{key} must be between 0 and 1",
+                )
+    if body.pricing_policy is not None:
+        policy = body.pricing_policy.model_dump(exclude_none=True)
+        merged_policy = dict(DEFAULT_PRICING_POLICY)
+        merged_policy.update(policy)
+        for key, value in policy.items():
+            if not math.isfinite(value):
+                return _error(400, "invalid_request", f"pricing_policy.{key} must be finite")
+        if abs(merged_policy["epsilon"]) < 1e-12:
+            return _error(400, "invalid_request", "pricing_policy.epsilon must be non-zero")
+        if "surge_min" in policy and policy["surge_min"] < 1.0:
+            return _error(400, "invalid_request", "pricing_policy.surge_min must be >= 1")
+        if "surge_max" in policy and policy["surge_max"] < 1.0:
+            return _error(400, "invalid_request", "pricing_policy.surge_max must be >= 1")
+        if merged_policy["surge_min"] > merged_policy["surge_max"]:
+            return _error(
+                400,
+                "invalid_request",
+                "pricing_policy.surge_min must be <= surge_max",
+            )
+        if "alpha_sensitivity" in policy and policy["alpha_sensitivity"] <= 0:
+            return _error(
+                400,
+                "invalid_request",
+                "pricing_policy.alpha_sensitivity must be > 0",
+            )
+    return None
+
 
 @router.post("/start")
-async def start_simulation(request: Request):
+async def start_simulation(
+    request: Request,
+    body: StartSimulationBody | None = Body(default=None),
+):
     manager = request.app.state.manager
     if manager.status == SimStatus.RUNNING:
         raise HTTPException(status_code=409, detail="Simulation is already running")
-    await manager.start()
-    return {"status": manager.status}
+    validation_error = _validate_start_body(body)
+    if validation_error is not None:
+        return validation_error
+    await manager.start(_start_options(body))
+    return _status_payload(manager)
 
 
 @router.post("/pause")
@@ -26,7 +185,7 @@ async def pause_simulation(request: Request):
     if manager.status != SimStatus.RUNNING:
         raise HTTPException(status_code=400, detail="Simulation is not running")
     await manager.pause()
-    return {"status": manager.status}
+    return _status_payload(manager)
 
 
 @router.post("/resume")
@@ -35,21 +194,27 @@ async def resume_simulation(request: Request):
     if manager.status != SimStatus.PAUSED:
         raise HTTPException(status_code=400, detail="Simulation is not paused")
     await manager.resume()
-    return {"status": manager.status}
+    return _status_payload(manager)
 
 
 @router.post("/restart")
-async def restart_simulation(request: Request):
+async def restart_simulation(
+    request: Request,
+    body: StartSimulationBody | None = Body(default=None),
+):
     manager = request.app.state.manager
-    await manager.restart()
-    return {"status": manager.status}
+    validation_error = _validate_start_body(body)
+    if validation_error is not None:
+        return validation_error
+    await manager.restart(_start_options(body))
+    return _status_payload(manager)
 
 
 @router.post("/stop")
 async def stop_simulation(request: Request):
     manager = request.app.state.manager
     await manager.stop()
-    return {"status": manager.status}
+    return _status_payload(manager)
 
 
 @router.post("/shutdown")
@@ -62,7 +227,13 @@ async def shutdown_server(request: Request):
 @router.get("/status")
 async def get_status(request: Request):
     manager = request.app.state.manager
-    return {"status": manager.status, **manager.get_state()}
+    return _status_payload(manager)
+
+
+@router.get("/kpi")
+async def get_kpi(request: Request):
+    manager = request.app.state.manager
+    return manager.get_kpi_summary()
 
 
 @router.get("/surge")
@@ -75,6 +246,35 @@ async def get_surge(request: Request):
 async def get_passengers(request: Request):
     manager = request.app.state.manager
     return {"passengers": manager.get_passengers()}
+
+
+@router.post("/passengers")
+async def create_passenger(body: CreatePassengerBody, request: Request):
+    manager = request.app.state.manager
+    if manager.status != SimStatus.RUNNING:
+        return _error(400, "simulation_not_running", "Simulation is not running")
+    if not _validate_lat_lng(body.pickup.lat, body.pickup.lng):
+        return _error(400, "invalid_request", "pickup lat/lng is invalid")
+    if not _validate_lat_lng(body.dropoff.lat, body.dropoff.lng):
+        return _error(400, "invalid_request", "dropoff lat/lng is invalid")
+    passenger_id = manager.enqueue_manual_passenger(
+        pickup_lat=body.pickup.lat,
+        pickup_lng=body.pickup.lng,
+        dropoff_lat=body.dropoff.lat,
+        dropoff_lng=body.dropoff.lng,
+    )
+    return {"passenger_id": passenger_id}
+
+
+@router.post("/taxis")
+async def create_taxi(body: CreateTaxiBody, request: Request):
+    manager = request.app.state.manager
+    if manager.status != SimStatus.RUNNING:
+        return _error(400, "simulation_not_running", "Simulation is not running")
+    if not _validate_lat_lng(body.lat, body.lng):
+        return _error(400, "invalid_request", "lat/lng is invalid")
+    taxi_id = manager.enqueue_manual_taxi(lat=body.lat, lng=body.lng)
+    return {"taxi_id": taxi_id}
 
 
 @router.get("/fare/{passenger_id}")
