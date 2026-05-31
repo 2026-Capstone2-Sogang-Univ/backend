@@ -86,7 +86,7 @@ async def get_fare(passenger_id: str, request: Request):
         if run_id is None:
             raise HTTPException(status_code=404, detail="Fare not found")
         row = await pool.fetchrow(
-            "SELECT taxi_id, fare, expected_fare, distance_m, dropoff_sim_time "
+            "SELECT taxi_id, meter_fare, fare, surge, expected_fare, distance_m, dropoff_sim_time "
             "FROM trip WHERE passenger_id = $1 AND run_id = $2 LIMIT 1",
             passenger_id, run_id,
         )
@@ -95,7 +95,9 @@ async def get_fare(passenger_id: str, request: Request):
         return {
             "passenger_id": passenger_id,
             "taxi_id": row["taxi_id"],
+            "meter_fare": row["meter_fare"],
             "fare": row["fare"],
+            "surge": row["surge"],
             "expected_fare": row["expected_fare"],
             "distance_m": row["distance_m"],
             "sim_time": row["dropoff_sim_time"],

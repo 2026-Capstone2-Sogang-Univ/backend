@@ -44,12 +44,17 @@ async def _handle(event: dict) -> None:
                     """
                     INSERT INTO dispatch (
                         id, run_id, passenger_id, taxi_id,
-                        dispatch_sim_time, estimated_pickup_distance_m, accepted
-                    ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+                        dispatch_sim_time, estimated_pickup_distance_m,
+                        raw_surge, target_matching_rate, calculated_surge,
+                        final_surge, final_fare_estimate_usd, p_actual, accepted
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                     ON CONFLICT DO NOTHING
                     """,
                     event["id"], event["run_id"], event["passenger_id"], event["taxi_id"],
                     event["dispatch_sim_time"], event.get("estimated_pickup_distance_m"),
+                    event.get("raw_surge"), event.get("target_matching_rate"),
+                    event.get("calculated_surge"), event.get("final_surge"),
+                    event.get("final_fare_usd"), event.get("p_actual"),
                     event.get("accepted", True),
                 )
             elif t == "dispatch_timeout":
@@ -63,14 +68,16 @@ async def _handle(event: dict) -> None:
                     INSERT INTO trip (
                         run_id, passenger_id, taxi_id, dispatch_id,
                         dispatch_sim_time, pickup_sim_time, dropoff_sim_time,
-                        distance_m, low_speed_seconds, fare, expected_fare, completion
-                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                        distance_m, low_speed_seconds, meter_fare, surge,
+                        fare, expected_fare, completion
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                     """,
                     event["run_id"], event["passenger_id"], event["taxi_id"],
                     event["dispatch_id"],
                     event["dispatch_sim_time"], event["pickup_sim_time"],
                     event.get("dropoff_sim_time"),
                     event["distance_m"], event["low_speed_seconds"],
+                    event.get("meter_fare", event["fare"]), event.get("surge", 1.0),
                     event["fare"], event["expected_fare"], event["completion"],
                 )
             elif t == "run_end":
