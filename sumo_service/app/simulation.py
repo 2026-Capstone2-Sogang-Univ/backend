@@ -41,16 +41,25 @@ from traci import constants as tc
 from .coord import make_sumolib_converter, sumo_to_latlng
 from .demand_history import DemandHistoryStore
 from .driver.decision_function import (
+    acceptance_features as _acceptance_features,
     acceptance_probability as _acceptance_probability,
-    required_fare_for_target_p as _required_fare_for_target_p,
+    required_fare_for_target_features as _required_fare_for_target_features,
 )
 
 _logger = logging.getLogger(__name__)
 from .db.engine import get_pool
 from .db.writer import db_writer_task as _db_writer_task
-from .fare import SPEED_THRESHOLD_MPS, TripAccumulator, calculate_fare, estimate_fare
+from .fare import (
+    SPEED_THRESHOLD_MPS,
+    TripAccumulator,
+    calculate_fare,
+    calculate_meter_fare,
+    estimate_fare,
+)
 from .grid import DEFAULT_ELASTICITY, H3_RESOLUTION, cell_center_latlng, compute_surge, get_cell
+from .h3_cells import load_model_h3_cells
 from .passenger import Passenger
+from .pricing import apply_surge_limits, compute_raw_surge, get_target_matching_rate
 from .prediction import PredictionDemandProvider
 from .weather import StaticWeatherProvider
 
@@ -206,9 +215,9 @@ class SimStatus(str, Enum):
 # None이면 기존 WebSocket/DB/실시간 pacing 경로를 그대로 사용하고, 값이 있으면 빠른 동기 실행 경로를 탄다.
 @dataclass(frozen=True)
 class ExperimentConfig:
-    target_p: float = 0.8
+    target_p: float | None = None
     elasticity: float = DEFAULT_ELASTICITY
-    beta_f: float = 0.006
+    beta_f: float | None = None
     seed: int = 42
     sim_duration: float = SIM_DURATION
     # 운영(start)과 같은 step rate를 기본값으로 둬야 sweep 결과를 운영에 옮길 수 있다.
@@ -251,6 +260,8 @@ class SimulationManager:
         self._surge_cells: list[dict] = []
         # WebSocket은 list 형태가 필요하지만 배차 판단은 pickup H3로 즉시 조회해야 하므로 dict 캐시를 함께 둔다.
         self._surge_by_h3: dict[str, float] = {}
+        self._raw_surge_by_h3: dict[str, float] = {}
+        self._target_matching_rate_by_h3: dict[str, float] = {}
         self._history_store: DemandHistoryStore | None = None
         self._prediction_demand_provider: PredictionDemandProvider | None = None
         self._surge_diagnostics: list[dict] = []
@@ -266,6 +277,7 @@ class SimulationManager:
         self._db_queue: asyncio.Queue | None = None
         self._db_writer_task: asyncio.Task | None = None
         self._taxi_dispatch_ids: dict[str, str] = {}
+        self._taxi_dispatch_surge: dict[str, float] = {}
         self._taxi_last_dropoff_cells: dict[str, str] = {}
         self._taxi_appeared: set[str] = set()   # taxis that have appeared in sub_results at least once
         self._taxi_missing_since: dict[str, float] = {}  # veh_id → sim_time when first detected missing
@@ -445,6 +457,8 @@ class SimulationManager:
             self._routable_edges = []
             self._surge_cells = []
             self._surge_by_h3 = {}
+            self._raw_surge_by_h3 = {}
+            self._target_matching_rate_by_h3 = {}
             self._history_store = None
             self._surge_diagnostics = []
             self._completed_passengers = []
@@ -462,6 +476,7 @@ class SimulationManager:
             self._db_queue = None
             self._db_writer_task = None
             self._taxi_dispatch_ids = {}
+            self._taxi_dispatch_surge = {}
             self._taxi_last_dropoff_cells = {}
             self._taxi_appeared.clear()
             self._taxi_missing_since.clear()
@@ -493,7 +508,14 @@ class SimulationManager:
             if self.connection_manager is not None:
                 await self.connection_manager.broadcast_state(state)
                 for payload in state.get("fare_updates", []):
-                    await self.connection_manager.broadcast_fare_update(**payload)
+                    await self.connection_manager.broadcast_fare_update(
+                        payload["passenger_id"],
+                        payload["taxi_id"],
+                        payload["fare"],
+                        payload["expected_fare"],
+                        payload["distance_m"],
+                        payload["sim_time"],
+                    )
                 if state.get("surge") is not None:
                     await self.connection_manager.broadcast_surge(
                         state["surge"], state["sim_time"]
@@ -654,24 +676,27 @@ class SimulationManager:
                 self._extend_vehicle_routes(sub_results)
 
                 self._spawn_passengers(sim_time)
+                surge_payload = None
+                with self._lock:
+                    _, grid_supply, grid_demand = self._capture_state(sim_time, sub_results)
+                    surge_interval = int(sim_time / 5.0)
+                    if surge_interval > self._last_surge_interval:
+                        self._last_surge_interval = surge_interval
+                        self._build_surge_cells(grid_supply, grid_demand, sim_time)
+                        surge_payload = self._surge_cells
+
                 fare_updates = self._update_taxi_states(sim_time, sub_results)
                 fare_updates += self._accumulate_fares(sim_time, sub_results)
 
                 with self._lock:
-                    state, grid_supply, grid_demand = self._capture_state(sim_time, sub_results)
+                    state, _, _ = self._capture_state(sim_time, sub_results)
                     self._state = state
                     state["fare_updates"] = fare_updates
                     for fu in fare_updates:
                         self._completed_passengers.append(fu)
                         if len(self._completed_passengers) > MAX_COMPLETED_PASSENGERS:
                             self._completed_passengers.pop(0)
-                    surge_interval = int(sim_time / 5.0)
-                    if surge_interval > self._last_surge_interval:
-                        self._last_surge_interval = surge_interval
-                        self._build_surge_cells(grid_supply, grid_demand, sim_time)
-                        state["surge"] = self._surge_cells
-                    else:
-                        state["surge"] = None
+                    state["surge"] = surge_payload
 
                 # Push state immediately after each step; broadcast loop sends it.
                 if broadcast_enabled and self._loop is not None and self._state_queue is not None:
@@ -685,11 +710,14 @@ class SimulationManager:
                             p = self._passengers.pop(pid, None) if pid else None
                             if p:
                                 dropoff_h3 = p.h3_dropoff or get_cell(p.dropoff_lat, p.dropoff_lng)
+                                meter_fare = calculate_meter_fare(accum)
                                 fare = calculate_fare(accum)
                                 self._completed_passengers.append({
                                     "passenger_id": pid,
                                     "taxi_id": taxi_id,
+                                    "meter_fare": meter_fare,
                                     "fare": fare,
+                                    "surge": accum.surge,
                                     "expected_fare": p.expected_fare,
                                     "distance_m": accum.distance_m,
                                     "sim_time": sim_time,
@@ -707,12 +735,15 @@ class SimulationManager:
                                     "dropoff_sim_time": sim_time,
                                     "distance_m": accum.distance_m,
                                     "low_speed_seconds": accum.low_speed_seconds,
+                                    "meter_fare": meter_fare,
                                     "fare": fare,
+                                    "surge": accum.surge,
                                     "expected_fare": p.expected_fare,
                                     "completion": "forced_at_end",
                                 })
                                 self._record_history_dropoff(sim_time, dropoff_h3)
                             self._taxi_dispatch_ids.pop(taxi_id, None)
+                            self._taxi_dispatch_surge.pop(taxi_id, None)
                         self._active_trips.clear()
                     self.status = SimStatus.FINISHED
                     if broadcast_enabled and self._loop is not None and self._state_queue is not None:
@@ -747,7 +778,9 @@ class SimulationManager:
                     "dispatch_sim_time": event.get("dispatch_sim_time"),
                     "pickup_sim_time": event.get("pickup_sim_time"),
                     "dropoff_sim_time": event.get("dropoff_sim_time"),
+                    "meter_fare_usd": (event.get("meter_fare") or 0) / 100.0,
                     "fare_usd": (event.get("fare") or 0) / 100.0,
+                    "surge": event.get("surge", 1.0),
                     "completion": event.get("completion"),
                 })
                 if event.get("completion") != "forced_at_end":
@@ -814,22 +847,7 @@ class SimulationManager:
             self._surge_diagnostics = []
             return
 
-        if self._latlng is None:
-            raise RuntimeError("lat/lng converter must be initialized before prediction components")
-
-        model_h3_cells: list[str] = []
-        seen_cells: set[str] = set()
-        for edge_id in self._routable_edges:
-            midpoint = self._get_edge_midpoint(edge_id)
-            if midpoint is None:
-                continue
-            lat, lng = self._latlng(*midpoint)
-            if not (math.isfinite(lat) and math.isfinite(lng)):
-                continue
-            h3_cell = get_cell(lat, lng)
-            if h3_cell not in seen_cells:
-                seen_cells.add(h3_cell)
-                model_h3_cells.append(h3_cell)
+        model_h3_cells = load_model_h3_cells()
 
         self._history_store = DemandHistoryStore(model_h3_cells=model_h3_cells)
         self._surge_diagnostics = []
@@ -839,17 +857,13 @@ class SimulationManager:
         if config.weather_source != "static":
             raise ValueError(f"unsupported weather source: {config.weather_source}")
 
-        fallback_policy = config.prediction_fallback_policy
-        if config.prediction_mode == "async" and fallback_policy == "error":
-            fallback_policy = "last_prediction"
-
         self._prediction_demand_provider = PredictionDemandProvider(
             prediction_url=config.prediction_url,
             model_h3_cells=model_h3_cells,
             history_store=self._history_store,
             weather_provider=StaticWeatherProvider(),
             prediction_horizon_min=config.prediction_horizon_min,
-            fallback_policy=fallback_policy,
+            fallback_policy=config.prediction_fallback_policy,
         )
 
     def _adjust_spawn_count_for_elasticity(self, raw_count: int, h3_cell: str | None, sim_time: float) -> int:
@@ -1037,6 +1051,119 @@ class SimulationManager:
             "expected_distance_m": route.length,
         })
 
+    def _candidate_driver_average_features(
+        self,
+        *,
+        candidate: Passenger,
+        sim_time: float,
+        sub_results: dict,
+        current_veh_id: str,
+        current_route,
+    ) -> tuple[float, float, float, int] | None:
+        if not candidate.h3_dropoff:
+            return None
+        call_dt = SIM_BASE_DATETIME + timedelta(seconds=sim_time)
+        trip_miles = candidate.expected_distance_m / 1609.344
+        empty_taxis = []
+        for taxi_id, vals in sub_results.items():
+            if not taxi_id.startswith("taxi_"):
+                continue
+            if self._taxi_states.get(taxi_id, "empty") != "empty":
+                continue
+            x, y = vals[tc.VAR_POSITION]
+            empty_taxis.append(((candidate.x - x) ** 2 + (candidate.y - y) ** 2, taxi_id, vals))
+
+        driver_features = []
+        for _, taxi_id, vals in sorted(empty_taxis)[:DISPATCH_MAX_CANDIDATES]:
+            x, y = vals[tc.VAR_POSITION]
+            road_id = vals.get(tc.VAR_ROAD_ID, "")
+            route = current_route if taxi_id == current_veh_id else None
+            if route is None:
+                try:
+                    route = traci.simulation.findRoute(road_id, candidate.pickup_edge)
+                except traci.exceptions.TraCIException:
+                    continue
+            if not route.edges:
+                continue
+            D_pu_miles = route.length / 1609.344
+            lat, lng = self._latlng(x, y)
+            last_cell = self._taxi_last_dropoff_cells.get(taxi_id) or get_cell(lat, lng)
+            features = _acceptance_features(
+                last_dropoff_cell=last_cell,
+                dropoff_cell=candidate.h3_dropoff,
+                call_datetime=call_dt,
+                D_pu=D_pu_miles,
+                trip_distance=trip_miles,
+                pickup_cell=candidate.h3_pickup,
+            )
+            driver_features.append((features.dV_without_fare, D_pu_miles, features.t_pu))
+
+        if not driver_features:
+            return None
+        count = len(driver_features)
+        return (
+            sum(v[0] for v in driver_features) / count,
+            sum(v[1] for v in driver_features) / count,
+            sum(v[2] for v in driver_features) / count,
+            count,
+        )
+
+    def _dispatch_pricing(
+        self,
+        *,
+        candidate: Passenger,
+        sim_time: float,
+        sub_results: dict,
+        current_veh_id: str,
+        current_route,
+    ) -> dict:
+        base_fare_usd = candidate.expected_fare / 100.0
+        raw_surge = self._raw_surge_by_h3.get(
+            candidate.h3_pickup or "",
+            self._surge_by_h3.get(candidate.h3_pickup or "", 1.0),
+        )
+        target_matching_rate = get_target_matching_rate(raw_surge)
+        required_fare_usd = None
+        calculated_surge = raw_surge
+        pricing_driver_count = None
+
+        if self.experiment_config is not None and base_fare_usd > 0:
+            averages = self._candidate_driver_average_features(
+                candidate=candidate,
+                sim_time=sim_time,
+                sub_results=sub_results,
+                current_veh_id=current_veh_id,
+                current_route=current_route,
+            )
+            if averages is not None:
+                avg_dv, avg_dpu, avg_tpu, pricing_driver_count = averages
+                required_fare_usd = _required_fare_for_target_features(
+                    target_p=target_matching_rate,
+                    dV_without_fare=avg_dv,
+                    D_pu=avg_dpu,
+                    T_pu=avg_tpu,
+                    beta_f=self.experiment_config.beta_f,
+                    alpha_sensitivity=self.experiment_config.alpha_sensitivity,
+                )
+                calculated_surge = required_fare_usd / base_fare_usd
+            final_surge = apply_surge_limits(calculated_surge)
+        else:
+            final_surge = self._surge_by_h3.get(candidate.h3_pickup or "", 1.0)
+            calculated_surge = final_surge
+
+        final_fare_usd = base_fare_usd * final_surge
+        return {
+            "base_fare_usd": base_fare_usd,
+            "raw_surge": raw_surge,
+            "target_matching_rate": target_matching_rate,
+            "required_fare_usd": required_fare_usd,
+            "calculated_surge": calculated_surge,
+            "final_surge": final_surge,
+            "final_fare_usd": final_fare_usd,
+            "surge_clamped": abs(calculated_surge - final_surge) > 1e-6,
+            "pricing_driver_count": pricing_driver_count,
+        }
+
     def _update_taxi_states(self, sim_time: float, sub_results: dict) -> list[dict]:
         fare_updates: list[dict] = []
         waiting_passengers = [p for p in self._passengers.values() if p.state == "waiting"]
@@ -1087,51 +1214,32 @@ class SimulationManager:
                         "dispatch_id": dispatch_id,
                         "passenger_id": candidate.id,
                         "taxi_id": veh_id,
-                        "target_p": self.experiment_config.target_p if self.experiment_config else None,
+                        "target_p": None,
+                        "target_matching_rate": None,
                         "p_actual": 1.0,
                         "base_fare_usd": candidate.expected_fare / 100.0,
                         "surge": 1.0,
-                        "surged_fare_usd": candidate.expected_fare / 100.0,
+                        "raw_surge": 1.0,
+                        "calculated_surge": 1.0,
+                        "final_surge": 1.0,
+                        "final_fare_usd": candidate.expected_fare / 100.0,
                         "required_fare_usd": None,
-                        "raw_incentive_usd": 0.0,
-                        "incentive_usd": 0.0,
-                        "capped": False,
+                        "surge_clamped": False,
+                        "pricing_driver_count": None,
                         "target_gap": 0.0,
+                        "matching_rate_error": 0.0,
                         "estimated_pickup_distance_m": route.length,
                     }
                     if candidate.h3_pickup and candidate.h3_dropoff:
                         D_pu_miles = route.length / 1609.344
-                        base_fare_usd = candidate.expected_fare / 100.0
-                        surge = self._surge_by_h3.get(candidate.h3_pickup, 1.0)
-                        fare_usd = base_fare_usd
-                        required_fare_usd = None
-                        raw_incentive_usd = 0.0
-                        incentive_usd = 0.0
-                        capped = False
-                        if self.experiment_config is not None:
-                            # 실험 모드에서는 target_p를 만족하는 운임을 역산한 뒤,
-                            # 현재 pickup cell surge 운임에 필요한 추가분만 인센티브로 지급한다.
-                            fare_usd = base_fare_usd * surge
-                            required_fare_usd = _required_fare_for_target_p(
-                                last_dropoff_cell=(
-                                    self._taxi_last_dropoff_cells.get(veh_id)
-                                    or get_cell(*self._latlng(tx, ty))
-                                ),
-                                dropoff_cell=candidate.h3_dropoff,
-                                call_datetime=SIM_BASE_DATETIME + timedelta(seconds=sim_time),
-                                target_p=self.experiment_config.target_p,
-                                D_pu=D_pu_miles,
-                                trip_distance=candidate.expected_distance_m / 1609.344,
-                                beta_f=self.experiment_config.beta_f,
-                                alpha_sensitivity=self.experiment_config.alpha_sensitivity,
-                                pickup_cell=candidate.h3_pickup,
-                            )
-                            raw_incentive_usd = required_fare_usd - fare_usd
-                            incentive_cap_usd = min(10.0, base_fare_usd)
-                            incentive_usd = min(max(raw_incentive_usd, 0.0), incentive_cap_usd)
-                            # raw_incentive_usd가 음수(이미 target_p 초과 달성)일 때는 capped로 간주하지 않음.
-                            capped = raw_incentive_usd > incentive_cap_usd
-                            fare_usd += incentive_usd
+                        pricing = self._dispatch_pricing(
+                            candidate=candidate,
+                            sim_time=sim_time,
+                            sub_results=sub_results,
+                            current_veh_id=veh_id,
+                            current_route=route,
+                        )
+                        fare_usd = pricing["final_fare_usd"]
                         trip_miles = candidate.expected_distance_m / 1609.344
                         call_dt    = SIM_BASE_DATETIME + timedelta(seconds=sim_time)
                         last_cell  = (self._taxi_last_dropoff_cells.get(veh_id)
@@ -1159,23 +1267,35 @@ class SimulationManager:
                             )
                             p = 1.0
                         accepted = _random.random() < p
+                        target_matching_rate = (
+                            pricing["target_matching_rate"]
+                            if self.experiment_config is not None else None
+                        )
                         decision_payload.update({
                             "p_actual": p,
-                            "base_fare_usd": base_fare_usd,
-                            "surge": surge,
-                            "surged_fare_usd": base_fare_usd * surge,
-                            "required_fare_usd": required_fare_usd,
-                            "raw_incentive_usd": raw_incentive_usd,
-                            "incentive_usd": incentive_usd,
-                            "capped": capped,
+                            "target_p": target_matching_rate,
+                            "target_matching_rate": target_matching_rate,
+                            "base_fare_usd": pricing["base_fare_usd"],
+                            "surge": pricing["final_surge"],
+                            "raw_surge": pricing["raw_surge"],
+                            "calculated_surge": pricing["calculated_surge"],
+                            "final_surge": pricing["final_surge"],
+                            "final_fare_usd": pricing["final_fare_usd"],
+                            "required_fare_usd": pricing["required_fare_usd"],
+                            "surge_clamped": pricing["surge_clamped"],
+                            "pricing_driver_count": pricing["pricing_driver_count"],
                             "target_gap": (
-                                self.experiment_config.target_p - p
-                                if self.experiment_config else 0.0
+                                target_matching_rate - p
+                                if target_matching_rate is not None else 0.0
+                            ),
+                            "matching_rate_error": (
+                                p - target_matching_rate
+                                if target_matching_rate is not None else 0.0
                             ),
                         })
                     if not accepted:
                         self._emit_event("dispatch_decision", {**decision_payload, "accepted": False})
-                        self._push_db_event({**dispatch_payload, "accepted": False})
+                        self._push_db_event({**dispatch_payload, **decision_payload, "accepted": False})
                         continue
 
                     dispatch_edges = list(route.edges)
@@ -1192,12 +1312,13 @@ class SimulationManager:
                     self._taxi_states[veh_id] = "dispatched"
                     self._taxi_dispatch_times[veh_id] = sim_time
                     self._taxi_dispatch_ids[veh_id] = dispatch_id
+                    self._taxi_dispatch_surge[veh_id] = decision_payload["final_surge"]
                     previous_dropoff_time = self._taxi_previous_dropoff_times.get(veh_id)
                     if previous_dropoff_time is not None:
                         # 첫 승객 전 대기시간은 정의상 제외하고, 하차 이후 다음 수락까지의 search time만 기록한다.
                         decision_payload["empty_wait_time_s"] = sim_time - previous_dropoff_time
                     self._emit_event("dispatch_decision", {**decision_payload, "accepted": True})
-                    self._push_db_event({**dispatch_payload, "accepted": True})
+                    self._push_db_event({**dispatch_payload, **decision_payload, "accepted": True})
                     break
 
             # 단계 2 — 픽업: 택시가 픽업 엣지 위에 도달했을 때 (또는 배차 타임아웃)
@@ -1215,6 +1336,7 @@ class SimulationManager:
                     del self._taxi_targets[veh_id]
                     self._taxi_states[veh_id] = "empty"
                     self._taxi_dispatch_times.pop(veh_id, None)
+                    self._taxi_dispatch_surge.pop(veh_id, None)
                     waiting_passengers.append(passenger)
                     old_dispatch_id = self._taxi_dispatch_ids.pop(veh_id, None)
                     if old_dispatch_id:
@@ -1237,12 +1359,14 @@ class SimulationManager:
                     passenger.state = "picked_up"
                     self._taxi_states[veh_id] = "occupied"
                     dispatch_time = self._taxi_dispatch_times.pop(veh_id, sim_time)
+                    dispatch_surge = self._taxi_dispatch_surge.pop(veh_id, 1.0)
                     self._active_trips[veh_id] = TripAccumulator(
                         passenger_id=passenger_id,
                         pickup_sim_time=sim_time,
                         dispatch_id=self._taxi_dispatch_ids.get(veh_id),
                         dispatch_sim_time=dispatch_time,
                         last_distance_snapshot=traci.vehicle.getDistance(veh_id),
+                        surge=dispatch_surge,
                     )
 
             # 단계 3 — 하차: 택시가 하차 엣지 위에 도달했을 때 (또는 트립 타임아웃)
@@ -1257,11 +1381,14 @@ class SimulationManager:
                 # 트립 타임아웃: 누적된 요금으로 강제 완료
                 if accum and sim_time - accum.pickup_sim_time > TRIP_TIMEOUT_S:
                     dropoff_h3 = passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
+                    meter_fare = calculate_meter_fare(accum)
                     fare = calculate_fare(accum)
                     fare_updates.append({
                         "passenger_id": passenger_id,
                         "taxi_id": veh_id,
+                        "meter_fare": meter_fare,
                         "fare": fare,
+                        "surge": accum.surge,
                         "expected_fare": passenger.expected_fare,
                         "distance_m": accum.distance_m,
                         "sim_time": sim_time,
@@ -1277,7 +1404,9 @@ class SimulationManager:
                         "dropoff_sim_time": sim_time,
                         "distance_m": accum.distance_m,
                         "low_speed_seconds": accum.low_speed_seconds,
+                        "meter_fare": meter_fare,
                         "fare": fare,
+                        "surge": accum.surge,
                         "expected_fare": passenger.expected_fare,
                         "completion": "trip_timeout",
                     })
@@ -1288,6 +1417,7 @@ class SimulationManager:
                     del self._taxi_targets[veh_id]
                     self._taxi_states[veh_id] = "empty"
                     self._taxi_dispatch_ids.pop(veh_id, None)
+                    self._taxi_dispatch_surge.pop(veh_id, None)
                     route = self._random_route_from(road_id)
                     if route:
                         traci.vehicle.setRoute(veh_id, route)
@@ -1300,11 +1430,14 @@ class SimulationManager:
                 if road_id == passenger.dropoff_edge:
                     accum = self._active_trips[veh_id]
                     dropoff_h3 = passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
+                    meter_fare = calculate_meter_fare(accum)
                     fare = calculate_fare(accum)
                     fare_updates.append({
                         "passenger_id": passenger_id,
                         "taxi_id": veh_id,
+                        "meter_fare": meter_fare,
                         "fare": fare,
+                        "surge": accum.surge,
                         "expected_fare": passenger.expected_fare,
                         "distance_m": accum.distance_m,
                         "sim_time": sim_time,
@@ -1320,7 +1453,9 @@ class SimulationManager:
                         "dropoff_sim_time": sim_time,
                         "distance_m": accum.distance_m,
                         "low_speed_seconds": accum.low_speed_seconds,
+                        "meter_fare": meter_fare,
                         "fare": fare,
+                        "surge": accum.surge,
                         "expected_fare": passenger.expected_fare,
                         "completion": "normal",
                     })
@@ -1331,6 +1466,7 @@ class SimulationManager:
                     del self._taxi_targets[veh_id]
                     self._taxi_states[veh_id] = "empty"
                     self._taxi_dispatch_ids.pop(veh_id, None)
+                    self._taxi_dispatch_surge.pop(veh_id, None)
                     route = self._random_route_from(road_id)
                     if route:
                         traci.vehicle.setRoute(veh_id, route)
@@ -1355,6 +1491,7 @@ class SimulationManager:
             self._taxi_states[veh_id] = "empty"
             self._taxi_dispatch_times.pop(veh_id, None)
             self._taxi_dispatch_ids.pop(veh_id, None)
+            self._taxi_dispatch_surge.pop(veh_id, None)
 
         return fare_updates
 
@@ -1369,11 +1506,14 @@ class SimulationManager:
                 passenger = self._passengers.pop(passenger_id, None) if passenger_id else None
                 if passenger:
                     dropoff_h3 = passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
+                    meter_fare = calculate_meter_fare(accum)
                     fare = calculate_fare(accum)
                     fare_updates.append({
                         "passenger_id": passenger_id,
                         "taxi_id": taxi_id,
+                        "meter_fare": meter_fare,
                         "fare": fare,
+                        "surge": accum.surge,
                         "expected_fare": passenger.expected_fare,
                         "distance_m": accum.distance_m,
                         "sim_time": sim_time,
@@ -1389,7 +1529,9 @@ class SimulationManager:
                         "dropoff_sim_time": sim_time,
                         "distance_m": accum.distance_m,
                         "low_speed_seconds": accum.low_speed_seconds,
+                        "meter_fare": meter_fare,
                         "fare": fare,
+                        "surge": accum.surge,
                         "expected_fare": passenger.expected_fare,
                         "completion": "sumo_removed",
                     })
@@ -1399,6 +1541,7 @@ class SimulationManager:
                 self._taxi_states.pop(taxi_id, None)
                 self._taxi_dispatch_times.pop(taxi_id, None)
                 self._taxi_dispatch_ids.pop(taxi_id, None)
+                self._taxi_dispatch_surge.pop(taxi_id, None)
                 continue
             dist = vals[tc.VAR_DISTANCE]
             delta = dist - accum.last_distance_snapshot
@@ -1663,6 +1806,8 @@ class SimulationManager:
     ) -> None:
         surge_cells = []
         surge_by_h3 = {}
+        raw_surge_by_h3 = {}
+        target_matching_rate_by_h3 = {}
         demand_for_surge: dict[str, float | int] = grid_demand
         config = self.experiment_config
         if config is not None and config.demand_source == "predicted":
@@ -1680,12 +1825,20 @@ class SimulationManager:
         )
         for cell in set(grid_supply) | set(grid_demand) | set(demand_for_surge):
             lat_c, lng_c = cell_center_latlng(cell)
+            raw_surge = compute_raw_surge(
+                grid_supply.get(cell, 0),
+                demand_for_surge.get(cell, 0),
+                elasticity=elasticity,
+            )
+            target_matching_rate = get_target_matching_rate(raw_surge)
             surge = compute_surge(
                 grid_supply.get(cell, 0),
                 demand_for_surge.get(cell, 0),
                 elasticity=elasticity,
             )
             surge_by_h3[cell] = surge
+            raw_surge_by_h3[cell] = raw_surge
+            target_matching_rate_by_h3[cell] = target_matching_rate
             actual_demand = grid_demand.get(cell, 0)
             selected_demand = demand_for_surge.get(cell, 0)
             surge_cells.append({
@@ -1694,6 +1847,8 @@ class SimulationManager:
                 "demand": selected_demand,
                 "actual_demand": actual_demand,
                 "surge": surge,
+                "raw_surge": raw_surge,
+                "target_matching_rate": target_matching_rate,
                 "center": {"lat": lat_c, "lng": lng_c},
             })
             if self.experiment_config is not None:
@@ -1703,7 +1858,11 @@ class SimulationManager:
                     "supply": grid_supply.get(cell, 0),
                     "actual_demand": actual_demand,
                     "demand_for_surge": selected_demand,
+                    "raw_surge": raw_surge,
+                    "target_matching_rate": target_matching_rate,
                     "surge": surge,
                 })
         self._surge_cells = surge_cells
         self._surge_by_h3 = surge_by_h3
+        self._raw_surge_by_h3 = raw_surge_by_h3
+        self._target_matching_rate_by_h3 = target_matching_rate_by_h3

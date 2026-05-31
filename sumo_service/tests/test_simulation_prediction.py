@@ -53,18 +53,24 @@ def test_predicted_demand_source_uses_prediction_for_surge(monkeypatch):
             "supply": 1,
             "demand": 4.0,
             "actual_demand": 1,
-            "surge": 4.0,
+            "surge": 4.9,
+            "raw_surge": pytest.approx(10.079368399158986),
+            "target_matching_rate": 0.85,
             "center": {"lat": 40.0, "lng": -73.0},
         }
     ]
-    assert manager._surge_by_h3 == {"h3_a": 4.0}
+    assert manager._surge_by_h3 == {"h3_a": 4.9}
+    assert manager._raw_surge_by_h3 == {"h3_a": pytest.approx(10.079368399158986)}
+    assert manager._target_matching_rate_by_h3 == {"h3_a": 0.85}
     assert manager._surge_diagnostics[-1] == {
         "sim_time": 0.0,
         "h3": "h3_a",
         "supply": 1,
         "actual_demand": 1,
         "demand_for_surge": 4.0,
-        "surge": 4.0,
+        "raw_surge": pytest.approx(10.079368399158986),
+        "target_matching_rate": 0.85,
+        "surge": 4.9,
     }
 
 
@@ -81,6 +87,8 @@ def test_actual_demand_source_uses_grid_demand_for_surge(monkeypatch):
             "demand": 2,
             "actual_demand": 2,
             "surge": pytest.approx(3.2),
+            "raw_surge": pytest.approx(3.174802103936399),
+            "target_matching_rate": 0.80,
             "center": {"lat": 40.0, "lng": -73.0},
         }
     ]
@@ -338,6 +346,7 @@ def test_run_experiment_resets_stale_run_state_before_loop(monkeypatch):
     manager._taxi_states = {"taxi_1": "occupied"}
     manager._taxi_dispatch_times = {"taxi_1": 12.0}
     manager._taxi_dispatch_ids = {"taxi_1": "dispatch_stale"}
+    manager._taxi_dispatch_surge = {"taxi_1": 2.0}
     manager._taxi_last_dropoff_cells = {"taxi_1": "h3_old"}
     manager._taxi_previous_dropoff_times = {"taxi_1": 30.0}
     manager._taxi_appeared = {"taxi_1"}
@@ -353,6 +362,8 @@ def test_run_experiment_resets_stale_run_state_before_loop(monkeypatch):
     manager._completed_passengers = [{"passenger_id": "p_stale"}]
     manager._surge_cells = [{"h3": "old"}]
     manager._surge_by_h3 = {"old": 2.0}
+    manager._raw_surge_by_h3 = {"old": 2.0}
+    manager._target_matching_rate_by_h3 = {"old": 0.7}
     manager._surge_diagnostics = [{"stale": True}]
     manager._event_log = [{"type": "stale"}]
 
@@ -367,6 +378,7 @@ def test_run_experiment_resets_stale_run_state_before_loop(monkeypatch):
         assert manager._taxi_states == {}
         assert manager._taxi_dispatch_times == {}
         assert manager._taxi_dispatch_ids == {}
+        assert manager._taxi_dispatch_surge == {}
         assert manager._taxi_last_dropoff_cells == {}
         assert manager._taxi_previous_dropoff_times == {}
         assert manager._taxi_appeared == set()
@@ -382,6 +394,8 @@ def test_run_experiment_resets_stale_run_state_before_loop(monkeypatch):
         assert manager._completed_passengers == []
         assert manager._surge_cells == []
         assert manager._surge_by_h3 == {}
+        assert manager._raw_surge_by_h3 == {}
+        assert manager._target_matching_rate_by_h3 == {}
         assert manager._surge_diagnostics == []
         assert manager._event_log == []
         assert manager.status == simulation.SimStatus.RUNNING
@@ -402,6 +416,8 @@ async def test_start_resets_stale_run_state_before_runtime_launch(monkeypatch):
     manager._taxi_states = {"taxi_1": "occupied"}
     manager._surge_cells = [{"h3": "old"}]
     manager._surge_by_h3 = {"old": 2.0}
+    manager._raw_surge_by_h3 = {"old": 2.0}
+    manager._target_matching_rate_by_h3 = {"old": 0.7}
     manager._surge_diagnostics = [{"stale": True}]
     manager._event_log = [{"type": "stale"}]
     stale_provider = ClosableProvider()
@@ -420,6 +436,8 @@ async def test_start_resets_stale_run_state_before_runtime_launch(monkeypatch):
             assert manager._taxi_states == {}
             assert manager._surge_cells == []
             assert manager._surge_by_h3 == {}
+            assert manager._raw_surge_by_h3 == {}
+            assert manager._target_matching_rate_by_h3 == {}
             assert manager._surge_diagnostics == []
             assert manager._event_log == []
             assert stale_provider.closed

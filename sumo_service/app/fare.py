@@ -31,14 +31,19 @@ class TripAccumulator:
     last_distance_snapshot: float = 0.0
     dispatch_id: str | None = None
     dispatch_sim_time: float = 0.0
+    surge: float = 1.0
 
 
-def calculate_fare(a: TripAccumulator) -> int:
+def calculate_meter_fare(a: TripAccumulator) -> int:
     fare = BASE_FARE
     fare += int(a.distance_m / DIST_UNIT_M) * DIST_UNIT_FARE
     fare += int(a.low_speed_seconds / TIME_UNIT_S) * TIME_UNIT_FARE
     fare += FIXED_SURCHARGES
     return fare
+
+
+def calculate_fare(a: TripAccumulator) -> int:
+    return round(calculate_meter_fare(a) * a.surge)
 
 
 def estimate_fare(distance_m: float) -> int:

@@ -130,6 +130,7 @@ def test_dispatch_timeout_reverts_passenger_to_waiting():
     mgr._taxi_states["taxi_0"] = "dispatched"
     mgr._taxi_targets["taxi_0"] = "p_0"
     mgr._taxi_dispatch_times["taxi_0"] = 0.0
+    mgr._taxi_dispatch_surge["taxi_0"] = 2.0
     sub = {"taxi_0": make_sub_entry(road_id="other_edge")}
 
     mgr._update_taxi_states(DISPATCH_TIMEOUT_S + 1, sub)
@@ -137,6 +138,7 @@ def test_dispatch_timeout_reverts_passenger_to_waiting():
     assert mgr._taxi_states["taxi_0"] == "empty"
     assert p.state == "waiting"
     assert "taxi_0" not in mgr._taxi_targets
+    assert "taxi_0" not in mgr._taxi_dispatch_surge
 
 
 def test_pickup_when_taxi_on_pickup_edge():
@@ -180,6 +182,27 @@ def test_pickup_creates_trip_accumulator():
     assert accum.passenger_id == "p_0"
     assert accum.pickup_sim_time == 100.0
     assert accum.last_distance_snapshot == 50.0
+
+
+def test_pickup_carries_dispatch_surge_into_trip_accumulator():
+    mgr = make_manager()
+    p = make_passenger(state="assigned", pickup_edge="pickup_edge")
+    mgr._passengers["p_0"] = p
+    mgr._taxi_states["taxi_0"] = "dispatched"
+    mgr._taxi_targets["taxi_0"] = "p_0"
+    mgr._taxi_dispatch_times["taxi_0"] = 0.0
+    mgr._taxi_dispatch_surge["taxi_0"] = 2.4
+    _traci_stub.simulation.findRoute = MagicMock(
+        return_value=MagicMock(edges=["pickup_edge", "dropoff_edge"])
+    )
+    _traci_stub.vehicle.setRoute = MagicMock()
+    _traci_stub.vehicle.getDistance = MagicMock(return_value=50.0)
+    sub = {"taxi_0": make_sub_entry(road_id="pickup_edge")}
+
+    mgr._update_taxi_states(100.0, sub)
+
+    assert mgr._active_trips["taxi_0"].surge == 2.4
+    assert "taxi_0" not in mgr._taxi_dispatch_surge
 
 
 # ---------------------------------------------------------------------------

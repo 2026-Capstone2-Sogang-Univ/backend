@@ -1,7 +1,7 @@
 import os
-import math
-
 import h3
+
+from .pricing import compute_limited_surge
 
 H3_RESOLUTION = int(os.getenv("H3_RESOLUTION", "9"))
 
@@ -27,21 +27,15 @@ def compute_surge(
     # min_active_surge가 1.2면 수요>공급이 발생하는 순간 1.0→1.2로 점프해 UI 상 작은 잡음을
     # 만들지 않는다. 0.1 단위 ceil도 가격 표시 안정성을 위한 정책 결정.
     min_active_surge: float = 1.2,
-    max_surge: float = 4.0,
+    max_surge: float = 4.9,
     increment: float = 0.1,
     elasticity: float = DEFAULT_ELASTICITY,
 ) -> float:
-    if supply == 0 and demand == 0:
-        return 1.0
-    if supply == 0:
-        return max_surge
-    if demand == 0:
-        return 1.0
-
-    raw_surge = (demand / supply) ** (1 / elasticity)
-    if raw_surge <= 1.0:
-        return 1.0
-
-    active_surge = max(raw_surge, min_active_surge)
-    stepped_surge = math.ceil(active_surge / increment) * increment
-    return min(round(stepped_surge, 10), max_surge)
+    return compute_limited_surge(
+        supply,
+        demand,
+        elasticity=elasticity,
+        min_active_surge=min_active_surge,
+        max_surge=max_surge,
+        increment=increment,
+    )

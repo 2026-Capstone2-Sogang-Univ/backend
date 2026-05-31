@@ -16,7 +16,6 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.driver.decision_function import pu_correction_constant
 from app.simulation import (
     ExperimentConfig,
     N_TAXIS,
@@ -29,7 +28,6 @@ from app.simulation import (
 CSV_COLUMNS = [
     "status",
     "reason",
-    "target_p",
     "elasticity",
     "beta_f",
     "seed",
@@ -49,12 +47,13 @@ CSV_COLUMNS = [
     "avg_empty_wait_time_s",
     "p50_empty_wait_time_s",
     "p95_empty_wait_time_s",
-    "incentive_cost_total_usd",
-    "capped_dispatch_attempt_rate",
-    "avg_target_gap_when_capped",
     "avg_actual_acceptance_probability",
+    "avg_target_matching_rate",
+    "avg_matching_rate_error",
+    "avg_abs_matching_rate_error",
     "avg_required_fare_usd",
-    "avg_incentive_usd",
+    "avg_final_surge",
+    "avg_final_fare_usd",
     "prediction_request_count",
     "prediction_success_count",
     "prediction_failure_count",
@@ -75,6 +74,7 @@ CSV_COLUMNS = [
     "elasticity_removed_count",
     "actual_spawned_passengers",
 ]
+PARAM_COLUMN_COUNT = 12
 
 
 def _parse_float_list(value: str | None, fallback: float | None) -> list[float]:
@@ -85,13 +85,20 @@ def _parse_float_list(value: str | None, fallback: float | None) -> list[float]:
     return [float(fallback)]
 
 
+def _parse_optional_float_list(value: str | None, fallback: float | None) -> list[float | None]:
+    if value:
+        return [float(v.strip()) for v in value.split(",") if v.strip()]
+    if fallback is None:
+        return [None]
+    return [float(fallback)]
+
+
 def _aggregate(events: list[dict], sim_duration: float) -> dict:
     # SimulationManager는 실험 중 원시 이벤트만 남기고, KPI 정의는 runner 한 곳에서 집계한다.
     # 이렇게 두면 SUMO loop는 가볍게 유지하고 지표 정의 변경도 CLI 쪽에서 좁게 처리할 수 있다.
     spawned = [e for e in events if e["type"] == "passenger_spawned"]
     decisions = [e for e in events if e["type"] == "dispatch_decision"]
     accepted = [e for e in decisions if e["accepted"]]
-    capped = [e for e in decisions if e.get("capped")]
     completed_trips = [
         e for e in events
         if e["type"] == "trip_completed" and e.get("completion") != "forced_at_end"
@@ -102,6 +109,20 @@ def _aggregate(events: list[dict], sim_duration: float) -> dict:
     predicted_values = [e["demand_for_surge"] for e in surge_diagnostics]
     demand_errors = [p - a for a, p in zip(actual_values, predicted_values)]
     surge_values = [e["surge"] for e in surge_diagnostics]
+    target_matching_rates = [
+        e["target_matching_rate"] for e in decisions
+        if e.get("target_matching_rate") is not None
+    ]
+    matching_rate_errors = [
+        e["matching_rate_error"] for e in decisions
+        if e.get("matching_rate_error") is not None
+    ]
+    final_surge_values = [
+        e["final_surge"] for e in decisions if e.get("final_surge") is not None
+    ]
+    final_fare_values = [
+        e["final_fare_usd"] for e in decisions if e.get("final_fare_usd") is not None
+    ]
     elasticity_events = [e for e in events if e["type"] == "passenger_elasticity"]
 
     spawned_count = len(spawned)
@@ -139,18 +160,21 @@ def _aggregate(events: list[dict], sim_duration: float) -> dict:
         "avg_empty_wait_time_s": mean(empty_waits) if empty_waits else None,
         "p50_empty_wait_time_s": median(empty_waits) if empty_waits else None,
         "p95_empty_wait_time_s": p95_empty_wait,
-        "incentive_cost_total_usd": sum(e.get("incentive_usd", 0.0) for e in accepted),
-        "capped_dispatch_attempt_rate": len(capped) / len(decisions) if decisions else 0.0,
-        "avg_target_gap_when_capped": (
-            mean(e.get("target_gap", 0.0) for e in capped) if capped else 0.0
-        ),
         "avg_actual_acceptance_probability": (
             mean(e.get("p_actual", 0.0) for e in decisions) if decisions else 0.0
         ),
-        "avg_required_fare_usd": _mean_present(e.get("required_fare_usd") for e in decisions),
-        "avg_incentive_usd": (
-            mean(e.get("incentive_usd", 0.0) for e in decisions) if decisions else 0.0
+        "avg_target_matching_rate": (
+            mean(target_matching_rates) if target_matching_rates else 0.0
         ),
+        "avg_matching_rate_error": (
+            mean(matching_rate_errors) if matching_rate_errors else 0.0
+        ),
+        "avg_abs_matching_rate_error": (
+            mean(abs(v) for v in matching_rate_errors) if matching_rate_errors else 0.0
+        ),
+        "avg_required_fare_usd": _mean_present(e.get("required_fare_usd") for e in decisions),
+        "avg_final_surge": mean(final_surge_values) if final_surge_values else 0.0,
+        "avg_final_fare_usd": mean(final_fare_values) if final_fare_values else 0.0,
         **diagnostics,
         "avg_actual_demand_for_surge": mean(actual_values) if actual_values else 0.0,
         "avg_predicted_demand_for_surge": mean(predicted_values) if predicted_values else 0.0,
@@ -176,26 +200,18 @@ def _mean_present(values) -> float | None:
     return mean(present) if present else None
 
 
-def _invalid_reason(target_p: float, beta_f: float, alpha_sensitivity: float) -> str | None:
+def _invalid_reason(beta_f: float | None, alpha_sensitivity: float) -> str | None:
     # 수학적으로 역산이 불가능한 조합은 SUMO를 띄우기 전에 invalid row로 남긴다.
-    c = pu_correction_constant()
-    if not math.isfinite(target_p) or target_p <= 0:
-        return "target_p must be positive and finite"
-    if target_p > 1.0:
-        return "target_p must be <= 1.0"
-    if target_p * c >= 1:
-        return "target_p * c must be < 1"
-    if not math.isfinite(beta_f) or abs(beta_f) < 1e-9:
-        return "beta_f must be finite and non-zero for inverse fare calculation"
+    if beta_f is not None and not math.isfinite(beta_f):
+        return "beta_f must be finite when provided"
     if not math.isfinite(alpha_sensitivity) or alpha_sensitivity <= 1e-9:
         return "alpha_sensitivity must be positive and finite"
     return None
 
 
 def _run_one(
-    target_p: float,
     elasticity: float,
-    beta_f: float,
+    beta_f: float | None,
     seed: int,
     sim_duration: float,
     step_length: float,
@@ -213,7 +229,6 @@ def _run_one(
         "sync" if demand_source == "predicted" and prediction_mode == "none" else prediction_mode
     )
     params = {
-        "target_p": target_p,
         "elasticity": elasticity,
         "beta_f": beta_f,
         "seed": seed,
@@ -225,13 +240,12 @@ def _run_one(
         "alpha_sensitivity": alpha_sensitivity,
         "weather_source": weather_source,
     }
-    reason = _invalid_reason(target_p, beta_f, alpha_sensitivity)
+    reason = _invalid_reason(beta_f, alpha_sensitivity)
     if reason:
         return {"status": "invalid", "reason": reason, "params": params, "metrics": None}
 
     manager = SimulationManager.fresh_experiment(
         ExperimentConfig(
-            target_p=target_p,
             elasticity=elasticity,
             beta_f=beta_f,
             seed=seed,
@@ -279,7 +293,6 @@ def _append_csv(path: Path, rows: list[dict]) -> None:
             writer.writerow({
                 "status": row["status"],
                 "reason": row["reason"],
-                "target_p": params.get("target_p"),
                 "elasticity": params.get("elasticity"),
                 "beta_f": params.get("beta_f"),
                 "seed": params.get("seed"),
@@ -290,15 +303,13 @@ def _append_csv(path: Path, rows: list[dict]) -> None:
                 "passenger_elasticity": params.get("passenger_elasticity"),
                 "alpha_sensitivity": params.get("alpha_sensitivity"),
                 "weather_source": params.get("weather_source"),
-                **{col: metrics.get(col) for col in CSV_COLUMNS[13:]},
+                **{col: metrics.get(col) for col in CSV_COLUMNS[PARAM_COLUMN_COUNT:]},
             })
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run SUMO acceptance experiment sweeps.")
-    parser.add_argument("--target-p", type=float)
-    parser.add_argument("--target-p-list")
-    parser.add_argument("--elasticity", type=float)
+    parser.add_argument("--elasticity", type=float, default=ExperimentConfig.elasticity)
     parser.add_argument("--elasticity-list")
     parser.add_argument("--beta-f", type=float)
     parser.add_argument("--beta-f-list")
@@ -324,9 +335,8 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    target_ps = _parse_float_list(args.target_p_list, args.target_p)
     elasticities = _parse_float_list(args.elasticity_list, args.elasticity)
-    beta_fs = _parse_float_list(args.beta_f_list, args.beta_f)
+    beta_fs = _parse_optional_float_list(args.beta_f_list, args.beta_f)
     alpha_sensitivities = _parse_float_list(
         args.alpha_sensitivity_list,
         args.alpha_sensitivity,
@@ -334,14 +344,12 @@ def main() -> int:
 
     # 조합별로 즉시 CSV append 한다. sweep 도중 SUMO/TraCI가 죽어도 완료된 row는 보존된다.
     rows: list[dict] = []
-    for target_p, elasticity, beta_f, alpha_sensitivity in itertools.product(
-        target_ps,
+    for elasticity, beta_f, alpha_sensitivity in itertools.product(
         elasticities,
         beta_fs,
         alpha_sensitivities,
     ):
         row = _run_one(
-            target_p,
             elasticity,
             beta_f,
             args.seed,

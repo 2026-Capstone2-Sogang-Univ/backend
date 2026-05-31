@@ -8,7 +8,7 @@ def test_surge_zero_zero():
 
 
 def test_surge_no_supply_with_demand():
-    assert compute_surge(0, 5) == 4.0
+    assert compute_surge(0, 5) == 4.9
 
 
 def test_surge_supply_no_demand():
@@ -32,7 +32,7 @@ def test_surge_less_demand_than_supply():
 
 def test_surge_capped_at_max():
     # demand=100, supply=1 -> well above max_surge
-    assert compute_surge(1, 100) == 4.0
+    assert compute_surge(1, 100) == 4.9
 
 
 def test_surge_custom_max_surge():
@@ -43,4 +43,5 @@ def test_surge_custom_max_surge():
 
 
 def test_surge_min_active_and_increment():
-    assert compute_surge(10, 11) == pytest.approx(1.2)
+    assert compute_surge(10, 11) == pytest.approx(1.0)
+    assert compute_surge(10, 12) == pytest.approx(1.4)

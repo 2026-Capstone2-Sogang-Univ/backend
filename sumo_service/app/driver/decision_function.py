@@ -50,6 +50,7 @@ _V_LOOKUP = {(r.h3_cell, int(r.dow), int(r.bin)): float(r.V_value) for r in _V_D
 _S_LOOKUP = {(r.h3_cell, int(r.dow), int(r.bin)): float(r.s_value) for r in _S_DF.itertuples()}
 _V_GLOBAL = float(_V_DF['V_value'].mean())
 _S_GLOBAL = float(_S_DF['s_value'].mean())
+_SAFE_MARGIN = 1e-3
 
 
 # 역산 실험에서는 fare만 바꿔가며 같은 비가격 효용항을 재사용한다.
@@ -166,14 +167,48 @@ def acceptance_probability(
         pickup_cell=pickup_cell,
     )
     beta = beta_f if beta_f is not None else _BETA_F
-    z = _BETA_0 + alpha_sensitivity * (
-        (features.z_without_fare - _BETA_0) + beta * fare_amount
+    real_dv = fare_amount + features.dV_without_fare
+    z = (
+        _BETA_0
+        + alpha_sensitivity * _BETA_DV * real_dv
+        + beta * fare_amount
+        + _BETA_DPU * D_pu
+        + _BETA_TPU * features.t_pu
     )
     return probability_from_z(z, _C)
 
 
 # target_p를 만족하는 최종 fare_amount를 푸는 역함수.
 # 호출부는 이 값을 최종 운임으로 쓰지 않고, 현재 surged fare 대비 추가 인센티브 산정 기준으로 사용한다.
+def required_fare_for_target_features(
+    *,
+    target_p: float,
+    dV_without_fare: float,
+    D_pu: float,
+    T_pu: float,
+    beta_f: float | None = None,
+    alpha_sensitivity: float = 1.0,
+) -> float:
+    """Return the v2 final fare amount for target P* from precomputed features."""
+    beta = beta_f if beta_f is not None else _BETA_F
+    if not isfinite(beta):
+        raise ValueError("beta_f must be finite for inverse fare calculation")
+    if not isfinite(alpha_sensitivity) or alpha_sensitivity <= 1e-9:
+        raise ValueError("alpha_sensitivity must be positive and finite for inverse fare calculation")
+    z_target = pu_corrected_logit(target_p, _C)
+    numerator = (
+        z_target
+        - _BETA_0
+        - alpha_sensitivity * _BETA_DV * dV_without_fare
+        - _BETA_DPU * D_pu
+        - _BETA_TPU * T_pu
+    )
+    denominator = alpha_sensitivity * _BETA_DV + beta
+    if abs(denominator) < _SAFE_MARGIN:
+        return float("inf")
+    return numerator / denominator
+
+
 def required_fare_for_target_p(
     last_dropoff_cell: str,
     dropoff_cell: str,
@@ -187,10 +222,8 @@ def required_fare_for_target_p(
     pickup_cell: str | None = None,  # 예약 인자: 추후 pickup-cell 기반 feature 도입 시 사용.
 ) -> float:
     beta = beta_f if beta_f is not None else _BETA_F
-    if not isfinite(beta) or abs(beta) < 1e-9:
-        raise ValueError("beta_f must be finite and non-zero for inverse fare calculation")
-    if not isfinite(alpha_sensitivity) or alpha_sensitivity <= 1e-9:
-        raise ValueError("alpha_sensitivity must be positive and finite for inverse fare calculation")
+    if not isfinite(beta):
+        raise ValueError("beta_f must be finite for inverse fare calculation")
     features = acceptance_features(
         last_dropoff_cell=last_dropoff_cell,
         dropoff_cell=dropoff_cell,
@@ -199,8 +232,14 @@ def required_fare_for_target_p(
         trip_distance=trip_distance,
         pickup_cell=pickup_cell,
     )
-    z_target = pu_corrected_logit(target_p, _C)
-    return ((z_target - _BETA_0) / alpha_sensitivity - (features.z_without_fare - _BETA_0)) / beta
+    return required_fare_for_target_features(
+        target_p=target_p,
+        dV_without_fare=features.dV_without_fare,
+        D_pu=D_pu,
+        T_pu=features.t_pu,
+        beta_f=beta,
+        alpha_sensitivity=alpha_sensitivity,
+    )
 
 
 def pu_correction_constant() -> float:

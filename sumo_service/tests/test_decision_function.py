@@ -156,7 +156,7 @@ def test_required_fare_can_return_negative_for_low_target_p():
     assert p == pytest.approx(0.01)
 
 
-def test_required_fare_scales_inversely_with_beta_f():
+def test_required_fare_changes_with_direct_fare_beta():
     # 작은 beta_f는 인센티브당 효용 기여가 작아 같은 target_p를 위해 더 큰 fare가 필요하다.
     cell = h3.latlng_to_cell(40.7580, -73.9855, 9)
     common = dict(
@@ -171,22 +171,25 @@ def test_required_fare_scales_inversely_with_beta_f():
     fare_large_beta = required_fare_for_target_p(**common, beta_f=0.01)
     fare_small_beta = required_fare_for_target_p(**common, beta_f=1e-4)
 
-    assert abs(fare_small_beta) > abs(fare_large_beta) * 10
+    assert math.isfinite(fare_large_beta)
+    assert math.isfinite(fare_small_beta)
+    assert fare_small_beta != pytest.approx(fare_large_beta)
 
 
-def test_required_fare_rejects_zero_beta():
+def test_required_fare_allows_zero_direct_fare_beta_when_total_fare_denominator_is_valid():
     cell = h3.latlng_to_cell(40.7580, -73.9855, 9)
 
-    with pytest.raises(ValueError, match="beta_f"):
-        required_fare_for_target_p(
-            last_dropoff_cell=cell,
-            dropoff_cell=cell,
-            call_datetime=datetime(2013, 7, 8, 8, 0),
-            target_p=0.8,
-            D_pu=0.3,
-            trip_distance=1.8,
-            beta_f=0.0,
-        )
+    fare = required_fare_for_target_p(
+        last_dropoff_cell=cell,
+        dropoff_cell=cell,
+        call_datetime=datetime(2013, 7, 8, 8, 0),
+        target_p=0.8,
+        D_pu=0.3,
+        trip_distance=1.8,
+        beta_f=0.0,
+    )
+
+    assert math.isfinite(fare)
 
 
 @pytest.mark.parametrize("beta_f", [math.inf, -math.inf, math.nan])

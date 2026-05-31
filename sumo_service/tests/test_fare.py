@@ -7,6 +7,7 @@ from app.fare import (
     TIME_UNIT_S,
     TripAccumulator,
     calculate_fare,
+    calculate_meter_fare,
     estimate_fare,
 )
 
@@ -58,6 +59,13 @@ def test_calculate_fare_lowspeed_only():
 def test_calculate_fare_both():
     acc = _acc(distance_m=DIST_UNIT_M, low_speed_seconds=TIME_UNIT_S)
     assert calculate_fare(acc) == BASE_FARE + DIST_UNIT_FARE + TIME_UNIT_FARE + FIXED_SURCHARGES
+
+
+def test_calculate_fare_applies_dispatch_surge():
+    acc = _acc(distance_m=DIST_UNIT_M, surge=2.0)
+    meter_fare = BASE_FARE + DIST_UNIT_FARE + FIXED_SURCHARGES
+    assert calculate_meter_fare(acc) == meter_fare
+    assert calculate_fare(acc) == round(meter_fare * 2.0)
 
 
 def test_calculate_fare_exceeds_estimate_when_lowspeed():
