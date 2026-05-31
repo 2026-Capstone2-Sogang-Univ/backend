@@ -4,6 +4,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+import os
 from statistics import mean, quantiles
 from typing import Literal
 
@@ -30,6 +31,7 @@ class PredictionDemandProvider:
     weather_provider: WeatherProvider
     prediction_horizon_min: int = 15
     fallback_policy: FallbackPolicy = "error"
+    api_key: str | None = None
     client: httpx.Client | None = None
     timeout_s: float = 10.0
     _cache: dict[datetime, DemandMap] = field(default_factory=dict, init=False)
@@ -49,6 +51,12 @@ class PredictionDemandProvider:
     _latencies_ms: list[float] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
+        if self.api_key is None:
+            self.api_key = os.getenv("PREDICTION_API_KEY")
+        if self.api_key is not None:
+            self.api_key = self.api_key.strip()
+        if not self.api_key:
+            raise ValueError("PREDICTION_API_KEY is required for Module3 prediction requests")
         self._owns_client = self.client is None
 
     def __enter__(self) -> PredictionDemandProvider:
@@ -142,6 +150,7 @@ class PredictionDemandProvider:
             response = self._http_client().post(
                 self.prediction_url,
                 json=payload,
+                headers={"X-API-Key": self.api_key},
                 timeout=self.timeout_s,
             )
             response.raise_for_status()
@@ -156,17 +165,23 @@ class PredictionDemandProvider:
         return dict(demand)
 
     def _request_payload(self, sim_datetime: datetime, target_time: datetime) -> dict[str, object]:
+        del target_time
+        request_time = floor_to_15min(sim_datetime)
         return {
-            "request_time": sim_datetime.isoformat(),
-            "target_time": target_time.isoformat(),
-            "horizon_min": self.prediction_horizon_min,
-            "history": self.history_store.records_for_prediction(sim_datetime),
-            "weather": self.weather_provider.features_at(sim_datetime),
+            "timestamp": request_time.isoformat(),
+            "weather": self.weather_provider.features_at(request_time),
+            "records": self.history_store.records_for_prediction(request_time),
         }
 
     def _parse_predictions(self, payload: object, target_time: datetime) -> DemandMap:
         if not isinstance(payload, dict) or not isinstance(payload.get("predictions"), list):
             raise ValueError("prediction response must include a predictions list")
+        response_target_time = datetime.fromisoformat(str(payload["target_time"]))
+        if response_target_time != target_time:
+            raise ValueError(
+                f"prediction response target_time {response_target_time.isoformat()} "
+                f"does not match expected {target_time.isoformat()}"
+            )
 
         model_cells = set(self.model_h3_cells)
         demand: DemandMap = {h3_cell: 0.0 for h3_cell in self.model_h3_cells}
@@ -175,10 +190,9 @@ class PredictionDemandProvider:
         for item in payload["predictions"]:
             if not isinstance(item, dict):
                 raise ValueError("prediction item must be an object")
-            item_target_time = datetime.fromisoformat(str(item["target_time"]))
             h3_cell = str(item["h3"])
-            predicted_demand = float(item["predicted_demand"])
-            if item_target_time == target_time and h3_cell in model_cells:
+            predicted_demand = float(item["predicted_demand_count"])
+            if h3_cell in model_cells:
                 demand[h3_cell] = predicted_demand
                 seen.add(h3_cell)
 
@@ -194,6 +208,9 @@ class PredictionDemandProvider:
         *,
         stale_use: bool = False,
     ) -> DemandMap:
+        # Long-running experiments may choose "last_prediction" to keep a batch
+        # alive during transient Module3 outages. The default remains fail-fast
+        # so validation runs do not silently mix predicted and fallback demand.
         with self._lock:
             last_prediction = None if self._last_prediction is None else dict(self._last_prediction)
 

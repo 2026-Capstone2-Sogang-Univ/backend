@@ -12,19 +12,26 @@ from app.prediction import PredictionDemandProvider, PredictionFallbackError
 from app.weather import StaticWeatherProvider
 
 
-def test_sync_request_payload_includes_history_and_weather():
+def test_sync_request_payload_matches_module3_contract_and_includes_api_key():
     requests: list[dict[str, object]] = []
+    headers: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request.read())
+        headers.append(request.headers.get("X-API-Key"))
         return httpx.Response(
             200,
             json={
+                "timestamp": "2013-07-08T08:15:00",
+                "target_time": "2013-07-08T08:30:00",
+                "horizon": "15min",
+                "count": 1,
                 "predictions": [
                     {
-                        "target_time": "2013-07-08T08:30:00",
                         "h3": "h3_a",
-                        "predicted_demand": 3,
+                        "predicted_demand_count": 3,
+                        "current_demand_count": 1,
+                        "current_dropoff_trip_count": 0,
                     }
                 ]
             },
@@ -39,17 +46,18 @@ def test_sync_request_payload_includes_history_and_weather():
             history_store=store,
             weather_provider=StaticWeatherProvider(temp=28.0, cat="rain"),
             client=client,
+            api_key="test-key",
         )
         demand = provider.demand_by_h3(datetime(2013, 7, 8, 8, 17))
         provider.close()
 
     assert demand == {"h3_a": 3.0}
     assert len(requests) == 1
+    assert headers == ["test-key"]
     payload = httpx.Response(200, content=requests[0]).json()
-    assert payload["request_time"] == "2013-07-08T08:17:00"
-    assert payload["target_time"] == "2013-07-08T08:30:00"
-    assert payload["horizon_min"] == 15
-    assert payload["history"][0] == {
+    assert payload["timestamp"] == "2013-07-08T08:15:00"
+    assert set(payload) == {"timestamp", "weather", "records"}
+    assert payload["records"][0] == {
         "h3": "h3_a",
         "time_bucket": "2013-07-08T08:15:00",
         "demand_count": 1,
@@ -57,6 +65,21 @@ def test_sync_request_payload_includes_history_and_weather():
     }
     assert payload["weather"]["feat_weather_temp"] == 28.0
     assert payload["weather"]["feat_weather_cat"] == "rain"
+
+
+def test_api_key_is_required_before_sending_request():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("request should not be sent without an API key")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ValueError, match="PREDICTION_API_KEY"):
+            PredictionDemandProvider(
+                prediction_url="https://prediction.test/predict",
+                model_h3_cells=["h3_a"],
+                history_store=DemandHistoryStore(model_h3_cells=["h3_a"]),
+                weather_provider=StaticWeatherProvider(),
+                client=client,
+            )
 
 
 def test_cache_avoids_duplicate_prediction_request_for_target_time():
@@ -68,11 +91,14 @@ def test_cache_avoids_duplicate_prediction_request_for_target_time():
         return httpx.Response(
             200,
             json={
+                "timestamp": "2013-07-08T08:15:00",
+                "target_time": "2013-07-08T08:30:00",
+                "horizon": "15min",
+                "count": 1,
                 "predictions": [
                     {
-                        "target_time": "2013-07-08T08:30:00",
                         "h3": "h3_a",
-                        "predicted_demand": 4,
+                        "predicted_demand_count": 4,
                     }
                 ]
             },
@@ -97,11 +123,14 @@ def test_diagnostics_do_not_wait_for_slow_prediction_http_request():
         return httpx.Response(
             200,
             json={
+                "timestamp": "2013-07-08T08:15:00",
+                "target_time": "2013-07-08T08:30:00",
+                "horizon": "15min",
+                "count": 1,
                 "predictions": [
                     {
-                        "target_time": "2013-07-08T08:30:00",
                         "h3": "h3_a",
-                        "predicted_demand": 9,
+                        "predicted_demand_count": 9,
                     }
                 ]
             },
@@ -153,16 +182,18 @@ def test_missing_h3_rate_zero_fills_absent_model_cells():
         return httpx.Response(
             200,
             json={
+                "timestamp": "2013-07-08T08:15:00",
+                "target_time": "2013-07-08T08:30:00",
+                "horizon": "15min",
+                "count": 2,
                 "predictions": [
                     {
-                        "target_time": "2013-07-08T08:30:00",
                         "h3": "h3_a",
-                        "predicted_demand": 2.5,
+                        "predicted_demand_count": 2.5,
                     },
                     {
-                        "target_time": "2013-07-08T08:30:00",
                         "h3": "unknown_h3",
-                        "predicted_demand": 99,
+                        "predicted_demand_count": 99,
                     },
                 ]
             },
@@ -181,11 +212,14 @@ def test_async_fallback_returns_actual_demand_and_counts_fallback_and_stale_use(
         return httpx.Response(
             200,
             json={
+                "timestamp": "2013-07-08T08:15:00",
+                "target_time": "2013-07-08T08:30:00",
+                "horizon": "15min",
+                "count": 1,
                 "predictions": [
                     {
-                        "target_time": "2013-07-08T08:30:00",
                         "h3": "h3_a",
-                        "predicted_demand": 8,
+                        "predicted_demand_count": 8,
                     }
                 ]
             },
@@ -229,11 +263,14 @@ def test_async_background_request_eventually_caches_prediction_and_success():
         return httpx.Response(
             200,
             json={
+                "timestamp": "2013-07-08T08:15:00",
+                "target_time": "2013-07-08T08:30:00",
+                "horizon": "15min",
+                "count": 1,
                 "predictions": [
                     {
-                        "target_time": "2013-07-08T08:30:00",
                         "h3": "h3_a",
-                        "predicted_demand": 8,
+                        "predicted_demand_count": 8,
                     }
                 ]
             },
@@ -274,6 +311,7 @@ def _provider(
             weather_provider=StaticWeatherProvider(),
             fallback_policy=fallback_policy,
             client=client,
+            api_key="test-key",
         )
         try:
             yield provider
@@ -302,6 +340,7 @@ def test_async_mode_uses_actual_fallback_while_background_request_runs():
         weather_provider=StaticWeatherProvider(),
         client=client,
         fallback_policy="last_prediction",
+        api_key="test-key",
     )
 
     demand = provider.demand_by_h3(
@@ -314,4 +353,3 @@ def test_async_mode_uses_actual_fallback_while_background_request_runs():
     assert provider.diagnostics()["prediction_fallback_count"] == 1
     assert provider.diagnostics()["prediction_stale_use_count"] == 1
     provider.close()
-
