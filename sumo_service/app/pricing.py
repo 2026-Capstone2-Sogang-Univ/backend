@@ -6,6 +6,12 @@ DEFAULT_EPSILON = -0.6
 DEFAULT_SURGE_MIN = 1.2
 DEFAULT_SURGE_MAX = 4.9
 DEFAULT_SURGE_STEP = 0.1
+RAW_SURGE_BUCKETS: tuple[tuple[str, float, float | None, float], ...] = (
+    ("raw_lt_1_5", float("-inf"), 1.5, 0.55),
+    ("raw_lt_2_5", 1.5, 2.5, 0.70),
+    ("raw_lt_3_5", 2.5, 3.5, 0.80),
+    ("raw_gte_3_5", 3.5, None, 0.85),
+)
 
 
 def compute_raw_surge(
@@ -62,12 +68,14 @@ def compute_limited_surge(
     )
 
 
+def raw_surge_bucket(raw_surge: float) -> str:
+    for bucket, lower, upper, _ in RAW_SURGE_BUCKETS:
+        if raw_surge >= lower and (upper is None or raw_surge < upper):
+            return bucket
+    return RAW_SURGE_BUCKETS[-1][0]
+
+
 def get_target_matching_rate(raw_surge: float) -> float:
     """Return the v2 target matching rate P* from raw surge bands."""
-    if raw_surge < 1.5:
-        return 0.55
-    if raw_surge < 2.5:
-        return 0.70
-    if raw_surge < 3.5:
-        return 0.80
-    return 0.85
+    bucket = raw_surge_bucket(raw_surge)
+    return next(target for key, _, _, target in RAW_SURGE_BUCKETS if key == bucket)

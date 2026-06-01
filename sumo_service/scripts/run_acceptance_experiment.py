@@ -19,10 +19,12 @@ if str(ROOT) not in sys.path:
 from app.simulation import (
     ExperimentConfig,
     N_TAXIS,
+    PARQUET_REPLAY_STAT_KEYS,
     SIM_DURATION,
     STEP_LENGTH,
     SimulationManager,
 )
+from app.pricing import RAW_SURGE_BUCKETS, raw_surge_bucket
 
 # CSV는 sweep을 여러 번 이어 붙일 수 있도록 JSON 결과의 params/metrics를 평탄화한 고정 컬럼을 쓴다.
 CSV_COLUMNS = [
@@ -124,6 +126,9 @@ def _aggregate(events: list[dict], sim_duration: float) -> dict:
         e["final_fare_usd"] for e in decisions if e.get("final_fare_usd") is not None
     ]
     elasticity_events = [e for e in events if e["type"] == "passenger_elasticity"]
+    parquet_replay = _latest_parquet_replay(events)
+    matching_by_raw_bucket = _aggregate_by_raw_bucket(decisions)
+    cells_by_raw_bucket = _aggregate_cells_by_raw_bucket(surge_diagnostics, decisions)
 
     spawned_count = len(spawned)
     matched_passengers = {e["passenger_id"] for e in accepted}
@@ -184,6 +189,21 @@ def _aggregate(events: list[dict], sim_duration: float) -> dict:
         "raw_spawn_candidate_count": sum(e["raw_spawn_candidate_count"] for e in elasticity_events),
         "elasticity_removed_count": sum(e["elasticity_removed_count"] for e in elasticity_events),
         "actual_spawned_passengers": sum(e["actual_spawned_passengers"] for e in elasticity_events) if elasticity_events else spawned_count,
+        "parquet_replay": parquet_replay,
+        "matching": {
+            "target_rate": mean(target_matching_rates) if target_matching_rates else 0.0,
+            "actual_rate": len(accepted) / len(decisions) if decisions else 0.0,
+            "matching_rate_error": (
+                (len(accepted) / len(decisions) if decisions else 0.0) - mean(target_matching_rates)
+                if target_matching_rates else (len(accepted) / len(decisions) if decisions else 0.0)
+            ),
+            "request_count": len(decisions),
+            "matched_count": len(accepted),
+            "by_raw_bucket": matching_by_raw_bucket,
+        },
+        "cells": {
+            "by_raw_bucket": cells_by_raw_bucket,
+        },
     }
 
 
@@ -193,6 +213,134 @@ def _latest_diagnostics(events: list[dict]) -> dict:
         if event["type"] == "diagnostics":
             diagnostics.update({k: v for k, v in event.items() if k != "type"})
     return diagnostics
+
+
+def _aggregate_by_raw_bucket(decisions: list[dict]) -> list[dict]:
+    states = {
+        bucket: {
+            "request_count": 0,
+            "matched_count": 0,
+            "target_sum": 0.0,
+            "target_count": 0,
+            "wait_seconds": [],
+        }
+        for bucket, _, _, _ in RAW_SURGE_BUCKETS
+    }
+    defaults = {bucket: target for bucket, _, _, target in RAW_SURGE_BUCKETS}
+
+    for decision in decisions:
+        bucket = decision.get("bucket")
+        if bucket not in states:
+            bucket = raw_surge_bucket(float(decision.get("raw_surge", 1.0) or 1.0))
+        state = states[bucket]
+        state["request_count"] += 1
+        if decision.get("accepted"):
+            state["matched_count"] += 1
+        if decision.get("target_matching_rate") is not None:
+            state["target_sum"] += float(decision["target_matching_rate"])
+            state["target_count"] += 1
+        if decision.get("empty_wait_time_s") is not None:
+            state["wait_seconds"].append(float(decision["empty_wait_time_s"]))
+
+    rows = []
+    for bucket, _, _, _ in RAW_SURGE_BUCKETS:
+        state = states[bucket]
+        request_count = int(state["request_count"])
+        matched_count = int(state["matched_count"])
+        target_rate = (
+            state["target_sum"] / state["target_count"]
+            if state["target_count"] else defaults[bucket]
+        )
+        actual_rate = matched_count / request_count if request_count else 0.0
+        waits = state["wait_seconds"]
+        rows.append({
+            "bucket": bucket,
+            "target_rate": target_rate,
+            "actual_rate": actual_rate,
+            "matching_rate_error": actual_rate - target_rate,
+            "request_count": request_count,
+            "matched_count": matched_count,
+            "average_wait_seconds": mean(waits) if waits else 0.0,
+            "p95_wait_seconds": _percentile(waits, 95.0) if waits else 0.0,
+            "marginal_utility_points": [],
+        })
+    return rows
+
+
+def _aggregate_cells_by_raw_bucket(surge_diagnostics: list[dict], decisions: list[dict]) -> list[dict]:
+    states = {
+        bucket: {
+            "cells": set(),
+            "supply_sum": 0.0,
+            "demand_sum": 0.0,
+            "raw_surge_sum": 0.0,
+            "observation_count": 0,
+            "dispatch_request_count": 0,
+        }
+        for bucket, _, _, _ in RAW_SURGE_BUCKETS
+    }
+
+    for decision in decisions:
+        bucket = decision.get("bucket")
+        if bucket not in states:
+            bucket = raw_surge_bucket(float(decision.get("raw_surge", 1.0) or 1.0))
+        states[bucket]["dispatch_request_count"] += 1
+
+    for row in surge_diagnostics:
+        raw_surge = float(row.get("raw_surge", row.get("surge", 1.0)) or 1.0)
+        bucket = row.get("bucket")
+        if bucket not in states:
+            bucket = raw_surge_bucket(raw_surge)
+        state = states[bucket]
+        h3_cell = row.get("h3")
+        if h3_cell:
+            state["cells"].add(str(h3_cell))
+        state["supply_sum"] += float(row.get("supply", 0.0) or 0.0)
+        state["demand_sum"] += float(row.get("demand_for_surge", row.get("demand", 0.0)) or 0.0)
+        state["raw_surge_sum"] += raw_surge
+        state["observation_count"] += 1
+
+    rows = []
+    for bucket, _, _, _ in RAW_SURGE_BUCKETS:
+        state = states[bucket]
+        observations = int(state["observation_count"])
+        cells = sorted(state["cells"])
+        rows.append({
+            "bucket": bucket,
+            "unique_cell_count": len(cells),
+            "avg_raw_surge": state["raw_surge_sum"] / observations if observations else 0.0,
+            "avg_supply": state["supply_sum"] / observations if observations else 0.0,
+            "avg_demand": state["demand_sum"] / observations if observations else 0.0,
+            "dispatch_request_count": int(state["dispatch_request_count"]),
+            "sample_h3_cells": cells[:10],
+        })
+    return rows
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * percentile / 100.0
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return ordered[int(rank)]
+    weight = rank - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _latest_parquet_replay(events: list[dict]) -> dict:
+    replay = {key: 0 for key in PARQUET_REPLAY_STAT_KEYS}
+    for event in events:
+        if event["type"] == "parquet_replay":
+            replay.update({
+                key: int(event.get(key, 0))
+                for key in PARQUET_REPLAY_STAT_KEYS
+            })
+    return replay
 
 
 def _mean_present(values) -> float | None:

@@ -7,6 +7,7 @@ from traci import constants as tc
 import app.simulation as simulation
 from app.fare import TripAccumulator
 from app.passenger import Passenger
+from app.pricing import raw_surge_bucket
 from app.simulation import ExperimentConfig, SIM_BASE_DATETIME, SimulationManager
 
 
@@ -50,6 +51,7 @@ def test_predicted_demand_source_uses_prediction_for_surge(monkeypatch):
     assert manager._surge_cells == [
         {
             "h3": "h3_a",
+            "bucket": "raw_gte_3_5",
             "supply": 1,
             "demand": 4.0,
             "actual_demand": 1,
@@ -65,6 +67,7 @@ def test_predicted_demand_source_uses_prediction_for_surge(monkeypatch):
     assert manager._surge_diagnostics[-1] == {
         "sim_time": 0.0,
         "h3": "h3_a",
+        "bucket": "raw_gte_3_5",
         "supply": 1,
         "actual_demand": 1,
         "demand_for_surge": 4.0,
@@ -83,6 +86,7 @@ def test_actual_demand_source_uses_grid_demand_for_surge(monkeypatch):
     assert manager._surge_cells == [
         {
             "h3": "h3_a",
+            "bucket": "raw_lt_3_5",
             "supply": 1,
             "demand": 2,
             "actual_demand": 2,
@@ -93,6 +97,22 @@ def test_actual_demand_source_uses_grid_demand_for_surge(monkeypatch):
         }
     ]
     assert manager._surge_by_h3 == {"h3_a": pytest.approx(3.2)}
+    cells = {
+        row["bucket"]: row
+        for row in manager.get_kpi_summary()["cells"]["by_raw_bucket"]
+    }
+    assert cells["raw_lt_3_5"]["unique_cell_count"] == 1
+    assert cells["raw_lt_3_5"]["avg_supply"] == 1.0
+    assert cells["raw_lt_3_5"]["avg_demand"] == 2.0
+    assert cells["raw_lt_3_5"]["avg_raw_surge"] == pytest.approx(3.174802103936399)
+    assert cells["raw_lt_3_5"]["sample_h3_cells"] == ["h3_a"]
+
+
+def test_raw_surge_bucket_boundaries():
+    assert raw_surge_bucket(1.4999) == "raw_lt_1_5"
+    assert raw_surge_bucket(1.5) == "raw_lt_2_5"
+    assert raw_surge_bucket(2.5) == "raw_lt_3_5"
+    assert raw_surge_bucket(3.5) == "raw_gte_3_5"
 
 
 def test_runtime_surge_does_not_append_experiment_diagnostics(monkeypatch):
@@ -102,6 +122,72 @@ def test_runtime_surge_does_not_append_experiment_diagnostics(monkeypatch):
     manager._build_surge_cells({"h3_a": 1}, {"h3_a": 2}, 0.0)
 
     assert manager._surge_diagnostics == []
+
+
+def test_experiment_pricing_uses_current_taxi_features(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(
+        simulation,
+        "_acceptance_features",
+        lambda **kwargs: SimpleNamespace(
+            dV_without_fare=7.5,
+            t_pu=kwargs["D_pu"] * 5.0,
+        ),
+    )
+
+    def fake_required_fare_for_target_features(**kwargs):
+        captured.update(kwargs)
+        return 30.0
+
+    monkeypatch.setattr(
+        simulation,
+        "_required_fare_for_target_features",
+        fake_required_fare_for_target_features,
+    )
+
+    manager = SimulationManager(ExperimentConfig())
+    manager._latlng = lambda x, y: (40.0, -73.0)
+    manager._taxi_last_dropoff_cells = {"taxi_current": "h3_last"}
+    manager._raw_surge_by_h3 = {"h3_pickup": 3.0}
+    candidate = Passenger(
+        id="p_0",
+        x=0.0,
+        y=0.0,
+        lat=40.0,
+        lng=-73.0,
+        pickup_edge="pickup_edge",
+        dropoff_edge="dropoff_edge",
+        dropoff_x=1.0,
+        dropoff_y=1.0,
+        dropoff_lat=40.1,
+        dropoff_lng=-73.1,
+        expected_distance_m=1609.344,
+        expected_fare=1000,
+        spawn_time=0.0,
+        state="waiting",
+        h3_pickup="h3_pickup",
+        h3_dropoff="h3_dropoff",
+    )
+
+    result = manager._dispatch_pricing(
+        candidate=candidate,
+        sim_time=0.0,
+        sub_results={
+            "taxi_current": {tc.VAR_POSITION: (0.0, 0.0)},
+            "taxi_other": {tc.VAR_POSITION: (999.0, 999.0)},
+        },
+        current_veh_id="taxi_current",
+        current_route=SimpleNamespace(edges=("edge_a",), length=3218.688),
+    )
+
+    assert captured["dV_without_fare"] == 7.5
+    assert captured["D_pu"] == pytest.approx(2.0)
+    assert captured["T_pu"] == pytest.approx(10.0)
+    assert result["required_fare_usd"] == 30.0
+    assert result["calculated_surge"] == pytest.approx(3.0)
+    assert result["final_surge"] == pytest.approx(3.0)
+    assert result["pricing_driver_count"] == 1
 
 
 class FakeHistoryStore:
@@ -469,9 +555,9 @@ def test_status_summary_contains_runtime_counts():
     assert summary["status"] == simulation.SimStatus.RUNNING
     assert summary["sim_time"] == 42.5
     assert summary["vehicle_count"] == 3
-    assert summary["taxi_count"] == 3
+    assert summary["taxi_count"] == 2
     assert summary["empty_taxi_count"] == 1
-    assert summary["dispatched_taxi_count"] == 1
+    assert summary["dispatched_taxi_count"] == 0
     assert summary["occupied_taxi_count"] == 1
     assert summary["waiting_passenger_count"] == 1
     assert summary["assigned_passenger_count"] == 1

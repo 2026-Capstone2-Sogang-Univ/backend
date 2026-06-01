@@ -12,6 +12,9 @@ def test_aggregate_includes_prediction_history_and_demand_diagnostics():
             "passenger_id": "p1",
             "accepted": True,
             "p_actual": 0.8,
+            "raw_surge": 1.8,
+            "bucket": "raw_lt_2_5",
+            "pickup_h3": "892830828cbffff",
             "target_matching_rate": 0.7,
             "matching_rate_error": 0.1,
             "final_surge": 1.8,
@@ -24,9 +27,18 @@ def test_aggregate_includes_prediction_history_and_demand_diagnostics():
         },
         {
             "type": "surge_diagnostic",
+            "h3": "892830828cbffff",
+            "bucket": "raw_lt_2_5",
             "actual_demand": 2.0,
             "demand_for_surge": 3.0,
+            "raw_surge": 1.8,
             "surge": 1.2,
+        },
+        {
+            "type": "parquet_replay",
+            "scheduled_due_count": 3,
+            "spawned_count": 2,
+            "skipped_pickup": 1,
         },
     ]
 
@@ -44,6 +56,21 @@ def test_aggregate_includes_prediction_history_and_demand_diagnostics():
     assert metrics["avg_abs_matching_rate_error"] == 0.1
     assert metrics["avg_final_surge"] == 1.8
     assert metrics["avg_final_fare_usd"] == 18.0
+    assert metrics["parquet_replay"]["scheduled_due_count"] == 3
+    assert metrics["parquet_replay"]["spawned_count"] == 2
+    assert metrics["parquet_replay"]["skipped_pickup"] == 1
+    assert metrics["parquet_replay"]["route_failed"] == 0
+    assert metrics["matching"]["request_count"] == 1
+    assert metrics["matching"]["matched_count"] == 1
+    assert metrics["matching"]["by_raw_bucket"][1]["bucket"] == "raw_lt_2_5"
+    assert metrics["matching"]["by_raw_bucket"][1]["request_count"] == 1
+    assert metrics["matching"]["by_raw_bucket"][1]["actual_rate"] == 1.0
+    assert metrics["cells"]["by_raw_bucket"][1]["bucket"] == "raw_lt_2_5"
+    assert metrics["cells"]["by_raw_bucket"][1]["unique_cell_count"] == 1
+    assert metrics["cells"]["by_raw_bucket"][1]["avg_supply"] == 0.0
+    assert metrics["cells"]["by_raw_bucket"][1]["avg_demand"] == 3.0
+    assert metrics["cells"]["by_raw_bucket"][1]["avg_raw_surge"] == 1.8
+    assert metrics["cells"]["by_raw_bucket"][1]["dispatch_request_count"] == 1
 
 
 def test_append_csv_writes_new_columns_without_keyerror_for_sparse_rows(tmp_path):

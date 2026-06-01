@@ -174,6 +174,8 @@ def test_parquet_spawn_when_time_reached():
         mgr._spawn_passengers(100.0)
     assert len(mgr._passengers) == 1
     assert mgr._trip_queue[0]["sim_time"] == 120.0
+    assert mgr._parquet_replay_stats["scheduled_due_count"] == 1
+    assert mgr._parquet_replay_stats["spawned_count"] == 1
 
 
 def test_parquet_no_spawn_before_time():
@@ -183,6 +185,7 @@ def test_parquet_no_spawn_before_time():
         mgr._spawn_passengers(100.0)
     assert len(mgr._passengers) == 0
     assert len(mgr._trip_queue) == 1
+    assert mgr._parquet_replay_stats["scheduled_due_count"] == 0
 
 
 def test_parquet_skips_pickup_outside_scc():
@@ -199,6 +202,8 @@ def test_parquet_skips_pickup_outside_scc():
     with patch("app.simulation.PASSENGER_SOURCE", "parquet"):
         mgr._spawn_passengers(100.0)
     assert len(mgr._passengers) == 0
+    assert mgr._parquet_replay_stats["scheduled_due_count"] == 1
+    assert mgr._parquet_replay_stats["skipped_pickup"] == 1
 
 
 def test_parquet_skips_dropoff_outside_scc():
@@ -215,6 +220,8 @@ def test_parquet_skips_dropoff_outside_scc():
     with patch("app.simulation.PASSENGER_SOURCE", "parquet"):
         mgr._spawn_passengers(100.0)
     assert len(mgr._passengers) == 0
+    assert mgr._parquet_replay_stats["scheduled_due_count"] == 1
+    assert mgr._parquet_replay_stats["skipped_dropoff"] == 1
 
 
 def test_parquet_outside_scc_trip_consumed_from_queue():
@@ -235,6 +242,24 @@ def test_parquet_outside_scc_trip_consumed_from_queue():
     # 외부 trip은 스킵되지만 큐에서 빠지고, 내부 trip 1개만 스폰
     assert len(mgr._passengers) == 1
     assert len(mgr._trip_queue) == 0
+    assert mgr._parquet_replay_stats["scheduled_due_count"] == 2
+    assert mgr._parquet_replay_stats["skipped_pickup"] == 1
+    assert mgr._parquet_replay_stats["spawned_count"] == 1
+
+
+def test_parquet_counts_route_failure():
+    mgr = make_manager()
+    mgr._trip_queue = [_make_trip(50.0)]
+    _traci_stub.simulation.findRoute.side_effect = _traci_stub.exceptions.TraCIException("route failed")
+    try:
+        with patch("app.simulation.PASSENGER_SOURCE", "parquet"):
+            mgr._spawn_passengers(100.0)
+    finally:
+        _traci_stub.simulation.findRoute.side_effect = None
+
+    assert len(mgr._passengers) == 0
+    assert mgr._parquet_replay_stats["scheduled_due_count"] == 1
+    assert mgr._parquet_replay_stats["route_failed"] == 1
 
 
 def test_passenger_elasticity_zero_keeps_raw_spawn_count():
@@ -268,4 +293,3 @@ def test_negative_passenger_elasticity_removes_spawn_candidates():
     assert mgr._event_log[-1]["type"] == "passenger_elasticity"
     assert mgr._event_log[-1]["raw_spawn_candidate_count"] == 10
     assert mgr._event_log[-1]["actual_spawned_passengers"] == 4
-

@@ -59,7 +59,7 @@ from .fare import (
 from .grid import DEFAULT_ELASTICITY, H3_RESOLUTION, cell_center_latlng, compute_surge, get_cell
 from .h3_cells import load_model_h3_cells
 from .passenger import Passenger
-from .pricing import apply_surge_limits, compute_raw_surge
+from .pricing import RAW_SURGE_BUCKETS, apply_surge_limits, compute_raw_surge, raw_surge_bucket
 from .prediction import PredictionDemandProvider
 from .weather import StaticWeatherProvider
 
@@ -90,7 +90,7 @@ STEP_LENGTH = (
 REAL_STEP_SLEEP = 1.0 / FRAME_RATE  # real seconds between TraCI steps
 
 N_TAXIS = int(os.getenv("N_TAXIS", "300"))
-N_BACKGROUND_CARS = 1200
+N_BACKGROUND_CARS = int(os.getenv("N_BACKGROUND_CARS", "1200"))
 
 PASSENGER_SPAWN_INTERVAL = 300.0
 PASSENGER_LAMBDA = int(os.getenv("PASSENGER_LAMBDA", "5"))
@@ -108,12 +108,6 @@ PASSENGER_SOURCE = os.getenv("PASSENGER_SOURCE", "random")
 TRIPS_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "trips_processed.json"
 SCC_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "routable_scc.json"
 
-RAW_SURGE_BUCKETS: tuple[tuple[str, float, float | None, float], ...] = (
-    ("raw_lt_1_5", float("-inf"), 1.5, 0.55),
-    ("raw_lt_2_5", 1.5, 2.5, 0.70),
-    ("raw_lt_3_5", 2.5, 3.5, 0.80),
-    ("raw_gte_3_5", 3.5, None, 0.85),
-)
 DEFAULT_TARGET_MATCHING_RATES = {
     bucket: target for bucket, _, _, target in RAW_SURGE_BUCKETS
 }
@@ -123,6 +117,16 @@ DEFAULT_PRICING_POLICY = {
     "surge_max": 4.9,
     "alpha_sensitivity": 1.0,
 }
+PARQUET_REPLAY_STAT_KEYS = (
+    "scheduled_due_count",
+    "spawned_count",
+    "skipped_pickup",
+    "skipped_dropoff",
+    "route_failed",
+    "missing_pickup_midpoint",
+    "missing_dropoff_midpoint",
+    "other_skipped",
+)
 
 # Manhattan 핫스팟: (lat, lng, importance). 하차 후 택시 목적지 가중치에 사용.
 HOTSPOTS: list[tuple[float, float, float]] = [
@@ -280,10 +284,17 @@ class KpiBucketState:
     request_count: int = 0
     matched_count: int = 0
     wait_seconds: list[float] | None = None
+    unique_h3_cells: set[str] | None = None
+    supply_sum: float = 0.0
+    demand_sum: float = 0.0
+    raw_surge_sum: float = 0.0
+    cell_observation_count: int = 0
 
     def __post_init__(self) -> None:
         if self.wait_seconds is None:
             self.wait_seconds = []
+        if self.unique_h3_cells is None:
+            self.unique_h3_cells = set()
 
 
 @dataclass
@@ -333,6 +344,7 @@ class SimulationManager:
         self._completed_passengers: list[dict] = []
         self._completed_trip_count: int = 0
         self._trip_queue: list[dict] = []
+        self._parquet_replay_stats: dict[str, int] = self._new_parquet_replay_stats()
         self._latlng: Callable[[float, float], tuple[float, float]] | None = None
         # veh_id → 현재 할당된 경로의 엣지 수. route_index와 비교해 끝에 근접했는지 판정.
         self._bg_route_len: dict[str, int] = {}
@@ -477,6 +489,10 @@ class SimulationManager:
             }
         )
 
+    @staticmethod
+    def _new_parquet_replay_stats() -> dict[str, int]:
+        return {key: 0 for key in PARQUET_REPLAY_STAT_KEYS}
+
     def _apply_start_options(self, options: SimulationStartOptions | None) -> None:
         if options is None:
             return
@@ -519,7 +535,6 @@ class SimulationManager:
             state = dict(self._state)
             vehicles = list(state.get("vehicles", []))
             passengers = list(state.get("passengers", []))
-            taxi_states = dict(self._taxi_states)
             waiting_passenger_count = sum(
                 1 for passenger in self._passengers.values() if passenger.state == "waiting"
             )
@@ -527,22 +542,14 @@ class SimulationManager:
                 1 for passenger in self._passengers.values() if passenger.state == "assigned"
             )
 
-            if taxi_states:
-                taxi_count = len(taxi_states)
-                empty_taxi_count = sum(1 for state_value in taxi_states.values() if state_value == "empty")
-                dispatched_taxi_count = sum(
-                    1 for state_value in taxi_states.values() if state_value == "dispatched"
-                )
-                occupied_taxi_count = sum(1 for state_value in taxi_states.values() if state_value == "occupied")
-            else:
-                taxi_vehicles = [
-                    vehicle for vehicle in vehicles
-                    if self._is_taxi_id(str(vehicle.get("id", "")))
-                ]
-                taxi_count = len(taxi_vehicles)
-                empty_taxi_count = sum(1 for vehicle in taxi_vehicles if vehicle.get("state") == "empty")
-                dispatched_taxi_count = sum(1 for vehicle in taxi_vehicles if vehicle.get("state") == "dispatched")
-                occupied_taxi_count = sum(1 for vehicle in taxi_vehicles if vehicle.get("state") == "occupied")
+            taxi_vehicles = [
+                vehicle for vehicle in vehicles
+                if self._is_taxi_id(str(vehicle.get("id", "")))
+            ]
+            taxi_count = len(taxi_vehicles)
+            empty_taxi_count = sum(1 for vehicle in taxi_vehicles if vehicle.get("state") == "empty")
+            dispatched_taxi_count = sum(1 for vehicle in taxi_vehicles if vehicle.get("state") == "dispatched")
+            occupied_taxi_count = sum(1 for vehicle in taxi_vehicles if vehicle.get("state") == "occupied")
 
             return {
                 "status": self.status,
@@ -613,6 +620,8 @@ class SimulationManager:
             average_empty_wait = sum(empty_waits) / len(empty_waits) if empty_waits else 0.0
             completed_count = self._runtime_kpi.completed_trip_count
             total_fare = self._runtime_kpi.total_fare_cents
+            parquet_replay = dict(self._parquet_replay_stats)
+            cell_bucket_payloads = self._cell_bucket_payloads()
 
             return {
                 "sim_time": sim_time,
@@ -647,6 +656,10 @@ class SimulationManager:
                     "p95_wait_seconds": p95_wait,
                     "marginal_utility_points": [],
                 },
+                "cells": {
+                    "by_raw_bucket": cell_bucket_payloads,
+                },
+                "parquet_replay": parquet_replay,
             }
 
     def get_boundary(self) -> dict:
@@ -808,6 +821,7 @@ class SimulationManager:
             self._completed_passengers = []
             self._completed_trip_count = 0
             self._trip_queue = []
+            self._parquet_replay_stats = self._new_parquet_replay_stats()
             self._latlng = None
             self._bg_route_len = {}
             self._taxi_route_len = {}
@@ -1173,6 +1187,8 @@ class SimulationManager:
             diagnostics.update(self._history_store.diagnostics())
         if diagnostics:
             self._emit_event("diagnostics", diagnostics)
+        if self._passenger_source() == "parquet":
+            self._emit_event("parquet_replay", dict(self._parquet_replay_stats))
         for row in self._surge_diagnostics:
             self._emit_event("surge_diagnostic", row)
 
@@ -1206,10 +1222,7 @@ class SimulationManager:
 
     @staticmethod
     def _raw_surge_bucket(raw_surge: float) -> str:
-        for bucket, lower, upper, _ in RAW_SURGE_BUCKETS:
-            if raw_surge >= lower and (upper is None or raw_surge < upper):
-                return bucket
-        return RAW_SURGE_BUCKETS[-1][0]
+        return raw_surge_bucket(raw_surge)
 
     def _target_matching_rate(self, raw_surge: float) -> float:
         return self._target_matching_rates[self._raw_surge_bucket(raw_surge)]
@@ -1241,6 +1254,39 @@ class SimulationManager:
         empty_wait = decision_payload.get("empty_wait_time_s")
         if empty_wait is not None:
             self._runtime_kpi.empty_wait_seconds.append(float(empty_wait))
+
+    def _record_cell_bucket_kpi(
+        self,
+        *,
+        bucket_key: str,
+        h3_cell: str,
+        supply: float | int,
+        demand: float | int,
+        raw_surge: float,
+    ) -> None:
+        bucket = self._runtime_kpi.buckets[bucket_key]
+        bucket.unique_h3_cells.add(h3_cell)
+        bucket.supply_sum += float(supply)
+        bucket.demand_sum += float(demand)
+        bucket.raw_surge_sum += float(raw_surge)
+        bucket.cell_observation_count += 1
+
+    def _cell_bucket_payloads(self) -> list[dict]:
+        payloads = []
+        for bucket_key, _, _, _ in RAW_SURGE_BUCKETS:
+            bucket = self._runtime_kpi.buckets[bucket_key]
+            observations = bucket.cell_observation_count
+            cells = sorted(bucket.unique_h3_cells or set())
+            payloads.append({
+                "bucket": bucket_key,
+                "unique_cell_count": len(cells),
+                "avg_raw_surge": bucket.raw_surge_sum / observations if observations else 0.0,
+                "avg_supply": bucket.supply_sum / observations if observations else 0.0,
+                "avg_demand": bucket.demand_sum / observations if observations else 0.0,
+                "dispatch_request_count": bucket.request_count,
+                "sample_h3_cells": cells[:10],
+            })
+        return payloads
 
     def _record_passenger_boarded_kpi(self, passenger: Passenger, sim_time: float) -> None:
         bucket_key = self._passenger_dispatch_buckets.get(passenger.id)
@@ -1314,6 +1360,7 @@ class SimulationManager:
         if self._passenger_source() == "parquet":
             while self._trip_queue and self._trip_queue[0]["sim_time"] <= sim_time:
                 trip = self._trip_queue.pop(0)
+                self._parquet_replay_stats["scheduled_due_count"] += 1
                 self._create_passenger_from_trip(trip, sim_time)
         else:
             interval = int(sim_time / PASSENGER_SPAWN_INTERVAL)
@@ -1412,22 +1459,29 @@ class SimulationManager:
         pickup_edge = trip["pickup_edge"]
         dropoff_edge = trip["dropoff_edge"]
         # SCC 외부 엣지면 스킵: 픽업이 외부면 배차 불가, 하차가 외부면 택시 갇힘
-        if pickup_edge not in self._routable_edges_set or \
-           dropoff_edge not in self._routable_edges_set:
+        if pickup_edge not in self._routable_edges_set:
+            self._parquet_replay_stats["skipped_pickup"] += 1
+            return
+        if dropoff_edge not in self._routable_edges_set:
+            self._parquet_replay_stats["skipped_dropoff"] += 1
             return
         traci_mod = _traci_module()
         try:
             route = traci_mod.simulation.findRoute(pickup_edge, dropoff_edge)
         except traci_mod.exceptions.TraCIException:
+            self._parquet_replay_stats["route_failed"] += 1
             return
         if not route.edges:
+            self._parquet_replay_stats["route_failed"] += 1
             return
         pt = self._get_edge_midpoint(pickup_edge)
         if pt is None:
+            self._parquet_replay_stats["missing_pickup_midpoint"] += 1
             return
         x, y = pt
         dt = self._get_edge_midpoint(dropoff_edge)
         if dt is None:
+            self._parquet_replay_stats["missing_dropoff_midpoint"] += 1
             return
         dx, dy = dt
         lat, lng = self._latlng(x, y)
@@ -1474,6 +1528,7 @@ class SimulationManager:
             "expected_fare_usd": expected_fare / 100.0,
             "expected_distance_m": route.length,
         })
+        self._parquet_replay_stats["spawned_count"] += 1
 
     def _process_manual_requests(self, sim_time: float) -> None:
         with self._lock:
@@ -1626,7 +1681,7 @@ class SimulationManager:
         self._taxi_last_dropoff_cells[request.entity_id] = get_cell(lat, lng)
         self._schedule_ws_event("broadcast_taxi_created", request.entity_id, lat, lng)
 
-    def _candidate_driver_average_features(
+    def _current_driver_features(
         self,
         *,
         candidate: Passenger,
@@ -1634,54 +1689,27 @@ class SimulationManager:
         sub_results: dict,
         current_veh_id: str,
         current_route,
-    ) -> tuple[float, float, float, int] | None:
+    ) -> tuple[float, float, float] | None:
         if not candidate.h3_dropoff:
+            return None
+        vals = sub_results.get(current_veh_id)
+        if vals is None or not getattr(current_route, "edges", None):
             return None
         call_dt = SIM_BASE_DATETIME + timedelta(seconds=sim_time)
         trip_miles = candidate.expected_distance_m / 1609.344
-        empty_taxis = []
-        for taxi_id, vals in sub_results.items():
-            if not self._is_taxi_id(taxi_id):
-                continue
-            if self._taxi_states.get(taxi_id, "empty") != "empty":
-                continue
-            x, y = vals[tc.VAR_POSITION]
-            empty_taxis.append(((candidate.x - x) ** 2 + (candidate.y - y) ** 2, taxi_id, vals))
-
-        driver_features = []
-        for _, taxi_id, vals in sorted(empty_taxis)[:DISPATCH_MAX_CANDIDATES]:
-            x, y = vals[tc.VAR_POSITION]
-            road_id = vals.get(tc.VAR_ROAD_ID, "")
-            route = current_route if taxi_id == current_veh_id else None
-            if route is None:
-                try:
-                    route = traci.simulation.findRoute(road_id, candidate.pickup_edge)
-                except traci.exceptions.TraCIException:
-                    continue
-            if not route.edges:
-                continue
-            D_pu_miles = route.length / 1609.344
-            lat, lng = self._latlng(x, y)
-            last_cell = self._taxi_last_dropoff_cells.get(taxi_id) or get_cell(lat, lng)
-            features = _acceptance_features(
-                last_dropoff_cell=last_cell,
-                dropoff_cell=candidate.h3_dropoff,
-                call_datetime=call_dt,
-                D_pu=D_pu_miles,
-                trip_distance=trip_miles,
-                pickup_cell=candidate.h3_pickup,
-            )
-            driver_features.append((features.dV_without_fare, D_pu_miles, features.t_pu))
-
-        if not driver_features:
-            return None
-        count = len(driver_features)
-        return (
-            sum(v[0] for v in driver_features) / count,
-            sum(v[1] for v in driver_features) / count,
-            sum(v[2] for v in driver_features) / count,
-            count,
+        D_pu_miles = current_route.length / 1609.344
+        x, y = vals[tc.VAR_POSITION]
+        lat, lng = self._latlng(x, y)
+        last_cell = self._taxi_last_dropoff_cells.get(current_veh_id) or get_cell(lat, lng)
+        features = _acceptance_features(
+            last_dropoff_cell=last_cell,
+            dropoff_cell=candidate.h3_dropoff,
+            call_datetime=call_dt,
+            D_pu=D_pu_miles,
+            trip_distance=trip_miles,
+            pickup_cell=candidate.h3_pickup,
         )
+        return features.dV_without_fare, D_pu_miles, features.t_pu
 
     def _dispatch_pricing(
         self,
@@ -1697,26 +1725,28 @@ class SimulationManager:
             candidate.h3_pickup or "",
             self._surge_by_h3.get(candidate.h3_pickup or "", 1.0),
         )
-        target_matching_rate = self._target_matching_rate(raw_surge)
+        bucket = self._raw_surge_bucket(raw_surge)
+        target_matching_rate = self._target_matching_rates[bucket]
         required_fare_usd = None
         calculated_surge = raw_surge
         pricing_driver_count = None
 
         if self.experiment_config is not None and base_fare_usd > 0:
-            averages = self._candidate_driver_average_features(
+            current_features = self._current_driver_features(
                 candidate=candidate,
                 sim_time=sim_time,
                 sub_results=sub_results,
                 current_veh_id=current_veh_id,
                 current_route=current_route,
             )
-            if averages is not None:
-                avg_dv, avg_dpu, avg_tpu, pricing_driver_count = averages
+            if current_features is not None:
+                dV_without_fare, D_pu_miles, T_pu = current_features
+                pricing_driver_count = 1
                 required_fare_usd = _required_fare_for_target_features(
                     target_p=target_matching_rate,
-                    dV_without_fare=avg_dv,
-                    D_pu=avg_dpu,
-                    T_pu=avg_tpu,
+                    dV_without_fare=dV_without_fare,
+                    D_pu=D_pu_miles,
+                    T_pu=T_pu,
                     beta_f=self.experiment_config.beta_f,
                     alpha_sensitivity=self.experiment_config.alpha_sensitivity,
                 )
@@ -1734,6 +1764,7 @@ class SimulationManager:
         return {
             "base_fare_usd": base_fare_usd,
             "raw_surge": raw_surge,
+            "bucket": bucket,
             "target_matching_rate": target_matching_rate,
             "required_fare_usd": required_fare_usd,
             "calculated_surge": calculated_surge,
@@ -1793,6 +1824,8 @@ class SimulationManager:
                         "dispatch_id": dispatch_id,
                         "passenger_id": candidate.id,
                         "taxi_id": veh_id,
+                        "pickup_h3": candidate.h3_pickup,
+                        "bucket": self._raw_surge_bucket(1.0),
                         "target_p": None,
                         "target_matching_rate": None,
                         "p_actual": 1.0,
@@ -1854,6 +1887,7 @@ class SimulationManager:
                             "base_fare_usd": pricing["base_fare_usd"],
                             "surge": pricing["final_surge"],
                             "raw_surge": pricing["raw_surge"],
+                            "bucket": pricing["bucket"],
                             "calculated_surge": pricing["calculated_surge"],
                             "final_surge": pricing["final_surge"],
                             "final_fare_usd": pricing["final_fare_usd"],
@@ -2424,7 +2458,8 @@ class SimulationManager:
                 elasticity=elasticity,
                 max_surge=float(self._pricing_policy.get("surge_max", 4.9)),
             )
-            target_matching_rate = self._target_matching_rate(raw_surge)
+            bucket = self._raw_surge_bucket(raw_surge)
+            target_matching_rate = self._target_matching_rates[bucket]
             surge = compute_surge(
                 grid_supply.get(cell, 0),
                 demand_for_surge.get(cell, 0),
@@ -2437,8 +2472,16 @@ class SimulationManager:
             target_matching_rate_by_h3[cell] = target_matching_rate
             actual_demand = grid_demand.get(cell, 0)
             selected_demand = demand_for_surge.get(cell, 0)
+            self._record_cell_bucket_kpi(
+                bucket_key=bucket,
+                h3_cell=cell,
+                supply=grid_supply.get(cell, 0),
+                demand=selected_demand,
+                raw_surge=raw_surge,
+            )
             surge_cells.append({
                 "h3": cell,
+                "bucket": bucket,
                 "supply": grid_supply.get(cell, 0),
                 "demand": selected_demand,
                 "actual_demand": actual_demand,
@@ -2451,6 +2494,7 @@ class SimulationManager:
                 self._surge_diagnostics.append({
                     "sim_time": sim_time,
                     "h3": cell,
+                    "bucket": bucket,
                     "supply": grid_supply.get(cell, 0),
                     "actual_demand": actual_demand,
                     "demand_for_surge": selected_demand,
