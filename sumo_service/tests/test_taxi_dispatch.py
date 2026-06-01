@@ -57,8 +57,17 @@ def make_sub_entry(x=0.0, y=0.0, speed=10.0, distance=100.0, road_id="some_edge"
 
 def make_manager() -> SimulationManager:
     mgr = SimulationManager()
-    mgr._routable_edges = [f"edge_{i}" for i in range(5)]
+    mgr._routable_edges = [f"edge_{i}" for i in range(5)] + [
+        "some_edge",
+        "pickup_edge",
+        "dropoff_edge",
+        "other_edge",
+    ]
+    mgr._routable_edges_set = set(mgr._routable_edges)
     mgr._latlng = lambda x, y: (40.7 + y * 1e-5, -74.0 + x * 1e-5)
+    _traci_stub.simulation.findRoute = MagicMock(
+        return_value=MagicMock(edges=["some_edge", "pickup_edge"], length=1000.0)
+    )
     return mgr
 
 
@@ -119,9 +128,55 @@ def test_dispatch_skipped_when_findroute_raises():
     assert p.state == "waiting"
 
 
+@pytest.mark.parametrize("road_id", ["", ":junction_edge", "outside_edge"])
+def test_dispatch_skips_invalid_current_road_without_findroute(road_id):
+    mgr = make_manager()
+    p = make_passenger()
+    mgr._passengers["p_0"] = p
+    sub = {"taxi_0": make_sub_entry(road_id=road_id)}
+    _traci_stub.simulation.findRoute = MagicMock()
+
+    mgr._update_taxi_states(0.0, sub)
+
+    _traci_stub.simulation.findRoute.assert_not_called()
+    assert mgr._taxi_states.get("taxi_0") != "dispatched"
+    assert p.state == "waiting"
+
+
 # ---------------------------------------------------------------------------
 # _update_taxi_states — 단계 2: 배차 타임아웃 / 픽업
 # ---------------------------------------------------------------------------
+
+def test_capture_grid_counts_matches_capture_state_counts():
+    mgr = make_manager()
+    waiting = make_passenger("p_waiting", state="waiting")
+    assigned = make_passenger("p_assigned", state="assigned")
+    picked_up = make_passenger("p_picked_up", state="picked_up")
+    waiting.h3_pickup = "pickup_cell_a"
+    assigned.h3_pickup = "pickup_cell_a"
+    picked_up.h3_pickup = "pickup_cell_b"
+    mgr._passengers = {
+        waiting.id: waiting,
+        assigned.id: assigned,
+        picked_up.id: picked_up,
+    }
+    mgr._taxi_states = {
+        "taxi_empty": "empty",
+        "taxi_dispatched": "dispatched",
+        "bg_0": "empty",
+    }
+    sub = {
+        "taxi_empty": make_sub_entry(x=0.0, y=0.0),
+        "taxi_dispatched": make_sub_entry(x=100.0, y=100.0),
+        "bg_0": make_sub_entry(x=200.0, y=200.0),
+    }
+
+    _, state_supply, state_demand = mgr._capture_state(10.0, sub)
+    grid_supply, grid_demand = mgr._capture_grid_counts(sub)
+
+    assert grid_supply == state_supply
+    assert grid_demand == state_demand
+
 
 def test_dispatch_timeout_reverts_passenger_to_waiting():
     mgr = make_manager()

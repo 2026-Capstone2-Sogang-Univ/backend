@@ -90,7 +90,7 @@ STEP_LENGTH = (
 REAL_STEP_SLEEP = 1.0 / FRAME_RATE  # real seconds between TraCI steps
 
 N_TAXIS = int(os.getenv("N_TAXIS", "300"))
-N_BACKGROUND_CARS = int(os.getenv("N_BACKGROUND_CARS", "1200"))
+N_BACKGROUND_CARS = int(os.getenv("N_BACKGROUND_CARS", "800"))
 
 PASSENGER_SPAWN_INTERVAL = 300.0
 PASSENGER_LAMBDA = int(os.getenv("PASSENGER_LAMBDA", "5"))
@@ -152,6 +152,8 @@ _BG_SUB_VARS = [tc.VAR_ROAD_ID, tc.VAR_ROUTE_INDEX]
 # 값이 2면 "마지막 세 엣지를 한 스텝에 모두 통과"해야만 누락되므로 짧은 커넥터 엣지로 인한
 # 잔여 소실이 크게 줄어든다.
 _ROUTE_EXTEND_REMAINING = 2
+_BG_ROUTE_EXTEND_REMAINING = 5
+_BG_ROUTE_EXTENSION_INTERVAL_S = 1.0
 # 경로 연장이 성공하면 차량은 새 경로의 index 0에서 시작하고 (경로길이 - _ROUTE_EXTEND_REMAINING - 1)
 # 엣지를 주행한 뒤 다시 연장한다. 짧은 경로가 매 스텝 재연장(findRoute 폭증)되는 것을 막기 위해
 # 라우팅이 돌려주는 경로 길이의 최소 목표치를 둔다 (재연장 주기 ≥ _MIN_ROUTE_EDGES - _ROUTE_EXTEND_REMAINING - 1).
@@ -349,6 +351,7 @@ class SimulationManager:
         # veh_id → 현재 할당된 경로의 엣지 수. route_index와 비교해 끝에 근접했는지 판정.
         self._bg_route_len: dict[str, int] = {}
         self._taxi_route_len: dict[str, int] = {}
+        self._last_bg_route_extension_time: float = float("-inf")
         self._edge_weights: list[float] = []
         self._routable_edges_set: set[str] = set()
         self._run_id: int | None = None
@@ -825,6 +828,7 @@ class SimulationManager:
             self._latlng = None
             self._bg_route_len = {}
             self._taxi_route_len = {}
+            self._last_bg_route_extension_time = float("-inf")
             self._edge_weights = []
             self._routable_edges_set = set()
             self._run_id = None
@@ -1044,13 +1048,19 @@ class SimulationManager:
                             except traci.exceptions.TraCIException:
                                 pass
 
-                self._extend_vehicle_routes(sub_results)
+                extend_bg_routes = (
+                    sim_time - self._last_bg_route_extension_time
+                    >= _BG_ROUTE_EXTENSION_INTERVAL_S
+                )
+                if extend_bg_routes:
+                    self._last_bg_route_extension_time = sim_time
+                self._extend_vehicle_routes(sub_results, extend_bg_routes=extend_bg_routes)
 
                 self._process_manual_requests(sim_time)
                 self._spawn_passengers(sim_time)
                 surge_payload = None
                 with self._lock:
-                    _, grid_supply, grid_demand = self._capture_state(sim_time, sub_results)
+                    grid_supply, grid_demand = self._capture_grid_counts(sub_results)
                     surge_interval = int(sim_time / 5.0)
                     if surge_interval > self._last_surge_interval:
                         self._last_surge_interval = surge_interval
@@ -1787,6 +1797,12 @@ class SimulationManager:
 
             # 단계 1 — 배차: 거리 기준 상위 K명 검토 후 수락 확률로 배차
             if state == "empty" and waiting_passengers:
+                if (
+                    not road_id
+                    or road_id.startswith(":")
+                    or road_id not in self._routable_edges_set
+                ):
+                    continue
                 candidates = heapq.nsmallest(
                     DISPATCH_MAX_CANDIDATES, waiting_passengers,
                     key=lambda p: (p.x - tx) ** 2 + (p.y - ty) ** 2,
@@ -2277,7 +2293,7 @@ class SimulationManager:
                 lat, lng = self._latlng(*pt)
                 self._taxi_last_dropoff_cells[f"taxi_{i}"] = get_cell(lat, lng)
 
-    def _extend_vehicle_routes(self, sub_results: dict) -> None:
+    def _extend_vehicle_routes(self, sub_results: dict, *, extend_bg_routes: bool = True) -> None:
         """경로 끝에 근접한 bg 차량·empty/dispatched 택시에 새 경로를 이어 붙여 arrival 제거를 막는다.
 
         구독값 route_index와 저장해 둔 경로 길이로 '남은 엣지 수'를 계산한다. 이 값은 단조
@@ -2293,8 +2309,10 @@ class SimulationManager:
                 continue  # 미구독이거나 아직 미출발(-1)한 차량은 건너뜀
 
             if veh_id.startswith("bg_"):
+                if not extend_bg_routes:
+                    continue
                 route_len = self._bg_route_len.get(veh_id)
-                if route_len is None or route_len - 1 - route_index > _ROUTE_EXTEND_REMAINING:
+                if route_len is None or route_len - 1 - route_index > _BG_ROUTE_EXTEND_REMAINING:
                     continue
                 new_route = self._random_route_from(road_id)
                 if new_route:
@@ -2424,6 +2442,27 @@ class SimulationManager:
 
         state_dict = {"vehicles": vehicles, "passengers": passengers_list, "sim_time": sim_time}
         return state_dict, grid_supply, grid_demand
+
+    def _capture_grid_counts(self, sub_results: dict) -> tuple[dict[str, int], dict[str, int]]:
+        """Return lightweight (grid_supply, grid_demand) for surge calculation."""
+        grid_supply: dict[str, int] = defaultdict(int)
+        grid_demand: dict[str, int] = defaultdict(int)
+
+        for veh_id, vals in sub_results.items():
+            if veh_id.startswith("bg_"):
+                continue
+            if self._taxi_states.get(veh_id, "empty") != "empty":
+                continue
+            x, y = vals[tc.VAR_POSITION]
+            lat, lng = self._latlng(x, y)
+            if math.isfinite(lat) and math.isfinite(lng):
+                grid_supply[get_cell(lat, lng)] += 1
+
+        for p in self._passengers.values():
+            if p.state in ("waiting", "assigned") and p.h3_pickup:
+                grid_demand[p.h3_pickup] += 1
+
+        return grid_supply, grid_demand
 
     def _build_surge_cells(
         self,

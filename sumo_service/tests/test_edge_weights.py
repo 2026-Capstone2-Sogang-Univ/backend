@@ -11,11 +11,13 @@ import pytest
 from tests.test_passenger_spawn import _traci_stub  # reuse stub
 
 from app.simulation import (
+    _BG_ROUTE_EXTEND_REMAINING,
     HOTSPOTS,
     HOTSPOT_BASE_WEIGHT,
     HOTSPOT_SIGMA_M,
     SimulationManager,
 )
+from traci import constants as tc
 
 
 def make_manager() -> SimulationManager:
@@ -124,3 +126,60 @@ def test_random_route_from_returns_none_when_all_attempts_fail():
     route = mgr._random_route_from("start", attempts=3)
 
     assert route is None
+
+
+def _route_extend_sub_entry(road_id: str, route_index: int) -> dict:
+    return {
+        tc.VAR_ROAD_ID: road_id,
+        tc.VAR_ROUTE_INDEX: route_index,
+    }
+
+
+def test_bg_route_extension_respects_interval_gate():
+    mgr = make_manager()
+    mgr._bg_route_len["bg_0"] = 6
+    mgr._random_route_from = MagicMock(return_value=["bg_edge", "next_edge"])
+    _traci_stub.vehicle.setRoute = MagicMock()
+
+    mgr._extend_vehicle_routes(
+        {"bg_0": _route_extend_sub_entry("bg_edge", 4)},
+        extend_bg_routes=False,
+    )
+
+    mgr._random_route_from.assert_not_called()
+    _traci_stub.vehicle.setRoute.assert_not_called()
+
+
+def test_bg_route_extension_uses_larger_remaining_threshold():
+    mgr = make_manager()
+    mgr._bg_route_len["bg_0"] = 10
+    mgr._random_route_from = MagicMock(return_value=["bg_edge", "next_edge"])
+    _traci_stub.vehicle.setRoute = MagicMock()
+
+    mgr._extend_vehicle_routes(
+        {
+            "bg_0": _route_extend_sub_entry(
+                "bg_edge",
+                10 - 1 - _BG_ROUTE_EXTEND_REMAINING,
+            )
+        },
+        extend_bg_routes=True,
+    )
+
+    mgr._random_route_from.assert_called_once_with("bg_edge")
+    _traci_stub.vehicle.setRoute.assert_called_once_with("bg_0", ["bg_edge", "next_edge"])
+
+
+def test_taxi_route_extension_still_runs_when_bg_gate_is_closed():
+    mgr = make_manager()
+    mgr._taxi_route_len["taxi_0"] = 3
+    mgr._random_route_from = MagicMock(return_value=["taxi_edge", "next_edge"])
+    _traci_stub.vehicle.setRoute = MagicMock()
+
+    mgr._extend_vehicle_routes(
+        {"taxi_0": _route_extend_sub_entry("taxi_edge", 0)},
+        extend_bg_routes=False,
+    )
+
+    mgr._random_route_from.assert_called_once_with("taxi_edge")
+    _traci_stub.vehicle.setRoute.assert_called_once_with("taxi_0", ["taxi_edge", "next_edge"])
