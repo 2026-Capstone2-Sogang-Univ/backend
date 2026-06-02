@@ -185,3 +185,6 @@ real_taxi_data/
 # sumo_service 루트의 csv/json만 무시한다.
 sumo_service/*.csv
 sumo_service/*.json
+
+# 로컬 디버깅용 uvicorn stdout/stderr 리다이렉트 파일
+sumo_service/.uvlog*

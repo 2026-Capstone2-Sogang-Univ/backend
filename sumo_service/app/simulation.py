@@ -84,6 +84,7 @@ SUMO_BINARY = "sumo-gui" if os.getenv("SUMO_GUI") == "1" else "sumo"
 SIM_DURATION = float(os.getenv("SIM_DURATION", "3600"))        # simulated seconds
 FRAME_RATE = 60.0  # broadcast fps (WebSocket messages per real second)
 SIMULATION_SPEED = float(os.getenv("SIMULATION_SPEED", "20"))  # simulated seconds per real second
+SIM_PROFILE = os.getenv("SIM_PROFILE", "0").strip().lower() in {"1", "true", "yes", "on"}
 STEP_LENGTH = (
     SIMULATION_SPEED / FRAME_RATE
 )  # simulated seconds per TraCI step (passed to SUMO)
@@ -145,7 +146,7 @@ HOTSPOT_BASE_WEIGHT = 1.0   # 모든 엣지 최소 가중치
 
 _SUB_VARS = [tc.VAR_POSITION, tc.VAR_ANGLE, tc.VAR_SPEED, tc.VAR_DISTANCE, tc.VAR_ROAD_ID, tc.VAR_ROUTE_INDEX]
 # bg 차량은 위치 스냅샷이 필요 없고 경로 연장 판정에 쓰는 값만 구독한다.
-_BG_SUB_VARS = [tc.VAR_ROAD_ID, tc.VAR_ROUTE_INDEX]
+_BG_SUB_VARS = [tc.VAR_ROAD_ID, tc.VAR_ROUTE_INDEX, tc.VAR_SPEED]
 # 경로 끝에서 남은 엣지 수가 이 값 이하이면 새 경로를 이어 붙인다.
 # route_index는 단조 증가하므로 한 번 임계값을 넘으면 매 스텝 참 → 짧은 엣지를 한 스텝에
 # 통과해도 연장이 누락되지 않는다(기존 단일 트리거 엣지 동등비교의 구조적 누락을 제거).
@@ -154,10 +155,20 @@ _BG_SUB_VARS = [tc.VAR_ROAD_ID, tc.VAR_ROUTE_INDEX]
 _ROUTE_EXTEND_REMAINING = 2
 _BG_ROUTE_EXTEND_REMAINING = 5
 _BG_ROUTE_EXTENSION_INTERVAL_S = 1.0
+_BG_ROUTE_EXTENSION_MAX_PER_TICK = 4
 # 경로 연장이 성공하면 차량은 새 경로의 index 0에서 시작하고 (경로길이 - _ROUTE_EXTEND_REMAINING - 1)
 # 엣지를 주행한 뒤 다시 연장한다. 짧은 경로가 매 스텝 재연장(findRoute 폭증)되는 것을 막기 위해
 # 라우팅이 돌려주는 경로 길이의 최소 목표치를 둔다 (재연장 주기 ≥ _MIN_ROUTE_EDGES - _ROUTE_EXTEND_REMAINING - 1).
-_MIN_ROUTE_EDGES = 5
+_MIN_ROUTE_EDGES = 10
+_BG_EXTENSION_MIN_ROUTE_EDGES = 25
+_TAXI_EXTENSION_MIN_ROUTE_EDGES = 25
+# 차량별 경로 연장 cooldown: extension 성공 후 이 sim_seconds 동안 같은 차량은 재시도하지 않는다.
+# 정체로 정지·저속 주행하는 차량이 매 bg-tick마다 trigger zone에 머물러 무의미한 findRoute를
+# 반복하는 폭증을 차단. 차량이 충분히 진행해 다시 trigger zone에 진입하기 전까지 사실상
+# extension은 일어나지 않으므로 안전.
+_BG_EXTENSION_COOLDOWN_S = 30.0
+_TAXI_EXTENSION_COOLDOWN_S = 15.0
+_BG_ROUTE_EXTENSION_MIN_SPEED_MPS = 0.1
 
 
 def _poisson_sample(lam: float) -> int:
@@ -321,6 +332,7 @@ class SimulationManager:
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._prof_counters: defaultdict = defaultdict(int)
         self._state_queue: Optional[asyncio.Queue] = None
         self._executor_task: Optional[asyncio.Future] = None
         self._broadcast_task: Optional[asyncio.Task] = None
@@ -351,6 +363,9 @@ class SimulationManager:
         # veh_id → 현재 할당된 경로의 엣지 수. route_index와 비교해 끝에 근접했는지 판정.
         self._bg_route_len: dict[str, int] = {}
         self._taxi_route_len: dict[str, int] = {}
+        # vehicle별 다음 extension 가능 sim_time (성공 시 +_EXTENSION_COOLDOWN_S로 세팅)
+        self._bg_extend_cooldown: dict[str, float] = {}
+        self._taxi_extend_cooldown: dict[str, float] = {}
         self._last_bg_route_extension_time: float = float("-inf")
         self._edge_weights: list[float] = []
         self._routable_edges_set: set[str] = set()
@@ -828,6 +843,8 @@ class SimulationManager:
             self._latlng = None
             self._bg_route_len = {}
             self._taxi_route_len = {}
+            self._bg_extend_cooldown = {}
+            self._taxi_extend_cooldown = {}
             self._last_bg_route_extension_time = float("-inf")
             self._edge_weights = []
             self._routable_edges_set = set()
@@ -963,6 +980,16 @@ class SimulationManager:
                 with open(TRIPS_FILE) as f:
                     self._trip_queue = sorted(json.load(f), key=lambda t: t["sim_time"])
 
+            _PROF_INTERVAL_S = 10.0
+            _prof = None
+            if SIM_PROFILE:
+                _prof = {
+                    "totals": defaultdict(float),
+                    "steps": 0,
+                    "last_sim": 0.0,
+                    "last_real": time.perf_counter(),
+                }
+
             next_deadline = time.perf_counter()
             while not self._stop_event.is_set():
                 if self._paused:
@@ -971,6 +998,7 @@ class SimulationManager:
                     continue
 
                 next_deadline += real_step_sleep
+                _pt = time.perf_counter() if SIM_PROFILE else 0.0
                 traci.simulationStep()
                 sim_time = traci.simulation.getTime()
 
@@ -979,7 +1007,10 @@ class SimulationManager:
                         traci.vehicle.subscribe(veh_id, _SUB_VARS)
 
                 sub_results = traci.vehicle.getAllSubscriptionResults()
+                if SIM_PROFILE:
+                    _prof["totals"]["sumo_step"] += time.perf_counter() - _pt
 
+                _pt = time.perf_counter() if SIM_PROFILE else 0.0
                 # Track which vehicles have appeared at least once, and clear stale missing records
                 for veh_id in sub_results:
                     if self._is_taxi_id(veh_id):
@@ -988,7 +1019,10 @@ class SimulationManager:
                     elif veh_id.startswith("bg_"):
                         self._bg_appeared.add(veh_id)
                         self._bg_missing_since.pop(veh_id, None)
+                if SIM_PROFILE:
+                    _prof["totals"]["appeared_track"] += time.perf_counter() - _pt
 
+                _pt = time.perf_counter() if SIM_PROFILE else 0.0
                 # Respawn empty taxis that have definitively left the network.
                 # Only fires for taxis that (a) previously appeared, (b) are now absent,
                 # (c) have been missing for > _RESPAWN_THRESHOLD sim seconds.
@@ -1021,6 +1055,10 @@ class SimulationManager:
                             except traci.exceptions.TraCIException as e:
                                 print(f"[respawn] FAILED {veh_id}: {e}", flush=True)
 
+                if SIM_PROFILE:
+                    _prof["totals"]["respawn_taxi"] += time.perf_counter() - _pt
+
+                _pt = time.perf_counter() if SIM_PROFILE else 0.0
                 # Respawn bg cars that left the network. bg는 트립 로직이 없어 한 번 arrival되면
                 # 영구 손실되므로(running 단조 감소의 주원인), 누락분을 재투입해 차량 수를 유지한다.
                 for veh_id in list(self._bg_route_len.keys()):
@@ -1048,16 +1086,27 @@ class SimulationManager:
                             except traci.exceptions.TraCIException:
                                 pass
 
+                if SIM_PROFILE:
+                    _prof["totals"]["respawn_bg"] += time.perf_counter() - _pt
+
+                _pt = time.perf_counter() if SIM_PROFILE else 0.0
                 extend_bg_routes = (
                     sim_time - self._last_bg_route_extension_time
                     >= _BG_ROUTE_EXTENSION_INTERVAL_S
                 )
                 if extend_bg_routes:
                     self._last_bg_route_extension_time = sim_time
-                self._extend_vehicle_routes(sub_results, extend_bg_routes=extend_bg_routes)
+                self._extend_vehicle_routes(sub_results, sim_time, extend_bg_routes=extend_bg_routes)
+                if SIM_PROFILE:
+                    _prof["totals"]["extend_routes"] += time.perf_counter() - _pt
 
+                _pt = time.perf_counter() if SIM_PROFILE else 0.0
                 self._process_manual_requests(sim_time)
                 self._spawn_passengers(sim_time)
+                if SIM_PROFILE:
+                    _prof["totals"]["spawn"] += time.perf_counter() - _pt
+
+                _pt = time.perf_counter() if SIM_PROFILE else 0.0
                 surge_payload = None
                 with self._lock:
                     grid_supply, grid_demand = self._capture_grid_counts(sub_results)
@@ -1066,10 +1115,19 @@ class SimulationManager:
                         self._last_surge_interval = surge_interval
                         self._build_surge_cells(grid_supply, grid_demand, sim_time)
                         surge_payload = self._surge_cells
+                if SIM_PROFILE:
+                    _prof["totals"]["surge"] += time.perf_counter() - _pt
 
+                _pt = time.perf_counter() if SIM_PROFILE else 0.0
                 fare_updates = self._update_taxi_states(sim_time, sub_results)
+                if SIM_PROFILE:
+                    _prof["totals"]["taxi_states"] += time.perf_counter() - _pt
+                _pt = time.perf_counter() if SIM_PROFILE else 0.0
                 fare_updates += self._accumulate_fares(sim_time, sub_results)
+                if SIM_PROFILE:
+                    _prof["totals"]["fares"] += time.perf_counter() - _pt
 
+                _pt = time.perf_counter() if SIM_PROFILE else 0.0
                 with self._lock:
                     state, _, _ = self._capture_state(sim_time, sub_results)
                     self._state = state
@@ -1088,6 +1146,58 @@ class SimulationManager:
                 # Push state immediately after each step; broadcast loop sends it.
                 if broadcast_enabled and self._loop is not None and self._state_queue is not None:
                     self._loop.call_soon_threadsafe(self._state_queue.put_nowait, state)
+                if SIM_PROFILE:
+                    _prof["totals"]["broadcast_build"] += time.perf_counter() - _pt
+
+                if SIM_PROFILE:
+                    _prof["steps"] += 1
+                if SIM_PROFILE and sim_time - _prof["last_sim"] >= _PROF_INTERVAL_S:
+                    _real_dt = time.perf_counter() - _prof["last_real"]
+                    _sim_dt = sim_time - _prof["last_sim"]
+                    _speedup = (_sim_dt / _real_dt) if _real_dt > 0 else 0
+                    _lines = [
+                        f"[prof] sim={sim_time:.0f}s steps={_prof['steps']} "
+                        f"real={_real_dt:.2f}s speedup={_speedup:.2f}x"
+                    ]
+                    _accounted = sum(_prof["totals"].values())
+                    for _sec, _t in sorted(_prof["totals"].items(), key=lambda kv: -kv[1]):
+                        _pct = 100 * _t / _real_dt if _real_dt else 0
+                        _avg_ms = 1000 * _t / _prof["steps"] if _prof["steps"] else 0
+                        _lines.append(
+                            f"[prof]   {_sec:18s} {_t:6.2f}s ({_pct:5.1f}%) "
+                            f"avg {_avg_ms:6.2f}ms/step"
+                        )
+                    _unacc = _real_dt - _accounted
+                    _lines.append(
+                        f"[prof]   {'(unaccounted)':18s} {_unacc:6.2f}s "
+                        f"({100 * _unacc / _real_dt if _real_dt else 0:5.1f}%)"
+                    )
+                    # Call counters collected only when SIM_PROFILE is enabled.
+                    _rrf = self._prof_counters.get("rrf_calls", 0)
+                    _fr = self._prof_counters.get("findRoute_calls", 0)
+                    _none = self._prof_counters.get("rrf_none", 0)
+                    _tbg = self._prof_counters.get("trigger_bg", 0)
+                    _ttx = self._prof_counters.get("trigger_taxi", 0)
+                    _skip_bg_cd = self._prof_counters.get("skip_bg_cooldown", 0)
+                    _skip_bg_stopped = self._prof_counters.get("skip_bg_stopped", 0)
+                    _skip_bg_budget = self._prof_counters.get("skip_bg_budget", 0)
+                    _avg_fr_per_rrf = (_fr / _rrf) if _rrf else 0
+                    _avg_rrf_time_ms = (1000 * _prof["totals"].get("extend_routes", 0) / _rrf) if _rrf else 0
+                    _lines.append(
+                        f"[prof]   counts: trigger_bg={_tbg} trigger_taxi={_ttx} "
+                        f"rrf_calls={_rrf} rrf_none={_none} findRoute_calls={_fr} "
+                        f"findRoute/rrf={_avg_fr_per_rrf:.2f} extend/rrf={_avg_rrf_time_ms:.2f}ms"
+                    )
+                    _lines.append(
+                        f"[prof]   skips: bg_cooldown={_skip_bg_cd} "
+                        f"bg_stopped={_skip_bg_stopped} bg_budget={_skip_bg_budget}"
+                    )
+                    print("\n".join(_lines), flush=True)
+                    _prof["totals"].clear()
+                    _prof["steps"] = 0
+                    _prof["last_sim"] = sim_time
+                    _prof["last_real"] = time.perf_counter()
+                    self._prof_counters.clear()
 
                 if sim_time >= sim_duration:
                     # Force-complete all trips still in progress so their fares are recorded.
@@ -2293,13 +2403,14 @@ class SimulationManager:
                 lat, lng = self._latlng(*pt)
                 self._taxi_last_dropoff_cells[f"taxi_{i}"] = get_cell(lat, lng)
 
-    def _extend_vehicle_routes(self, sub_results: dict, *, extend_bg_routes: bool = True) -> None:
+    def _extend_vehicle_routes(self, sub_results: dict, sim_time: float, *, extend_bg_routes: bool = True) -> None:
         """경로 끝에 근접한 bg 차량·empty/dispatched 택시에 새 경로를 이어 붙여 arrival 제거를 막는다.
 
         구독값 route_index와 저장해 둔 경로 길이로 '남은 엣지 수'를 계산한다. 이 값은 단조
         증가하므로 한 번 임계값(_ROUTE_EXTEND_REMAINING)을 넘으면 매 스텝 참이 되어, 짧은
         엣지를 한 스텝에 통과해도 연장이 누락되지 않는다. 연장에 실패하면 route_len을 그대로
         두므로 다음 스텝에 자동으로 재시도된다(임계값이 계속 참이기 때문)."""
+        bg_extension_attempts = 0
         for veh_id, vals in sub_results.items():
             road_id = vals.get(tc.VAR_ROAD_ID, "")
             if not road_id or road_id.startswith(":"):
@@ -2311,14 +2422,34 @@ class SimulationManager:
             if veh_id.startswith("bg_"):
                 if not extend_bg_routes:
                     continue
+                if sim_time < self._bg_extend_cooldown.get(veh_id, 0.0):
+                    if SIM_PROFILE:
+                        self._prof_counters["skip_bg_cooldown"] += 1
+                    continue  # cooldown 중 — 정체로 정지한 차량의 무의미한 재시도 차단
                 route_len = self._bg_route_len.get(veh_id)
                 if route_len is None or route_len - 1 - route_index > _BG_ROUTE_EXTEND_REMAINING:
                     continue
-                new_route = self._random_route_from(road_id)
+                speed = vals.get(tc.VAR_SPEED, _BG_ROUTE_EXTENSION_MIN_SPEED_MPS + 1.0)
+                if speed <= _BG_ROUTE_EXTENSION_MIN_SPEED_MPS:
+                    if SIM_PROFILE:
+                        self._prof_counters["skip_bg_stopped"] += 1
+                    continue
+                if bg_extension_attempts >= _BG_ROUTE_EXTENSION_MAX_PER_TICK:
+                    if SIM_PROFILE:
+                        self._prof_counters["skip_bg_budget"] += 1
+                    continue
+                bg_extension_attempts += 1
+                if SIM_PROFILE:
+                    self._prof_counters["trigger_bg"] += 1
+                new_route = self._random_route_from(
+                    road_id,
+                    min_edges=_BG_EXTENSION_MIN_ROUTE_EDGES,
+                )
                 if new_route:
                     try:
                         traci.vehicle.setRoute(veh_id, new_route)
                         self._bg_route_len[veh_id] = len(new_route)
+                        self._bg_extend_cooldown[veh_id] = sim_time + _BG_EXTENSION_COOLDOWN_S
                     except traci.exceptions.TraCIException:
                         pass  # route_len 유지 → 다음 스텝 재시도
 
@@ -2326,14 +2457,22 @@ class SimulationManager:
                 # empty·dispatched 택시만 연장 (occupied 경로는 트립 로직이 관리)
                 if self._taxi_states.get(veh_id, "empty") not in ("empty", "dispatched"):
                     continue
+                if sim_time < self._taxi_extend_cooldown.get(veh_id, 0.0):
+                    continue
                 route_len = self._taxi_route_len.get(veh_id)
                 if route_len is None or route_len - 1 - route_index > _ROUTE_EXTEND_REMAINING:
                     continue
-                new_route = self._random_route_from(road_id)
+                if SIM_PROFILE:
+                    self._prof_counters["trigger_taxi"] += 1
+                new_route = self._random_route_from(
+                    road_id,
+                    min_edges=_TAXI_EXTENSION_MIN_ROUTE_EDGES,
+                )
                 if new_route:
                     try:
                         traci.vehicle.setRoute(veh_id, new_route)
                         self._taxi_route_len[veh_id] = len(new_route)
+                        self._taxi_extend_cooldown[veh_id] = sim_time + _TAXI_EXTENSION_COOLDOWN_S
                     except traci.exceptions.TraCIException:
                         pass  # route_len 유지 → 다음 스텝 재시도
 
@@ -2367,26 +2506,38 @@ class SimulationManager:
             weights.append(w)
         return weights
 
-    def _random_route_from(self, current_edge: str, attempts: int = 10) -> list[str] | None:
+    def _random_route_from(
+        self,
+        current_edge: str,
+        attempts: int = 10,
+        *,
+        min_edges: int = _MIN_ROUTE_EDGES,
+    ) -> list[str] | None:
         """current_edge에서 시작하는 경로를 반환. _MIN_ROUTE_EDGES개 이상을 우선 시도하고
         점차 길이를 낮춰 2개까지 폴백, 모두 실패 시 None."""
+        if SIM_PROFILE:
+            self._prof_counters["rrf_calls"] += 1
         edges = self._routable_edges
         weights = self._edge_weights if len(self._edge_weights) == len(edges) else None
 
         def _pick() -> str:
             return _random.choices(edges, weights=weights, k=1)[0] if weights else _random.choice(edges)
 
-        for min_len in range(_MIN_ROUTE_EDGES, 1, -1):
+        for min_len in range(min_edges, 1, -1):
             for _ in range(attempts):
                 dst = _pick()
                 if dst == current_edge:
                     continue
                 try:
+                    if SIM_PROFILE:
+                        self._prof_counters["findRoute_calls"] += 1
                     result = traci.simulation.findRoute(current_edge, dst)
                     if len(result.edges) >= min_len:
                         return list(result.edges)
                 except traci.exceptions.TraCIException:
                     continue
+        if SIM_PROFILE:
+            self._prof_counters["rrf_none"] += 1
         return None
 
     def _random_route(self, edges: list[str], attempts: int = 10) -> list[str]:
