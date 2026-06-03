@@ -1,6 +1,6 @@
 import pytest
 
-from app.grid import compute_surge
+from app.grid import cells_within_k_ring, compute_surge, get_cell
 
 
 def test_surge_zero_zero():
@@ -45,3 +45,12 @@ def test_surge_custom_max_surge():
 def test_surge_min_active_and_increment():
     assert compute_surge(10, 11) == pytest.approx(1.0)
     assert compute_surge(10, 12) == pytest.approx(1.4)
+
+
+def test_cells_within_k_ring_includes_center_and_neighbors():
+    center = get_cell(40.758, -73.985)
+    ring0 = cells_within_k_ring(center, 0)
+    ring1 = cells_within_k_ring(center, 1)
+    assert center in ring0
+    assert center in ring1
+    assert len(ring1) > len(ring0)

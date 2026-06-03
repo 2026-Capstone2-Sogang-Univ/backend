@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -8,7 +9,7 @@ import httpx
 import pytest
 
 from app.demand_history import DemandHistoryStore
-from app.prediction import PredictionDemandProvider, PredictionFallbackError
+from app.prediction import PredictionDemandProvider, PredictionFallbackError, warm_prediction_service
 from app.weather import StaticWeatherProvider
 
 
@@ -168,7 +169,7 @@ def test_error_fallback_policy_raises_prediction_fallback_error():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, json={"error": "unavailable"})
 
-    with _provider(["h3_a"], handler) as provider:
+    with _provider(["h3_a"], handler, retry_max=0) as provider:
         with pytest.raises(PredictionFallbackError):
             provider.demand_by_h3(datetime(2013, 7, 8, 8, 17))
 
@@ -297,13 +298,68 @@ def test_prediction_latency_p95_uses_inclusive_quantile():
 
 
 @contextmanager
+def test_prediction_retries_after_transient_503():
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503, json={"error": "cold start"})
+        return httpx.Response(
+            200,
+            json={
+                "timestamp": "2013-07-08T08:15:00",
+                "target_time": "2013-07-08T08:30:00",
+                "horizon": "15min",
+                "count": 1,
+                "predictions": [{"h3": "h3_a", "predicted_demand_count": 4}],
+            },
+        )
+
+    with _provider(["h3_a"], handler, retry_max=2) as provider:
+        assert provider.demand_by_h3(datetime(2013, 7, 8, 8, 17)) == {"h3_a": 4.0}
+        assert attempts == 2
+        assert provider.diagnostics()["prediction_retry_count"] == 1
+
+
+def test_warm_prediction_service_retries_until_root_responds():
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if request.method == "GET" and attempts == 1:
+            raise httpx.ConnectError("cold")
+        if request.method == "GET":
+            return httpx.Response(404)
+        raise AssertionError(f"unexpected request: {request.method}")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        ok = warm_prediction_service(
+            prediction_url="https://prediction.test/predict",
+            api_key="test-key",
+            client=client,
+            retry_max=2,
+        )
+
+    assert ok is True
+    assert attempts == 2
+
+
 def _provider(
     model_h3_cells: list[str],
     handler,
     *,
     fallback_policy: str = "error",
+    retry_max: int | None = None,
 ) -> Iterator[PredictionDemandProvider]:
+    prev_warmup = os.environ.get("PREDICTION_WARMUP")
+    os.environ["PREDICTION_WARMUP"] = "0"
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        kwargs: dict = {}
+        if retry_max is not None:
+            kwargs["retry_max"] = retry_max
         provider = PredictionDemandProvider(
             prediction_url="https://prediction.test/predict",
             model_h3_cells=model_h3_cells,
@@ -312,11 +368,16 @@ def _provider(
             fallback_policy=fallback_policy,
             client=client,
             api_key="test-key",
+            **kwargs,
         )
         try:
             yield provider
         finally:
             provider.close()
+            if prev_warmup is None:
+                os.environ.pop("PREDICTION_WARMUP", None)
+            else:
+                os.environ["PREDICTION_WARMUP"] = prev_warmup
 
 
 def _wait_for_success(provider: PredictionDemandProvider) -> None:

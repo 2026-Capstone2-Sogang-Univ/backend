@@ -74,6 +74,21 @@ def test_predicted_demand_source_uses_prediction_for_surge(monkeypatch):
     }
 
 
+def test_predicted_policy_fetches_on_wall_clock_not_every_surge_tick():
+    manager = SimulationManager(ExperimentConfig(demand_source="predicted", policy_update_interval_real_s=10.0))
+    assert manager._should_fetch_prediction() is True
+    assert manager._should_fetch_prediction() is False
+    manager._last_policy_wall_time -= 11.0
+    assert manager._should_fetch_prediction() is True
+
+
+def test_surge_grid_recomputes_every_5_sim_seconds():
+    manager = SimulationManager(ExperimentConfig(demand_source="predicted"))
+    assert manager._should_recompute_surge_grid(0.0) is True
+    assert manager._should_recompute_surge_grid(4.0) is False
+    assert manager._should_recompute_surge_grid(5.0) is True
+
+
 def test_actual_demand_source_uses_grid_demand_for_surge(monkeypatch):
     monkeypatch.setattr(simulation, "cell_center_latlng", lambda cell: (40.0, -73.0))
     manager = SimulationManager(ExperimentConfig(demand_source="actual"))
@@ -148,7 +163,7 @@ class CloseSettledDiagnosticsProvider(ClosableProvider):
 
 
 def test_random_passenger_creation_records_spawn_history(monkeypatch):
-    manager = SimulationManager(ExperimentConfig())
+    manager = SimulationManager(ExperimentConfig(demand_source="actual"))
     history = FakeHistoryStore()
     manager._history_store = history
     manager._routable_edges = ["pickup_edge", "dropoff_edge"]
@@ -174,7 +189,7 @@ def test_random_passenger_creation_records_spawn_history(monkeypatch):
 
 
 def test_parquet_passenger_creation_records_spawn_history(monkeypatch):
-    manager = SimulationManager(ExperimentConfig())
+    manager = SimulationManager(ExperimentConfig(demand_source="actual"))
     history = FakeHistoryStore()
     manager._history_store = history
     manager._routable_edges_set = {"pickup_edge", "dropoff_edge"}
@@ -244,7 +259,7 @@ def test_trip_completion_paths_record_dropoff_history(monkeypatch):
 
 
 def test_prediction_provider_is_closed_on_reinitialize_and_run_reset(monkeypatch):
-    manager = SimulationManager(ExperimentConfig())
+    manager = SimulationManager(ExperimentConfig(demand_source="actual"))
     manager._latlng = lambda x, y: (x, y)
     manager._routable_edges = []
     provider = ClosableProvider()
@@ -268,7 +283,7 @@ def test_prediction_provider_is_closed_on_reinitialize_and_run_reset(monkeypatch
 
 
 def test_run_experiment_emits_prediction_history_and_surge_diagnostics(monkeypatch):
-    manager = SimulationManager(ExperimentConfig())
+    manager = SimulationManager(ExperimentConfig(demand_source="actual"))
     provider = ClosableProvider()
     provider.diagnostics = lambda: {"prediction_request_count": 2}
     history = FakeHistoryStore()
@@ -312,7 +327,7 @@ def test_run_experiment_emits_prediction_history_and_surge_diagnostics(monkeypat
 
 
 def test_run_experiment_closes_prediction_provider_before_diagnostics(monkeypatch):
-    manager = SimulationManager(ExperimentConfig())
+    manager = SimulationManager(ExperimentConfig(demand_source="actual"))
     provider = CloseSettledDiagnosticsProvider()
 
     def fake_run_loop():
@@ -333,7 +348,7 @@ def test_run_experiment_closes_prediction_provider_before_diagnostics(monkeypatc
 
 
 def test_run_experiment_resets_stale_run_state_before_loop(monkeypatch):
-    manager = SimulationManager(ExperimentConfig())
+    manager = SimulationManager(ExperimentConfig(demand_source="actual"))
     stale_provider = ClosableProvider()
     manager._prediction_demand_provider = stale_provider
     manager._history_store = FakeHistoryStore()
@@ -616,7 +631,7 @@ async def test_start_resets_stale_run_state_before_runtime_launch(monkeypatch):
 
 
 def _manager_with_active_trip(history: FakeHistoryStore) -> SimulationManager:
-    manager = SimulationManager(ExperimentConfig())
+    manager = SimulationManager(ExperimentConfig(demand_source="actual"))
     manager._history_store = history
     passenger = Passenger(
         id="p_0",
