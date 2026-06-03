@@ -105,7 +105,7 @@ SIM_BASE_DATETIME = _datetime(2013, 7, 8, 8, 0, 0)
 # parquet 모드에서 승객 대량 스폰 시 findRoute RPC 폭증 방지용 튜닝값
 DISPATCH_MAX_CANDIDATES = int(os.getenv("DISPATCH_MAX_CANDIDATES", "3"))
 
-PASSENGER_SOURCE = os.getenv("PASSENGER_SOURCE", "random")
+PASSENGER_SOURCE = os.getenv("PASSENGER_SOURCE", "parquet")
 TRIPS_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "trips_processed.json"
 SCC_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "routable_scc.json"
 
@@ -169,6 +169,9 @@ _TAXI_EXTENSION_MIN_ROUTE_EDGES = 25
 _BG_EXTENSION_COOLDOWN_S = 30.0
 _TAXI_EXTENSION_COOLDOWN_S = 15.0
 _BG_ROUTE_EXTENSION_MIN_SPEED_MPS = 0.1
+_TAXI_ROUTE_EXTENSION_MIN_SPEED_MPS = 0.1
+_TAXI_CRITICAL_REMAINING_EDGES = 0
+_DISPATCHED_TAXI_CRITICAL_REMAINING_EDGES = 1
 
 
 def _poisson_sample(lam: float) -> int:
@@ -366,6 +369,7 @@ class SimulationManager:
         # vehicle별 다음 extension 가능 sim_time (성공 시 +_EXTENSION_COOLDOWN_S로 세팅)
         self._bg_extend_cooldown: dict[str, float] = {}
         self._taxi_extend_cooldown: dict[str, float] = {}
+        self._taxi_last_extend_route_index: dict[str, int] = {}
         self._last_bg_route_extension_time: float = float("-inf")
         self._edge_weights: list[float] = []
         self._routable_edges_set: set[str] = set()
@@ -374,6 +378,8 @@ class SimulationManager:
         self._db_writer_task: asyncio.Task | None = None
         self._taxi_dispatch_ids: dict[str, str] = {}
         self._taxi_dispatch_surge: dict[str, float] = {}
+        self._taxi_pickup_route_index: dict[str, int] = {}
+        self._taxi_dropoff_route_index: dict[str, int] = {}
         self._passenger_dispatch_buckets: dict[str, str] = {}
         self._taxi_last_dropoff_cells: dict[str, str] = {}
         self._taxi_appeared: set[str] = set()   # taxis that have appeared in sub_results at least once
@@ -845,6 +851,7 @@ class SimulationManager:
             self._taxi_route_len = {}
             self._bg_extend_cooldown = {}
             self._taxi_extend_cooldown = {}
+            self._taxi_last_extend_route_index = {}
             self._last_bg_route_extension_time = float("-inf")
             self._edge_weights = []
             self._routable_edges_set = set()
@@ -857,6 +864,8 @@ class SimulationManager:
             self._db_writer_task = None
             self._taxi_dispatch_ids = {}
             self._taxi_dispatch_surge = {}
+            self._taxi_pickup_route_index = {}
+            self._taxi_dropoff_route_index = {}
             self._passenger_dispatch_buckets = {}
             self._taxi_last_dropoff_cells = {}
             self._taxi_appeared.clear()
@@ -1050,6 +1059,7 @@ class SimulationManager:
                                 )
                                 traci.vehicle.subscribe(veh_id, _SUB_VARS)
                                 self._taxi_route_len[veh_id] = len(route_edges)
+                                self._taxi_last_extend_route_index.pop(veh_id, None)
                                 self._taxi_missing_since.pop(veh_id, None)
                                 print(f"[respawn] {veh_id} at sim_time={sim_time:.0f}", flush=True)
                             except traci.exceptions.TraCIException as e:
@@ -1176,21 +1186,36 @@ class SimulationManager:
                     _rrf = self._prof_counters.get("rrf_calls", 0)
                     _fr = self._prof_counters.get("findRoute_calls", 0)
                     _none = self._prof_counters.get("rrf_none", 0)
+                    _invalid_current_edge = self._prof_counters.get("rrf_invalid_current_edge", 0)
                     _tbg = self._prof_counters.get("trigger_bg", 0)
                     _ttx = self._prof_counters.get("trigger_taxi", 0)
+                    _ttx_empty = self._prof_counters.get("trigger_taxi_empty", 0)
+                    _ttx_dispatched = self._prof_counters.get("trigger_taxi_dispatched", 0)
+                    _pickup_index_reached = self._prof_counters.get("pickup_index_reached", 0)
+                    _dropoff_index_reached = self._prof_counters.get("dropoff_index_reached", 0)
                     _skip_bg_cd = self._prof_counters.get("skip_bg_cooldown", 0)
                     _skip_bg_stopped = self._prof_counters.get("skip_bg_stopped", 0)
                     _skip_bg_budget = self._prof_counters.get("skip_bg_budget", 0)
+                    _skip_taxi_stopped = self._prof_counters.get("skip_taxi_stopped", 0)
+                    _skip_taxi_static_index = self._prof_counters.get("skip_taxi_static_index", 0)
                     _avg_fr_per_rrf = (_fr / _rrf) if _rrf else 0
                     _avg_rrf_time_ms = (1000 * _prof["totals"].get("extend_routes", 0) / _rrf) if _rrf else 0
                     _lines.append(
                         f"[prof]   counts: trigger_bg={_tbg} trigger_taxi={_ttx} "
-                        f"rrf_calls={_rrf} rrf_none={_none} findRoute_calls={_fr} "
+                        f"trigger_taxi_empty={_ttx_empty} "
+                        f"trigger_taxi_dispatched={_ttx_dispatched} "
+                        f"pickup_index_reached={_pickup_index_reached} "
+                        f"dropoff_index_reached={_dropoff_index_reached} "
+                        f"rrf_calls={_rrf} rrf_none={_none} "
+                        f"rrf_invalid_current_edge={_invalid_current_edge} "
+                        f"findRoute_calls={_fr} "
                         f"findRoute/rrf={_avg_fr_per_rrf:.2f} extend/rrf={_avg_rrf_time_ms:.2f}ms"
                     )
                     _lines.append(
                         f"[prof]   skips: bg_cooldown={_skip_bg_cd} "
-                        f"bg_stopped={_skip_bg_stopped} bg_budget={_skip_bg_budget}"
+                        f"bg_stopped={_skip_bg_stopped} bg_budget={_skip_bg_budget} "
+                        f"taxi_stopped={_skip_taxi_stopped} "
+                        f"taxi_static_index={_skip_taxi_static_index}"
                     )
                     print("\n".join(_lines), flush=True)
                     _prof["totals"].clear()
@@ -1243,6 +1268,8 @@ class SimulationManager:
                                 self._record_history_dropoff(sim_time, dropoff_h3)
                             self._taxi_dispatch_ids.pop(taxi_id, None)
                             self._taxi_dispatch_surge.pop(taxi_id, None)
+                            self._taxi_pickup_route_index.pop(taxi_id, None)
+                            self._taxi_dropoff_route_index.pop(taxi_id, None)
                         self._active_trips.clear()
                     self.status = SimStatus.FINISHED
                     if broadcast_enabled and self._loop is not None and self._state_queue is not None:
@@ -1797,6 +1824,8 @@ class SimulationManager:
             return
         self._taxi_states[request.entity_id] = "empty"
         self._taxi_route_len[request.entity_id] = len(route_edges)
+        self._taxi_pickup_route_index.pop(request.entity_id, None)
+        self._taxi_dropoff_route_index.pop(request.entity_id, None)
         lat, lng = self._latlng(x, y)
         self._taxi_last_dropoff_cells[request.entity_id] = get_cell(lat, lng)
         self._schedule_ws_event("broadcast_taxi_created", request.entity_id, lat, lng)
@@ -2036,6 +2065,7 @@ class SimulationManager:
                         continue
 
                     dispatch_edges = list(route.edges)
+                    pickup_route_index = len(dispatch_edges) - 1
                     # Buffer past pickup edge: prevents network exit if taxi traverses
                     # pickup edge in one step before our pickup detection fires.
                     buf = self._random_route_from(candidate.pickup_edge)
@@ -2043,6 +2073,7 @@ class SimulationManager:
                         dispatch_edges = dispatch_edges + buf[1:]
                     traci.vehicle.setRoute(veh_id, dispatch_edges)
                     self._taxi_route_len[veh_id] = len(dispatch_edges)
+                    self._taxi_last_extend_route_index.pop(veh_id, None)
                     candidate.state = "assigned"
                     waiting_passengers.remove(candidate)
                     self._taxi_targets[veh_id] = candidate.id
@@ -2050,6 +2081,8 @@ class SimulationManager:
                     self._taxi_dispatch_times[veh_id] = sim_time
                     self._taxi_dispatch_ids[veh_id] = dispatch_id
                     self._taxi_dispatch_surge[veh_id] = decision_payload["final_surge"]
+                    self._taxi_pickup_route_index[veh_id] = pickup_route_index
+                    self._taxi_dropoff_route_index.pop(veh_id, None)
                     previous_dropoff_time = self._taxi_previous_dropoff_times.get(veh_id)
                     if previous_dropoff_time is not None:
                         # 첫 승객 전 대기시간은 정의상 제외하고, 하차 이후 다음 수락까지의 search time만 기록한다.
@@ -2080,6 +2113,9 @@ class SimulationManager:
                     passenger.state = "waiting"
                     del self._taxi_targets[veh_id]
                     self._taxi_states[veh_id] = "empty"
+                    self._taxi_last_extend_route_index.pop(veh_id, None)
+                    self._taxi_pickup_route_index.pop(veh_id, None)
+                    self._taxi_dropoff_route_index.pop(veh_id, None)
                     self._taxi_dispatch_times.pop(veh_id, None)
                     self._taxi_dispatch_surge.pop(veh_id, None)
                     waiting_passengers.append(passenger)
@@ -2087,12 +2123,22 @@ class SimulationManager:
                     if old_dispatch_id:
                         self._push_db_event({"type": "dispatch_timeout", "id": old_dispatch_id})
                     continue
-                if road_id == passenger.pickup_edge:
+                route_index = vals.get(tc.VAR_ROUTE_INDEX)
+                pickup_index = self._taxi_pickup_route_index.get(veh_id)
+                pickup_reached_by_index = (
+                    pickup_index is not None
+                    and route_index is not None
+                    and route_index >= pickup_index
+                )
+                if road_id == passenger.pickup_edge or pickup_reached_by_index:
+                    if not road_id or road_id.startswith(":") or road_id not in self._routable_edges_set:
+                        continue
                     try:
                         route = traci.simulation.findRoute(road_id, passenger.dropoff_edge)
                         if not route.edges:
                             continue
                         trip_edges = list(route.edges)
+                        dropoff_route_index = len(trip_edges) - 1
                         # Buffer past dropoff edge: prevents network exit if taxi traverses
                         # dropoff edge in one step before our dropoff detection fires.
                         buf = self._random_route_from(passenger.dropoff_edge)
@@ -2104,6 +2150,11 @@ class SimulationManager:
                     passenger.state = "picked_up"
                     self._record_passenger_boarded_kpi(passenger, sim_time)
                     self._taxi_states[veh_id] = "occupied"
+                    self._taxi_last_extend_route_index.pop(veh_id, None)
+                    self._taxi_pickup_route_index.pop(veh_id, None)
+                    self._taxi_dropoff_route_index[veh_id] = dropoff_route_index
+                    if pickup_reached_by_index and road_id != passenger.pickup_edge and SIM_PROFILE:
+                        self._prof_counters["pickup_index_reached"] += 1
                     dispatch_time = self._taxi_dispatch_times.pop(veh_id, sim_time)
                     dispatch_surge = self._taxi_dispatch_surge.pop(veh_id, 1.0)
                     self._active_trips[veh_id] = TripAccumulator(
@@ -2169,6 +2220,9 @@ class SimulationManager:
                     del self._active_trips[veh_id]
                     del self._taxi_targets[veh_id]
                     self._taxi_states[veh_id] = "empty"
+                    self._taxi_last_extend_route_index.pop(veh_id, None)
+                    self._taxi_pickup_route_index.pop(veh_id, None)
+                    self._taxi_dropoff_route_index.pop(veh_id, None)
                     self._taxi_dispatch_ids.pop(veh_id, None)
                     self._taxi_dispatch_surge.pop(veh_id, None)
                     route = self._random_route_from(road_id)
@@ -2180,7 +2234,14 @@ class SimulationManager:
                         # 다음 스텝에 _extend_vehicle_routes가 즉시 연장을 시도하게 한다.
                         self._taxi_route_len[veh_id] = 0
                     continue
-                if road_id == passenger.dropoff_edge:
+                route_index = vals.get(tc.VAR_ROUTE_INDEX)
+                dropoff_index = self._taxi_dropoff_route_index.get(veh_id)
+                dropoff_reached_by_index = (
+                    dropoff_index is not None
+                    and route_index is not None
+                    and route_index >= dropoff_index
+                )
+                if road_id == passenger.dropoff_edge or dropoff_reached_by_index:
                     accum = self._active_trips[veh_id]
                     dropoff_h3 = passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
                     meter_fare = calculate_meter_fare(accum)
@@ -2218,6 +2279,11 @@ class SimulationManager:
                     del self._active_trips[veh_id]
                     del self._taxi_targets[veh_id]
                     self._taxi_states[veh_id] = "empty"
+                    self._taxi_last_extend_route_index.pop(veh_id, None)
+                    self._taxi_pickup_route_index.pop(veh_id, None)
+                    self._taxi_dropoff_route_index.pop(veh_id, None)
+                    if dropoff_reached_by_index and road_id != passenger.dropoff_edge and SIM_PROFILE:
+                        self._prof_counters["dropoff_index_reached"] += 1
                     self._taxi_dispatch_ids.pop(veh_id, None)
                     self._taxi_dispatch_surge.pop(veh_id, None)
                     route = self._random_route_from(road_id)
@@ -2242,6 +2308,9 @@ class SimulationManager:
                     passenger.state = "waiting"
                     waiting_passengers.append(passenger)
             self._taxi_states[veh_id] = "empty"
+            self._taxi_last_extend_route_index.pop(veh_id, None)
+            self._taxi_pickup_route_index.pop(veh_id, None)
+            self._taxi_dropoff_route_index.pop(veh_id, None)
             self._taxi_dispatch_times.pop(veh_id, None)
             self._taxi_dispatch_ids.pop(veh_id, None)
             self._taxi_dispatch_surge.pop(veh_id, None)
@@ -2292,6 +2361,8 @@ class SimulationManager:
                     self._taxi_last_dropoff_cells[taxi_id] = dropoff_h3
                 self._active_trips.pop(taxi_id, None)
                 self._taxi_states.pop(taxi_id, None)
+                self._taxi_pickup_route_index.pop(taxi_id, None)
+                self._taxi_dropoff_route_index.pop(taxi_id, None)
                 self._taxi_dispatch_times.pop(taxi_id, None)
                 self._taxi_dispatch_ids.pop(taxi_id, None)
                 self._taxi_dispatch_surge.pop(taxi_id, None)
@@ -2455,15 +2526,41 @@ class SimulationManager:
 
             elif self._is_taxi_id(veh_id):
                 # empty·dispatched 택시만 연장 (occupied 경로는 트립 로직이 관리)
-                if self._taxi_states.get(veh_id, "empty") not in ("empty", "dispatched"):
+                taxi_state = self._taxi_states.get(veh_id, "empty")
+                if taxi_state not in ("empty", "dispatched"):
+                    self._taxi_last_extend_route_index.pop(veh_id, None)
                     continue
+                if taxi_state != "dispatched":
+                    self._taxi_last_extend_route_index.pop(veh_id, None)
                 if sim_time < self._taxi_extend_cooldown.get(veh_id, 0.0):
                     continue
                 route_len = self._taxi_route_len.get(veh_id)
-                if route_len is None or route_len - 1 - route_index > _ROUTE_EXTEND_REMAINING:
+                remaining_edges = route_len - 1 - route_index if route_len is not None else None
+                if remaining_edges is None or remaining_edges > _ROUTE_EXTEND_REMAINING:
                     continue
+                critical_remaining_edges = (
+                    _DISPATCHED_TAXI_CRITICAL_REMAINING_EDGES
+                    if taxi_state == "dispatched"
+                    else _TAXI_CRITICAL_REMAINING_EDGES
+                )
+                speed = vals.get(tc.VAR_SPEED, _TAXI_ROUTE_EXTENSION_MIN_SPEED_MPS + 1.0)
+                if (
+                    speed <= _TAXI_ROUTE_EXTENSION_MIN_SPEED_MPS
+                    and remaining_edges > critical_remaining_edges
+                ):
+                    if SIM_PROFILE:
+                        self._prof_counters["skip_taxi_stopped"] += 1
+                    continue
+                if taxi_state == "dispatched" and remaining_edges > critical_remaining_edges:
+                    previous_route_index = self._taxi_last_extend_route_index.get(veh_id)
+                    self._taxi_last_extend_route_index[veh_id] = route_index
+                    if previous_route_index == route_index:
+                        if SIM_PROFILE:
+                            self._prof_counters["skip_taxi_static_index"] += 1
+                        continue
                 if SIM_PROFILE:
                     self._prof_counters["trigger_taxi"] += 1
+                    self._prof_counters[f"trigger_taxi_{taxi_state}"] += 1
                 new_route = self._random_route_from(
                     road_id,
                     min_edges=_TAXI_EXTENSION_MIN_ROUTE_EDGES,
@@ -2473,6 +2570,7 @@ class SimulationManager:
                         traci.vehicle.setRoute(veh_id, new_route)
                         self._taxi_route_len[veh_id] = len(new_route)
                         self._taxi_extend_cooldown[veh_id] = sim_time + _TAXI_EXTENSION_COOLDOWN_S
+                        self._taxi_last_extend_route_index.pop(veh_id, None)
                     except traci.exceptions.TraCIException:
                         pass  # route_len 유지 → 다음 스텝 재시도
 
@@ -2517,6 +2615,14 @@ class SimulationManager:
         점차 길이를 낮춰 2개까지 폴백, 모두 실패 시 None."""
         if SIM_PROFILE:
             self._prof_counters["rrf_calls"] += 1
+        if (
+            not current_edge
+            or current_edge.startswith(":")
+            or current_edge not in self._routable_edges_set
+        ):
+            if SIM_PROFILE:
+                self._prof_counters["rrf_invalid_current_edge"] += 1
+            return None
         edges = self._routable_edges
         weights = self._edge_weights if len(self._edge_weights) == len(edges) else None
 

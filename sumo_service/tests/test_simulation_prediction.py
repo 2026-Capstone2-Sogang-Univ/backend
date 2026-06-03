@@ -330,6 +330,7 @@ def test_trip_completion_paths_record_dropoff_history(monkeypatch):
 
 
 def test_prediction_provider_is_closed_on_reinitialize_and_run_reset(monkeypatch):
+    monkeypatch.setattr(simulation, "PASSENGER_SOURCE", "random")
     manager = SimulationManager(ExperimentConfig())
     manager._latlng = lambda x, y: (x, y)
     manager._routable_edges = []
@@ -354,6 +355,7 @@ def test_prediction_provider_is_closed_on_reinitialize_and_run_reset(monkeypatch
 
 
 def test_run_experiment_emits_prediction_history_and_surge_diagnostics(monkeypatch):
+    monkeypatch.setattr(simulation, "PASSENGER_SOURCE", "random")
     manager = SimulationManager(ExperimentConfig())
     provider = ClosableProvider()
     provider.diagnostics = lambda: {"prediction_request_count": 2}
@@ -398,6 +400,7 @@ def test_run_experiment_emits_prediction_history_and_surge_diagnostics(monkeypat
 
 
 def test_run_experiment_closes_prediction_provider_before_diagnostics(monkeypatch):
+    monkeypatch.setattr(simulation, "PASSENGER_SOURCE", "random")
     manager = SimulationManager(ExperimentConfig())
     provider = CloseSettledDiagnosticsProvider()
 
@@ -419,6 +422,7 @@ def test_run_experiment_closes_prediction_provider_before_diagnostics(monkeypatc
 
 
 def test_run_experiment_resets_stale_run_state_before_loop(monkeypatch):
+    monkeypatch.setattr(simulation, "PASSENGER_SOURCE", "random")
     manager = SimulationManager(ExperimentConfig())
     stale_provider = ClosableProvider()
     manager._prediction_demand_provider = stale_provider
@@ -443,6 +447,9 @@ def test_run_experiment_resets_stale_run_state_before_loop(monkeypatch):
     manager._routable_edges_set = {"edge_old"}
     manager._edge_weights = [1.0]
     manager._taxi_route_len = {"taxi_1": 2}
+    manager._taxi_last_extend_route_index = {"taxi_1": 1}
+    manager._taxi_pickup_route_index = {"taxi_1": 1}
+    manager._taxi_dropoff_route_index = {"taxi_1": 2}
     manager._bg_route_len = {"bg_1": 2}
     manager._trip_queue = [{"sim_time": 1.0}]
     manager._completed_passengers = [{"passenger_id": "p_stale"}]
@@ -476,6 +483,9 @@ def test_run_experiment_resets_stale_run_state_before_loop(monkeypatch):
         assert manager._routable_edges_set == set()
         assert manager._edge_weights == []
         assert manager._taxi_route_len == {}
+        assert manager._taxi_last_extend_route_index == {}
+        assert manager._taxi_pickup_route_index == {}
+        assert manager._taxi_dropoff_route_index == {}
         assert manager._bg_route_len == {}
         assert manager._trip_queue == []
         assert manager._completed_passengers == []

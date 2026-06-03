@@ -45,13 +45,21 @@ def make_passenger(
     )
 
 
-def make_sub_entry(x=0.0, y=0.0, speed=10.0, distance=100.0, road_id="some_edge"):
+def make_sub_entry(
+    x=0.0,
+    y=0.0,
+    speed=10.0,
+    distance=100.0,
+    road_id="some_edge",
+    route_index=0,
+):
     return {
         tc.VAR_POSITION: (x, y),
         tc.VAR_ANGLE: 0.0,
         tc.VAR_SPEED: speed,
         tc.VAR_DISTANCE: distance,
         tc.VAR_ROAD_ID: road_id,
+        tc.VAR_ROUTE_INDEX: route_index,
     }
 
 
@@ -87,6 +95,7 @@ def test_dispatch_empty_taxi_to_waiting_passenger():
     assert mgr._taxi_states["taxi_0"] == "dispatched"
     assert p.state == "assigned"
     assert mgr._taxi_targets["taxi_0"] == "p_0"
+    assert mgr._taxi_pickup_route_index["taxi_0"] == 1
 
 
 def test_dispatch_selects_nearest_passenger():
@@ -217,6 +226,38 @@ def test_pickup_when_taxi_on_pickup_edge():
     assert "taxi_0" in mgr._active_trips
 
 
+def test_pickup_when_taxi_passed_pickup_route_index(monkeypatch):
+    monkeypatch.setattr("app.simulation.SIM_PROFILE", True)
+    mgr = make_manager()
+    p = make_passenger(state="assigned", pickup_edge="pickup_edge", dropoff_edge="dropoff_edge")
+    mgr._passengers["p_0"] = p
+    mgr._taxi_states["taxi_0"] = "dispatched"
+    mgr._taxi_targets["taxi_0"] = "p_0"
+    mgr._taxi_dispatch_times["taxi_0"] = 0.0
+    mgr._taxi_pickup_route_index["taxi_0"] = 1
+    _traci_stub.simulation.findRoute = MagicMock(
+        return_value=MagicMock(edges=["buffer_edge", "dropoff_edge"])
+    )
+    _traci_stub.vehicle.setRoute = MagicMock()
+    _traci_stub.vehicle.getDistance = MagicMock(return_value=80.0)
+    sub = {
+        "taxi_0": make_sub_entry(
+            road_id="buffer_edge",
+            route_index=2,
+        )
+    }
+    mgr._routable_edges.append("buffer_edge")
+    mgr._routable_edges_set.add("buffer_edge")
+
+    mgr._update_taxi_states(100.0, sub)
+
+    assert mgr._taxi_states["taxi_0"] == "occupied"
+    assert p.state == "picked_up"
+    assert "taxi_0" not in mgr._taxi_pickup_route_index
+    assert mgr._taxi_dropoff_route_index["taxi_0"] == 1
+    assert mgr._prof_counters["pickup_index_reached"] == 1
+
+
 def test_pickup_creates_trip_accumulator():
     mgr = make_manager()
     p = make_passenger(state="assigned", pickup_edge="pickup_edge")
@@ -285,6 +326,40 @@ def test_dropoff_when_taxi_on_dropoff_edge():
     assert mgr._taxi_states["taxi_0"] == "empty"
     assert "p_0" not in mgr._passengers
     assert "taxi_0" not in mgr._active_trips
+
+
+def test_dropoff_when_taxi_passed_dropoff_route_index(monkeypatch):
+    monkeypatch.setattr("app.simulation.SIM_PROFILE", True)
+    mgr = make_manager()
+    p = make_passenger(state="picked_up", dropoff_edge="dropoff_edge")
+    mgr._passengers["p_0"] = p
+    mgr._taxi_states["taxi_0"] = "occupied"
+    mgr._taxi_targets["taxi_0"] = "p_0"
+    mgr._taxi_dropoff_route_index["taxi_0"] = 1
+    mgr._active_trips["taxi_0"] = TripAccumulator(
+        passenger_id="p_0",
+        pickup_sim_time=50.0,
+        last_distance_snapshot=0.0,
+        surge=1.0,
+    )
+    _traci_stub.vehicle.setRoute = MagicMock()
+    sub = {
+        "taxi_0": make_sub_entry(
+            road_id="buffer_edge",
+            route_index=2,
+            distance=500.0,
+        )
+    }
+    mgr._routable_edges.append("buffer_edge")
+    mgr._routable_edges_set.add("buffer_edge")
+
+    fare_updates = mgr._update_taxi_states(100.0, sub)
+
+    assert len(fare_updates) == 1
+    assert "taxi_0" not in mgr._active_trips
+    assert "p_0" not in mgr._passengers
+    assert "taxi_0" not in mgr._taxi_dropoff_route_index
+    assert mgr._prof_counters["dropoff_index_reached"] == 1
 
 
 def test_trip_timeout_forces_fare():
