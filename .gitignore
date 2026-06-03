@@ -177,6 +177,9 @@ pyrightconfig.json
 
 .temp
 
+# 로컬 실험 산출·대용량 요청 덤프
+predict_request_*.json
+*.png
 
 # 원시 택시 데이터 (대용량, 로컬에서만 보관)
 real_taxi_data/
