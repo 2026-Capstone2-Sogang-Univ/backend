@@ -28,7 +28,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime as _datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -39,7 +39,8 @@ import traci.exceptions
 from traci import constants as tc
 
 from .coord import make_sumolib_converter, sumo_to_latlng
-from .demand_history import DemandHistoryStore
+from .demand_history import DemandHistoryStore, floor_to_15min
+from .module3_validation import horizon_eval_snapshot
 from .driver.decision_function import (
     acceptance_features as _acceptance_features,
     acceptance_probability as _acceptance_probability,
@@ -56,10 +57,23 @@ from .fare import (
     calculate_meter_fare,
     estimate_fare,
 )
-from .grid import DEFAULT_ELASTICITY, H3_RESOLUTION, cell_center_latlng, compute_surge, get_cell
+from .grid import (
+    DEFAULT_ELASTICITY,
+    H3_RESOLUTION,
+    cell_center_latlng,
+    cells_within_k_ring,
+    compute_surge,
+    get_cell,
+)
 from .h3_cells import load_model_h3_cells
 from .passenger import Passenger
 from .pricing import apply_surge_limits, compute_raw_surge
+from .rebalance import (
+    acceptance_bonus_from_raw_surge,
+    gaussian_cell_weight,
+    select_top_surge_deficit_cells,
+)
+from .experiment_pacing import resolve_experiment_pacing
 from .prediction import PredictionDemandProvider
 from .weather import StaticWeatherProvider
 
@@ -82,6 +96,8 @@ SUMO_NET = str(
 SUMO_BINARY = "sumo-gui" if os.getenv("SUMO_GUI") == "1" else "sumo"
 
 SIM_DURATION = float(os.getenv("SIM_DURATION", "3600"))        # simulated seconds
+# Docker / batch progress: log every N sim-seconds (0 = disabled).
+SIM_PROGRESS_LOG_INTERVAL_S = float(os.getenv("SIM_PROGRESS_LOG_INTERVAL_S", "500"))
 FRAME_RATE = 60.0  # broadcast fps (WebSocket messages per real second)
 SIMULATION_SPEED = float(os.getenv("SIMULATION_SPEED", "20"))  # simulated seconds per real second
 STEP_LENGTH = (
@@ -90,7 +106,36 @@ STEP_LENGTH = (
 REAL_STEP_SLEEP = 1.0 / FRAME_RATE  # real seconds between TraCI steps
 
 N_TAXIS = int(os.getenv("N_TAXIS", "300"))
-N_BACKGROUND_CARS = 1200
+
+
+def _resolve_n_background_cars() -> int:
+    raw = os.getenv("N_BACKGROUND_CARS", "").strip()
+    if raw:
+        return max(0, int(raw))
+    if os.getenv("EXPERIMENT_FAST", "1").strip().lower() not in ("0", "false", "no"):
+        return 200
+    return 1200
+
+
+N_BACKGROUND_CARS = _resolve_n_background_cars()
+# Fast bench: cap empty-taxi dispatch tries per step when waiting backlog is large.
+_DISPATCH_BACKLOG_WAIT_THRESHOLD = int(os.getenv("DISPATCH_BACKLOG_WAIT_THRESHOLD", "60"))
+_DISPATCH_MAX_EMPTY_PER_STEP_FAST = int(os.getenv("DISPATCH_MAX_EMPTY_PER_STEP_FAST", "80"))
+BENCH_MAX_FIND_ROUTE_PER_STEP = int(os.getenv("BENCH_MAX_FIND_ROUTE_PER_STEP", "600"))
+# After reject / failed offer: skip repeat findRoute for same taxi (and optionally taxi×passenger).
+TAXI_DISPATCH_COOLDOWN_S = float(os.getenv("TAXI_DISPATCH_COOLDOWN_S", "5"))
+PAIR_DISPATCH_COOLDOWN_S = float(os.getenv("PAIR_DISPATCH_COOLDOWN_S", "60"))
+DISPATCH_H3_K_RING = int(os.getenv("DISPATCH_H3_K_RING", "1"))
+DISPATCH_H3_FILTER = os.getenv("DISPATCH_H3_FILTER", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+# NYC Q90 accepted pickup ~2.14 mi — skip findRoute beyond this straight-line cap.
+PICKUP_MAX_EUCLIDEAN_MILES = float(os.getenv("PICKUP_MAX_EUCLIDEAN_MILES", "2.14"))
+PICKUP_MAX_EUCLIDEAN_M_SQ = (PICKUP_MAX_EUCLIDEAN_MILES * 1609.344) ** 2
+# Waiting passenger natural churn (0 = disabled). Default 15 sim-min.
+PASSENGER_WAIT_ABANDON_S = float(os.getenv("PASSENGER_WAIT_ABANDON_S", "900"))
 
 PASSENGER_SPAWN_INTERVAL = 300.0
 PASSENGER_LAMBDA = int(os.getenv("PASSENGER_LAMBDA", "5"))
@@ -138,6 +183,7 @@ HOTSPOTS: list[tuple[float, float, float]] = [
 ]
 HOTSPOT_SIGMA_M = 300.0     # 가우시안 감쇠 스케일 (m)
 HOTSPOT_BASE_WEIGHT = 1.0   # 모든 엣지 최소 가중치
+REBALANCE_SIGMA_M = 400.0   # 고서지 H3 셀 중심으로 빈차 유도 시 감쇠 스케일 (m)
 
 _SUB_VARS = [tc.VAR_POSITION, tc.VAR_ANGLE, tc.VAR_SPEED, tc.VAR_DISTANCE, tc.VAR_ROAD_ID, tc.VAR_ROUTE_INDEX]
 # bg 차량은 위치 스냅샷이 필요 없고 경로 연장 판정에 쓰는 값만 구독한다.
@@ -148,6 +194,8 @@ _BG_SUB_VARS = [tc.VAR_ROAD_ID, tc.VAR_ROUTE_INDEX]
 # 값이 2면 "마지막 세 엣지를 한 스텝에 모두 통과"해야만 누락되므로 짧은 커넥터 엣지로 인한
 # 잔여 소실이 크게 줄어든다.
 _ROUTE_EXTEND_REMAINING = 2
+# route_len이 없을 때 매 스텝 findRoute를 돌리지 않도록 최소 간격(시뮬 초).
+_ROUTE_EXTEND_RETRY_SIM_S = 15.0
 # 경로 연장이 성공하면 차량은 새 경로의 index 0에서 시작하고 (경로길이 - _ROUTE_EXTEND_REMAINING - 1)
 # 엣지를 주행한 뒤 다시 연장한다. 짧은 경로가 매 스텝 재연장(findRoute 폭증)되는 것을 막기 위해
 # 라우팅이 돌려주는 경로 길이의 최소 목표치를 둔다 (재연장 주기 ≥ _MIN_ROUTE_EDGES - _ROUTE_EXTEND_REMAINING - 1).
@@ -231,23 +279,52 @@ class SimStatus(str, Enum):
 # None이면 기존 WebSocket/DB/실시간 pacing 경로를 그대로 사용하고, 값이 있으면 빠른 동기 실행 경로를 탄다.
 @dataclass(frozen=True)
 class ExperimentConfig:
+    # Single-bucket P* override (default: high-surge band). Use target_matching_rate_overrides for multi-band sweeps.
     target_p: float | None = None
+    target_p_bucket: str = "raw_gte_3_5"
+    # e.g. (("raw_gte_3_5", 0.90), ("raw_lt_3_5", 0.82))
+    target_matching_rate_overrides: tuple[tuple[str, float], ...] | None = None
     elasticity: float = DEFAULT_ELASTICITY
     beta_f: float | None = None
     seed: int = 42
     sim_duration: float = SIM_DURATION
     # 운영(start)과 같은 step rate를 기본값으로 둬야 sweep 결과를 운영에 옮길 수 있다.
-    step_length: float = STEP_LENGTH
-    real_sleep: float = 0.0
+    # fast=True: bench (step≈1s, no wall-clock sleep). fast=False: Lab pacing (SIMULATION_SPEED).
+    fast: bool = False
+    simulation_speed: float = field(
+        default_factory=lambda: float(os.getenv("SIMULATION_SPEED", "20"))
+    )
+    step_length: float | None = None
+    real_sleep: float | None = None
+    # Predicted-demand policy: surge + Module 3 API refresh cadence (wall clock).
+    policy_update_interval_real_s: float = field(
+        default_factory=lambda: float(os.getenv("POLICY_UPDATE_INTERVAL_REAL_S", "900"))
+    )
+    # Bench (--fast): refresh prediction every N sim-seconds (default 900 = 15 sim-min).
+    policy_update_interval_sim_s: float = field(
+        default_factory=lambda: float(os.getenv("POLICY_UPDATE_INTERVAL_SIM_S", "900"))
+    )
     broadcast: bool = False
-    demand_source: str = "actual"
-    prediction_mode: str = "none"
+    demand_source: str = "predicted"
+    prediction_mode: str = "sync"
     prediction_url: str = "https://module3-ml.onrender.com/predict"
     prediction_horizon_min: int = 15
     prediction_fallback_policy: str = "error"
     passenger_elasticity: float = 0.0
     alpha_sensitivity: float = 1.0
     weather_source: str = "static"
+    # matching: 역산 fare만. rebalance: 역산 fare + 빈차 고서지 재배치(공급 보조).
+    policy_mode: str = "matching"
+    rebalance_interval_s: float = 60.0
+    rebalance_top_k: int = 8
+    rebalance_min_raw_surge: float = 1.5
+    rebalance_acceptance_coef: float = 0.08
+    n_taxis: int | None = None
+    passenger_lambda: int | None = None
+    dispatch_max_candidates: int | None = None
+    surge_max: float | None = None
+    # 구간별 플랫폼 인센티브(USD): (<1.5, <2.5, <3.5, >=3.5 raw_surge)
+    band_incentive_usd: tuple[float, float, float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -280,10 +357,35 @@ class KpiBucketState:
     request_count: int = 0
     matched_count: int = 0
     wait_seconds: list[float] | None = None
+    p_actual_sum: float = 0.0
+    p_actual_count: int = 0
 
     def __post_init__(self) -> None:
         if self.wait_seconds is None:
             self.wait_seconds = []
+
+
+@dataclass
+class FastBenchDispatchStats:
+    """Running dispatch KPIs when fast bench skips per-decision _event_log rows."""
+
+    decision_count: int = 0
+    accept_count: int = 0
+    offered_passenger_ids: set[str] = field(default_factory=set)
+    matched_passenger_ids: set[str] = field(default_factory=set)
+    decisions_per_passenger: dict[str, int] = field(default_factory=dict)
+    matching_rate_error_sum: float = 0.0
+    matching_rate_error_abs_sum: float = 0.0
+    matching_rate_error_count: int = 0
+    surge_clamped_count: int = 0
+    final_surge_sum: float = 0.0
+    final_surge_count: int = 0
+    final_fare_sum: float = 0.0
+    final_fare_count: int = 0
+    required_fare_sum: float = 0.0
+    required_fare_count: int = 0
+    p_actual_sum: float = 0.0
+    p_actual_count: int = 0
 
 
 @dataclass
@@ -321,7 +423,19 @@ class SimulationManager:
         self._taxi_dispatch_times: dict[str, float] = {}
         self._last_spawn_interval: int = -1
         self._last_surge_interval: int = -1
+        self._last_progress_log_bucket: int = -1
+        self._last_policy_wall_time: float | None = None
+        self._last_policy_sim_time: float | None = None
+        self._cached_predicted_demand: dict[str, float] | None = None
+        self._forecasts_by_target_sim_time: dict[float, dict[str, float]] = {}
+        self._forecast_issued_sim_time: dict[float, float] = {}
+        self._evaluated_forecast_targets: set[float] = set()
+        self._last_rebalance_interval: int = -1
         self._routable_edges: list[str] = []
+        self._h3_to_edges: dict[str, list[str]] = {}
+        self._last_grid_supply: dict[str, int] = {}
+        self._last_grid_demand: dict[str, int] = {}
+        self._rebalance_edge_weights: list[float] | None = None
         self._surge_cells: list[dict] = []
         # WebSocket은 list 형태가 필요하지만 배차 판단은 pickup H3로 즉시 조회해야 하므로 dict 캐시를 함께 둔다.
         self._surge_by_h3: dict[str, float] = {}
@@ -337,6 +451,7 @@ class SimulationManager:
         # veh_id → 현재 할당된 경로의 엣지 수. route_index와 비교해 끝에 근접했는지 판정.
         self._bg_route_len: dict[str, int] = {}
         self._taxi_route_len: dict[str, int] = {}
+        self._route_extend_retry_after: dict[str, float] = {}
         self._edge_weights: list[float] = []
         self._routable_edges_set: set[str] = set()
         self._run_id: int | None = None
@@ -353,6 +468,13 @@ class SimulationManager:
         self._bg_missing_since: dict[str, float] = {}
         # 실험 모드는 DB 대신 메모리 이벤트 로그로 KPI를 집계한다.
         self._event_log: list[dict] = []
+        self._dispatch_pricing_cache: dict[str, dict] = {}
+        self._dispatch_taxi_round: int = 0
+        self._find_route_calls_this_step: int = 0
+        self._fast_dispatch_stats: FastBenchDispatchStats | None = None
+        self._taxi_dispatch_cooldown_until: dict[str, float] = {}
+        self._pair_dispatch_cooldown_until: dict[tuple[str, str], float] = {}
+        self._rejected_dispatch_pairs: set[tuple[str, str]] = set()
         # 기사 빈차 대기시간은 이전 하차 시각과 다음 수락 시각의 차이로 계산한다.
         self._taxi_previous_dropoff_times: dict[str, float] = {}
         self._manual_requests: deque[ManualCreationRequest] = deque()
@@ -366,7 +488,247 @@ class SimulationManager:
         self._runtime_initial_passenger_count: int = 0
         self._target_matching_rates: dict[str, float] = dict(DEFAULT_TARGET_MATCHING_RATES)
         self._pricing_policy: dict[str, float] = dict(DEFAULT_PRICING_POLICY)
-        self._runtime_kpi: RuntimeKpiState = self._new_runtime_kpi()
+        self._apply_experiment_overrides()
+        self._runtime_kpi: RuntimeKpiState = self._new_runtime_kpi(self._target_matching_rates)
+
+    @staticmethod
+    def _resolve_target_matching_rates_from_config(
+        config: ExperimentConfig | None,
+    ) -> dict[str, float]:
+        rates = dict(DEFAULT_TARGET_MATCHING_RATES)
+        if config is None:
+            return rates
+        if config.target_matching_rate_overrides:
+            for bucket, value in config.target_matching_rate_overrides:
+                if bucket not in rates:
+                    raise ValueError(
+                        f"unknown target_matching_rate bucket {bucket!r}; "
+                        f"expected one of {sorted(rates)}"
+                    )
+                p = float(value)
+                if not 0.0 < p <= 1.0:
+                    raise ValueError(f"target P* for {bucket!r} must be in (0, 1], got {p}")
+                rates[bucket] = p
+        if config.target_p is not None:
+            bucket = config.target_p_bucket
+            if bucket not in rates:
+                raise ValueError(
+                    f"unknown target_p_bucket {bucket!r}; expected one of {sorted(rates)}"
+                )
+            p = float(config.target_p)
+            if not 0.0 < p <= 1.0:
+                raise ValueError(f"target_p must be in (0, 1], got {p}")
+            rates[bucket] = p
+        return rates
+
+    def _sync_runtime_kpi_bucket_targets(self) -> None:
+        """Keep band KPI target_rate aligned with _target_matching_rates after overrides."""
+        for bucket, state in self._runtime_kpi.buckets.items():
+            if bucket in self._target_matching_rates:
+                state.target_rate = self._target_matching_rates[bucket]
+
+    def _apply_experiment_overrides(self) -> None:
+        config = self.experiment_config
+        if config is None:
+            return
+        if config.n_taxis is not None:
+            self._runtime_taxi_count = int(config.n_taxis)
+        if config.surge_max is not None:
+            self._pricing_policy["surge_max"] = float(config.surge_max)
+        if config.alpha_sensitivity is not None:
+            self._pricing_policy["alpha_sensitivity"] = float(config.alpha_sensitivity)
+        self._target_matching_rates = self._resolve_target_matching_rates_from_config(config)
+        if hasattr(self, "_runtime_kpi"):
+            self._sync_runtime_kpi_bucket_targets()
+
+    def _passenger_lambda(self) -> int:
+        if self.experiment_config is not None and self.experiment_config.passenger_lambda is not None:
+            return int(self.experiment_config.passenger_lambda)
+        return PASSENGER_LAMBDA
+
+    def _dispatch_max_candidates(self) -> int:
+        if (
+            self.experiment_config is not None
+            and self.experiment_config.dispatch_max_candidates is not None
+        ):
+            return int(self.experiment_config.dispatch_max_candidates)
+        return DISPATCH_MAX_CANDIDATES
+
+    def _uses_realtime_policy_cadence(self) -> bool:
+        config = self.experiment_config
+        return config is not None and config.demand_source == "predicted"
+
+    def _policy_update_interval_real_s(self) -> float:
+        config = self.experiment_config
+        if config is not None:
+            return float(config.policy_update_interval_real_s)
+        return float(os.getenv("POLICY_UPDATE_INTERVAL_REAL_S", "900"))
+
+    def _policy_update_interval_sim_s(self) -> float:
+        config = self.experiment_config
+        if config is not None:
+            return float(config.policy_update_interval_sim_s)
+        return float(os.getenv("POLICY_UPDATE_INTERVAL_SIM_S", "900"))
+
+    def _maybe_log_sim_progress(self, sim_time: float, sim_duration: float) -> None:
+        """Emit periodic progress to stdout (visible in docker logs)."""
+        if SIM_PROGRESS_LOG_INTERVAL_S <= 0:
+            return
+        bucket = int(sim_time // SIM_PROGRESS_LOG_INTERVAL_S)
+        if bucket <= 0 or bucket <= self._last_progress_log_bucket:
+            return
+        self._last_progress_log_bucket = bucket
+
+        waiting = sum(1 for p in self._passengers.values() if p.state == "waiting")
+        assigned = sum(1 for p in self._passengers.values() if p.state == "assigned")
+        active_trips = len(self._active_trips)
+        pct = (100.0 * sim_time / sim_duration) if sim_duration > 0 else 0.0
+
+        label = ""
+        config = self.experiment_config
+        if config is not None:
+            label = (
+                f" demand={config.demand_source} policy={config.policy_mode}"
+                f" taxis={config.n_taxis or self._runtime_taxi_count}"
+            )
+
+        print(
+            f"[progress] sim_time={sim_time:.0f}/{sim_duration:.0f} ({pct:.1f}%)"
+            f"{label}"
+            f" waiting={waiting} assigned={assigned}"
+            f" active_trips={active_trips} completed_trips={self._completed_trip_count}",
+            flush=True,
+        )
+        if self.experiment_config is not None and self.experiment_config.fast:
+            fds = self._fast_dispatch_stats
+            print(
+                f"[progress] event_log_rows={len(self._event_log)} "
+                f"dispatch_stats={fds.decision_count if fds else 0}",
+                flush=True,
+            )
+
+    def _should_fetch_prediction(self, sim_time: float) -> bool:
+        if not self._uses_realtime_policy_cadence():
+            return False
+        config = self.experiment_config
+        if config is not None and config.fast:
+            if self._last_policy_sim_time is None:
+                self._last_policy_sim_time = sim_time
+                return True
+            if sim_time - self._last_policy_sim_time >= self._policy_update_interval_sim_s():
+                self._last_policy_sim_time = sim_time
+                return True
+            return False
+        now = time.perf_counter()
+        if self._last_policy_wall_time is None:
+            self._last_policy_wall_time = now
+            return True
+        if now - self._last_policy_wall_time >= self._policy_update_interval_real_s():
+            self._last_policy_wall_time = now
+            return True
+        return False
+
+    def _surge_recompute_interval_sim_s(self) -> float:
+        if self.experiment_config is not None and self.experiment_config.fast:
+            return float(os.getenv("SURGE_RECOMPUTE_INTERVAL_S", "15"))
+        return 5.0
+
+    def _should_recompute_surge_grid(self, sim_time: float) -> bool:
+        interval_s = self._surge_recompute_interval_sim_s()
+        surge_interval = int(sim_time / interval_s)
+        if surge_interval > self._last_surge_interval:
+            self._last_surge_interval = surge_interval
+            return True
+        return False
+
+    def _bench_skip_surge_cell_diagnostics(self) -> bool:
+        """Actual fast bench: skip per-H3 diagnostic rows (M3 predicted runs still record)."""
+        config = self.experiment_config
+        return (
+            config is not None
+            and config.fast
+            and config.demand_source == "actual"
+        )
+
+    def _find_route_budget_ok(self) -> bool:
+        config = self.experiment_config
+        if config is None or not config.fast:
+            return True
+        return self._find_route_calls_this_step < BENCH_MAX_FIND_ROUTE_PER_STEP
+
+    def _sim_find_route(self, from_edge: str, to_edge: str):
+        if not self._find_route_budget_ok():
+            raise traci.exceptions.TraCIException("bench findRoute budget exhausted")
+        self._find_route_calls_this_step += 1
+        return traci.simulation.findRoute(from_edge, to_edge)
+
+    def _prediction_horizon_sim_seconds(self) -> float:
+        config = self.experiment_config
+        minutes = config.prediction_horizon_min if config else 15
+        return float(minutes) * 60.0
+
+    def _target_sim_time(self, sim_time: float) -> float:
+        sim_dt = SIM_BASE_DATETIME + timedelta(seconds=sim_time)
+        target_dt = floor_to_15min(
+            sim_dt + timedelta(minutes=self.experiment_config.prediction_horizon_min)
+        )
+        return (target_dt - SIM_BASE_DATETIME).total_seconds()
+
+    def _register_prediction_forecast(self, sim_time: float, demand: dict[str, float]) -> None:
+        target_sim_time = self._target_sim_time(sim_time)
+        self._forecasts_by_target_sim_time[target_sim_time] = dict(demand)
+        self._forecast_issued_sim_time[target_sim_time] = sim_time
+
+    def _evaluate_forecasts_at_horizon(
+        self,
+        sim_time: float,
+        grid_demand: dict[str, int],
+    ) -> None:
+        if not self._uses_realtime_policy_cadence():
+            return
+        for target_sim_time, predicted in list(self._forecasts_by_target_sim_time.items()):
+            if target_sim_time in self._evaluated_forecast_targets:
+                continue
+            if sim_time < target_sim_time:
+                continue
+            issued_sim_time = self._forecast_issued_sim_time.get(target_sim_time, target_sim_time)
+            self._evaluated_forecast_targets.add(target_sim_time)
+            snap = horizon_eval_snapshot(
+                issued_sim_time=issued_sim_time,
+                target_sim_time=target_sim_time,
+                predicted=predicted,
+                actual={k: float(v) for k, v in grid_demand.items()},
+            )
+            self._emit_event(
+                snap["type"],
+                {k: v for k, v in snap.items() if k != "type"},
+            )
+
+    def _resolve_predicted_demand(
+        self,
+        sim_time: float,
+        grid_demand: dict[str, int],
+    ) -> dict[str, float]:
+        if self._prediction_demand_provider is None:
+            raise RuntimeError("predicted demand source requires a prediction demand provider")
+        if self._should_fetch_prediction(sim_time) or self._cached_predicted_demand is None:
+            demand = self._prediction_demand_provider.demand_by_h3(
+                SIM_BASE_DATETIME + timedelta(seconds=sim_time),
+                mode=self._provider_prediction_mode(self.experiment_config.prediction_mode),
+                actual_demand=grid_demand,
+            )
+            self._cached_predicted_demand = dict(demand)
+            self._register_prediction_forecast(sim_time, self._cached_predicted_demand)
+        return self._cached_predicted_demand
+
+    def _band_incentive_usd(self, raw_surge: float) -> float:
+        config = self.experiment_config
+        if config is None or not config.band_incentive_usd:
+            return 0.0
+        bucket = self._raw_surge_bucket(float(raw_surge))
+        order = ("raw_lt_1_5", "raw_lt_2_5", "raw_lt_3_5", "raw_gte_3_5")
+        idx = order.index(bucket)
+        return float(config.band_incentive_usd[idx])
 
     # ------------------------------------------------------------------
     # Public async API (called from FastAPI endpoints)
@@ -450,6 +812,7 @@ class SimulationManager:
         if self.experiment_config is None:
             raise RuntimeError("run_experiment requires experiment_config")
         _random.seed(self.experiment_config.seed)
+        self._apply_experiment_overrides()
         self._reset_run_state()
         self._stop_event.clear()
         self.status = SimStatus.RUNNING
@@ -457,6 +820,7 @@ class SimulationManager:
             self._run_loop()
             prediction_provider = self._close_prediction_demand_provider()
             self._emit_experiment_diagnostics(prediction_provider=prediction_provider)
+            self._emit_fast_dispatch_summary()
             return list(self._event_log)
         finally:
             self._close_prediction_demand_provider()
@@ -798,7 +1162,19 @@ class SimulationManager:
             self._taxi_dispatch_times = {}
             self._last_spawn_interval = -1
             self._last_surge_interval = -1
+            self._last_progress_log_bucket = -1
+            self._last_policy_wall_time = None
+            self._last_policy_sim_time = None
+            self._cached_predicted_demand = None
+            self._forecasts_by_target_sim_time = {}
+            self._forecast_issued_sim_time = {}
+            self._evaluated_forecast_targets = set()
+            self._last_rebalance_interval = -1
             self._routable_edges = []
+            self._h3_to_edges = {}
+            self._last_grid_supply = {}
+            self._last_grid_demand = {}
+            self._rebalance_edge_weights = None
             self._surge_cells = []
             self._surge_by_h3 = {}
             self._raw_surge_by_h3 = {}
@@ -810,6 +1186,7 @@ class SimulationManager:
             self._trip_queue = []
             self._latlng = None
             self._bg_route_len = {}
+            self._route_extend_retry_after = {}
             self._taxi_route_len = {}
             self._edge_weights = []
             self._routable_edges_set = set()
@@ -829,6 +1206,17 @@ class SimulationManager:
             self._bg_appeared.clear()
             self._bg_missing_since.clear()
             self._event_log = []
+            self._dispatch_pricing_cache = {}
+            self._dispatch_taxi_round = 0
+            self._find_route_calls_this_step = 0
+            self._fast_dispatch_stats = (
+                FastBenchDispatchStats()
+                if self.experiment_config is not None and self.experiment_config.fast
+                else None
+            )
+            self._taxi_dispatch_cooldown_until = {}
+            self._pair_dispatch_cooldown_until = {}
+            self._rejected_dispatch_pairs = set()
             self._taxi_previous_dropoff_times = {}
             self._manual_requests.clear()
             self._manual_passenger_counter = 0
@@ -880,9 +1268,12 @@ class SimulationManager:
             # 일반 모드는 기존 상수와 broadcast queue를 사용하고,
             # 실험 모드는 SUMO step만 최대한 빠르게 진행한 뒤 메모리 이벤트만 남긴다.
             experiment = self.experiment_config is not None
-            step_length = self.experiment_config.step_length if experiment else STEP_LENGTH
+            if experiment:
+                step_length, real_step_sleep = resolve_experiment_pacing(self.experiment_config)
+            else:
+                step_length = STEP_LENGTH
+                real_step_sleep = REAL_STEP_SLEEP
             sim_duration = self.experiment_config.sim_duration if experiment else self._runtime_duration
-            real_step_sleep = self.experiment_config.real_sleep if experiment else REAL_STEP_SLEEP
             broadcast_enabled = (not experiment) or bool(self.experiment_config.broadcast)
             cmd = [
                 SUMO_BINARY,
@@ -926,7 +1317,17 @@ class SimulationManager:
             self._routable_edges_set = set(self._routable_edges)
             self._initialize_prediction_components()
             self._edge_weights = self._compute_edge_weights()
+            self._h3_to_edges = self._build_h3_edge_index()
             self._add_initial_vehicles()
+            if experiment and self.experiment_config is not None and self.experiment_config.fast:
+                print(
+                    f"[bench] step_length={step_length}s n_bg={N_BACKGROUND_CARS} "
+                    f"findRoute_cap/step={BENCH_MAX_FIND_ROUTE_PER_STEP} "
+                    f"surge_recompute={self._surge_recompute_interval_sim_s()}s "
+                    f"dispatch_empty_cap={_DISPATCH_MAX_EMPTY_PER_STEP_FAST}"
+                    f"@{_DISPATCH_BACKLOG_WAIT_THRESHOLD}+waiting",
+                    flush=True,
+                )
             if (
                 self._runtime_initial_passenger_count > 0
                 and not experiment
@@ -955,6 +1356,7 @@ class SimulationManager:
                 next_deadline += real_step_sleep
                 traci.simulationStep()
                 sim_time = traci.simulation.getTime()
+                self._maybe_log_sim_progress(sim_time, sim_duration)
 
                 for veh_id in traci.simulation.getDepartedIDList():
                     if self._is_taxi_id(veh_id):
@@ -1005,49 +1407,65 @@ class SimulationManager:
 
                 # Respawn bg cars that left the network. bg는 트립 로직이 없어 한 번 arrival되면
                 # 영구 손실되므로(running 단조 감소의 주원인), 누락분을 재투입해 차량 수를 유지한다.
-                for veh_id in list(self._bg_route_len.keys()):
-                    if veh_id in sub_results:
-                        continue
-                    if veh_id not in self._bg_appeared:
-                        continue  # 아직 최초 출발 전 (insertion 대기)
-                    missing_since = self._bg_missing_since.get(veh_id)
-                    if missing_since is None:
-                        self._bg_missing_since[veh_id] = sim_time
-                    elif sim_time - missing_since >= _RESPAWN_THRESHOLD:
-                        route_edges = self._random_route(self._routable_edges)
-                        if route_edges:
-                            route_id = f"respawn_{veh_id}_{int(sim_time)}"
-                            try:
-                                traci.route.add(route_id, route_edges)
-                                traci.vehicle.add(
-                                    vehID=veh_id, routeID=route_id, typeID="DEFAULT_VEHTYPE",
-                                    depart=sim_time, departLane="best",
-                                    departPos="random_free", departSpeed="max",
-                                )
-                                traci.vehicle.subscribe(veh_id, _BG_SUB_VARS)
-                                self._bg_route_len[veh_id] = len(route_edges)
-                                self._bg_missing_since.pop(veh_id, None)
-                            except traci.exceptions.TraCIException:
-                                pass
+                if N_BACKGROUND_CARS > 0:
+                    for veh_id in list(self._bg_route_len.keys()):
+                        if veh_id in sub_results:
+                            continue
+                        if veh_id not in self._bg_appeared:
+                            continue  # 아직 최초 출발 전 (insertion 대기)
+                        missing_since = self._bg_missing_since.get(veh_id)
+                        if missing_since is None:
+                            self._bg_missing_since[veh_id] = sim_time
+                        elif sim_time - missing_since >= _RESPAWN_THRESHOLD:
+                            route_edges = self._random_route(self._routable_edges)
+                            if route_edges:
+                                route_id = f"respawn_{veh_id}_{int(sim_time)}"
+                                try:
+                                    traci.route.add(route_id, route_edges)
+                                    traci.vehicle.add(
+                                        vehID=veh_id, routeID=route_id, typeID="DEFAULT_VEHTYPE",
+                                        depart=sim_time, departLane="best",
+                                        departPos="random_free", departSpeed="max",
+                                    )
+                                    traci.vehicle.subscribe(veh_id, _BG_SUB_VARS)
+                                    self._bg_route_len[veh_id] = len(route_edges)
+                                    self._bg_missing_since.pop(veh_id, None)
+                                except traci.exceptions.TraCIException:
+                                    pass
 
                 self._extend_vehicle_routes(sub_results)
+                self._find_route_calls_this_step = 0
 
                 self._process_manual_requests(sim_time)
                 self._spawn_passengers(sim_time)
                 surge_payload = None
+                bench_no_broadcast = (
+                    experiment
+                    and self.experiment_config is not None
+                    and self.experiment_config.fast
+                    and not broadcast_enabled
+                )
                 with self._lock:
-                    _, grid_supply, grid_demand = self._capture_state(sim_time, sub_results)
-                    surge_interval = int(sim_time / 5.0)
-                    if surge_interval > self._last_surge_interval:
-                        self._last_surge_interval = surge_interval
+                    if bench_no_broadcast:
+                        grid_supply, grid_demand = self._capture_grid_only(sub_results)
+                    else:
+                        _, grid_supply, grid_demand = self._capture_state(sim_time, sub_results)
+                    self._evaluate_forecasts_at_horizon(sim_time, grid_demand)
+                    if self._should_recompute_surge_grid(sim_time):
                         self._build_surge_cells(grid_supply, grid_demand, sim_time)
+                    if self._surge_cells:
                         surge_payload = self._surge_cells
+                    if self._is_rebalance_policy():
+                        self._maybe_rebalance_empty_taxis(sim_time, sub_results)
 
                 fare_updates = self._update_taxi_states(sim_time, sub_results)
                 fare_updates += self._accumulate_fares(sim_time, sub_results)
 
                 with self._lock:
-                    state, _, _ = self._capture_state(sim_time, sub_results)
+                    if bench_no_broadcast:
+                        state = {"vehicles": [], "passengers": [], "sim_time": sim_time}
+                    else:
+                        state, _, _ = self._capture_state(sim_time, sub_results)
                     self._state = state
                     state["fare_updates"] = fare_updates
                     for fu in fare_updates:
@@ -1160,7 +1578,102 @@ class SimulationManager:
     def _emit_event(self, event_type: str, payload: dict) -> None:
         if self.experiment_config is None:
             return
+        # Fast bench: O(1) counters instead of millions of dispatch_decision dicts.
+        if self.experiment_config.fast and event_type in (
+            "dispatch_attempted",
+            "dispatch_decision",
+        ):
+            return
         self._event_log.append({"type": event_type, **payload})
+
+    def _record_fast_dispatch_stats(self, decision_payload: dict, *, accepted: bool) -> None:
+        stats = self._fast_dispatch_stats
+        if stats is None:
+            return
+        stats.decision_count += 1
+        pid = decision_payload.get("passenger_id")
+        if pid:
+            pid_s = str(pid)
+            stats.offered_passenger_ids.add(pid_s)
+            stats.decisions_per_passenger[pid_s] = (
+                stats.decisions_per_passenger.get(pid_s, 0) + 1
+            )
+        if accepted:
+            stats.accept_count += 1
+            if pid:
+                stats.matched_passenger_ids.add(str(pid))
+        mre = decision_payload.get("matching_rate_error")
+        if mre is not None:
+            mre_f = float(mre)
+            stats.matching_rate_error_sum += mre_f
+            stats.matching_rate_error_abs_sum += abs(mre_f)
+            stats.matching_rate_error_count += 1
+        if decision_payload.get("surge_clamped"):
+            stats.surge_clamped_count += 1
+        fs = decision_payload.get("final_surge")
+        if fs is not None:
+            stats.final_surge_sum += float(fs)
+            stats.final_surge_count += 1
+        ff = decision_payload.get("final_fare_usd")
+        if ff is not None:
+            stats.final_fare_sum += float(ff)
+            stats.final_fare_count += 1
+        rf = decision_payload.get("required_fare_usd")
+        if rf is not None:
+            stats.required_fare_sum += float(rf)
+            stats.required_fare_count += 1
+        pa = decision_payload.get("p_actual")
+        if pa is not None:
+            stats.p_actual_sum += float(pa)
+            stats.p_actual_count += 1
+
+    def _emit_fast_dispatch_summary(self) -> None:
+        stats = self._fast_dispatch_stats
+        if stats is None or self.experiment_config is None:
+            return
+        bucket_payload = {
+            bucket.bucket: {
+                "request_count": bucket.request_count,
+                "matched_count": bucket.matched_count,
+                "p_actual_sum": bucket.p_actual_sum,
+                "p_actual_count": bucket.p_actual_count,
+                "target_rate": bucket.target_rate,
+            }
+            for bucket in self._runtime_kpi.buckets.values()
+        }
+        empty_waits = list(self._runtime_kpi.empty_wait_seconds or [])
+        self._event_log.append({
+            "type": "dispatch_kpi_fast_summary",
+            "decision_count": stats.decision_count,
+            "accept_count": stats.accept_count,
+            "offered_passenger_count": len(stats.offered_passenger_ids),
+            "matched_passenger_count": len(stats.matched_passenger_ids),
+            "empty_wait_seconds": empty_waits,
+            "decisions_per_passenger": dict(stats.decisions_per_passenger),
+            "matching_rate_error_sum": stats.matching_rate_error_sum,
+            "matching_rate_error_abs_sum": stats.matching_rate_error_abs_sum,
+            "matching_rate_error_count": stats.matching_rate_error_count,
+            "surge_clamped_count": stats.surge_clamped_count,
+            "final_surge_sum": stats.final_surge_sum,
+            "final_surge_count": stats.final_surge_count,
+            "final_fare_sum": stats.final_fare_sum,
+            "final_fare_count": stats.final_fare_count,
+            "required_fare_sum": stats.required_fare_sum,
+            "required_fare_count": stats.required_fare_count,
+            "p_actual_sum": stats.p_actual_sum,
+            "p_actual_count": stats.p_actual_count,
+            "buckets": bucket_payload,
+        })
+
+    def _fast_dispatch_empty_cap(self, waiting_count: int) -> int | None:
+        """Limit empty taxis that run dispatch per step when backlog grows (fast bench only)."""
+        if (
+            self.experiment_config is None
+            or not self.experiment_config.fast
+            or waiting_count < _DISPATCH_BACKLOG_WAIT_THRESHOLD
+        ):
+            return None
+        return _DISPATCH_MAX_EMPTY_PER_STEP_FAST
 
     def _emit_experiment_diagnostics(self, prediction_provider=None) -> None:
         if self.experiment_config is None:
@@ -1229,10 +1742,15 @@ class SimulationManager:
         return PASSENGER_SOURCE
 
     def _record_dispatch_kpi(self, decision_payload: dict, *, accepted: bool) -> None:
+        self._record_fast_dispatch_stats(decision_payload, accepted=accepted)
         raw_surge = float(decision_payload.get("raw_surge", 1.0) or 1.0)
         bucket_key = self._raw_surge_bucket(raw_surge)
         bucket = self._runtime_kpi.buckets[bucket_key]
         bucket.request_count += 1
+        p_actual = decision_payload.get("p_actual")
+        if p_actual is not None:
+            bucket.p_actual_sum += float(p_actual)
+            bucket.p_actual_count += 1
         if accepted:
             bucket.matched_count += 1
             passenger_id = decision_payload.get("passenger_id")
@@ -1320,7 +1838,7 @@ class SimulationManager:
             if interval <= self._last_spawn_interval:
                 return
             self._last_spawn_interval = interval
-            n = _poisson_sample(PASSENGER_LAMBDA)
+            n = _poisson_sample(self._passenger_lambda())
             n = self._adjust_spawn_count_for_elasticity(n, None, sim_time)
             for _ in range(n):
                 self._create_passenger_random(sim_time)
@@ -1649,13 +2167,15 @@ class SimulationManager:
             empty_taxis.append(((candidate.x - x) ** 2 + (candidate.y - y) ** 2, taxi_id, vals))
 
         driver_features = []
-        for _, taxi_id, vals in sorted(empty_taxis)[:DISPATCH_MAX_CANDIDATES]:
+        for _, taxi_id, vals in sorted(empty_taxis)[: self._dispatch_max_candidates()]:
             x, y = vals[tc.VAR_POSITION]
             road_id = vals.get(tc.VAR_ROAD_ID, "")
             route = current_route if taxi_id == current_veh_id else None
             if route is None:
+                if not self._is_valid_road_edge(road_id):
+                    continue
                 try:
-                    route = traci.simulation.findRoute(road_id, candidate.pickup_edge)
+                    route = self._sim_find_route(road_id, candidate.pickup_edge)
                 except traci.exceptions.TraCIException:
                     continue
             if not route.edges:
@@ -1702,7 +2222,12 @@ class SimulationManager:
         calculated_surge = raw_surge
         pricing_driver_count = None
 
-        if self.experiment_config is not None and base_fare_usd > 0:
+        # 실험 모드는 PU 학습 역산(required_fare) 경로를 항상 사용한다. rebalance는 공급 이동만 추가.
+        use_inverse = self.experiment_config is not None and base_fare_usd > 0
+        if use_inverse:
+            cached = self._dispatch_pricing_cache.get(candidate.id)
+            if cached is not None:
+                return dict(cached)
             averages = self._candidate_driver_average_features(
                 candidate=candidate,
                 sim_time=sim_time,
@@ -1731,7 +2256,7 @@ class SimulationManager:
             calculated_surge = final_surge
 
         final_fare_usd = base_fare_usd * final_surge
-        return {
+        result = {
             "base_fare_usd": base_fare_usd,
             "raw_surge": raw_surge,
             "target_matching_rate": target_matching_rate,
@@ -1742,10 +2267,135 @@ class SimulationManager:
             "surge_clamped": abs(calculated_surge - final_surge) > 1e-6,
             "pricing_driver_count": pricing_driver_count,
         }
+        if use_inverse:
+            self._dispatch_pricing_cache[candidate.id] = result
+        return result
+
+    @staticmethod
+    def _is_valid_road_edge(edge_id: str) -> bool:
+        """TraCI findRoute/setRoute require a non-empty, non-internal edge id."""
+        return bool(edge_id) and not edge_id.startswith(":")
+
+    def _prune_dispatch_cooldowns(self, sim_time: float) -> None:
+        self._taxi_dispatch_cooldown_until = {
+            vid: until
+            for vid, until in self._taxi_dispatch_cooldown_until.items()
+            if until > sim_time
+        }
+        self._pair_dispatch_cooldown_until = {
+            key: until
+            for key, until in self._pair_dispatch_cooldown_until.items()
+            if until > sim_time
+        }
+
+    def _taxi_on_dispatch_cooldown(self, veh_id: str, sim_time: float) -> bool:
+        return sim_time < self._taxi_dispatch_cooldown_until.get(veh_id, 0.0)
+
+    def _pair_on_dispatch_cooldown(
+        self, veh_id: str, passenger_id: str, sim_time: float
+    ) -> bool:
+        return sim_time < self._pair_dispatch_cooldown_until.get((veh_id, passenger_id), 0.0)
+
+    def _set_dispatch_cooldowns(
+        self, veh_id: str, passenger_id: str, sim_time: float
+    ) -> None:
+        self._taxi_dispatch_cooldown_until[veh_id] = sim_time + TAXI_DISPATCH_COOLDOWN_S
+        self._pair_dispatch_cooldown_until[(veh_id, passenger_id)] = (
+            sim_time + PAIR_DISPATCH_COOLDOWN_S
+        )
+
+    def _record_dispatch_rejection(self, veh_id: str, passenger_id: str) -> None:
+        """ED: once driver rejects, do not re-offer same pair while passenger waits."""
+        self._rejected_dispatch_pairs.add((veh_id, passenger_id))
+
+    def _is_rejected_dispatch_pair(self, veh_id: str, passenger_id: str) -> bool:
+        return (veh_id, passenger_id) in self._rejected_dispatch_pairs
+
+    def _clear_rejection_history_for_passenger(self, passenger_id: str) -> None:
+        if not self._rejected_dispatch_pairs:
+            return
+        self._rejected_dispatch_pairs = {
+            pair
+            for pair in self._rejected_dispatch_pairs
+            if pair[1] != passenger_id
+        }
+
+    @staticmethod
+    def _within_pickup_euclidean_cap(tx: float, ty: float, passenger: Passenger) -> bool:
+        dx = passenger.x - tx
+        dy = passenger.y - ty
+        return dx * dx + dy * dy <= PICKUP_MAX_EUCLIDEAN_M_SQ
+
+    def _filter_by_pickup_euclidean(
+        self,
+        tx: float,
+        ty: float,
+        passengers: list[Passenger],
+    ) -> list[Passenger]:
+        if not passengers:
+            return passengers
+        return [
+            p for p in passengers
+            if self._within_pickup_euclidean_cap(tx, ty, p)
+        ]
+
+    def _expire_abandoned_waiting_passengers(self, sim_time: float) -> None:
+        if PASSENGER_WAIT_ABANDON_S <= 0:
+            return
+        for pid, passenger in list(self._passengers.items()):
+            if passenger.state != "waiting":
+                continue
+            if sim_time - passenger.spawn_time <= PASSENGER_WAIT_ABANDON_S:
+                continue
+            del self._passengers[pid]
+            self._clear_rejection_history_for_passenger(pid)
+            self._emit_event("passenger_abandoned", {
+                "sim_time": sim_time,
+                "passenger_id": pid,
+                "wait_seconds": sim_time - passenger.spawn_time,
+            })
+
+    def _waiting_passengers_near_taxi(
+        self,
+        tx: float,
+        ty: float,
+        waiting_passengers: list[Passenger],
+    ) -> list[Passenger]:
+        if not DISPATCH_H3_FILTER or not waiting_passengers:
+            return waiting_passengers
+        lat, lng = self._latlng(tx, ty)
+        if not (math.isfinite(lat) and math.isfinite(lng)):
+            return waiting_passengers
+        near_cells = cells_within_k_ring(get_cell(lat, lng), DISPATCH_H3_K_RING)
+        filtered = [
+            p for p in waiting_passengers
+            if p.h3_pickup and p.h3_pickup in near_cells
+        ]
+        return filtered if filtered else waiting_passengers
 
     def _update_taxi_states(self, sim_time: float, sub_results: dict) -> list[dict]:
         fare_updates: list[dict] = []
+        self._dispatch_pricing_cache.clear()
+        self._prune_dispatch_cooldowns(sim_time)
+        self._expire_abandoned_waiting_passengers(sim_time)
         waiting_passengers = [p for p in self._passengers.values() if p.state == "waiting"]
+        waiting_count = len(waiting_passengers)
+        empty_dispatch_cap = self._fast_dispatch_empty_cap(waiting_count)
+        eligible_empty_taxis: set[str] | None = None
+        if empty_dispatch_cap is not None:
+            empty_ids = sorted(
+                veh_id for veh_id, vals in sub_results.items()
+                if self._is_taxi_id(veh_id)
+                and self._taxi_states.get(veh_id, "empty") == "empty"
+                and self._is_valid_road_edge(vals.get(tc.VAR_ROAD_ID, ""))
+            )
+            if empty_ids:
+                n = len(empty_ids)
+                start = self._dispatch_taxi_round % n
+                eligible_empty_taxis = {
+                    empty_ids[(start + i) % n] for i in range(min(empty_dispatch_cap, n))
+                }
+                self._dispatch_taxi_round = (start + empty_dispatch_cap) % n
 
         for veh_id, vals in sub_results.items():
             if not self._is_taxi_id(veh_id):
@@ -1754,18 +2404,35 @@ class SimulationManager:
             tx, ty = vals[tc.VAR_POSITION]
             road_id = vals.get(tc.VAR_ROAD_ID, "")
 
-            # 단계 1 — 배차: 거리 기준 상위 K명 검토 후 수락 확률로 배차
-            if state == "empty" and waiting_passengers:
+            # 단계 1 — 배차: 거리 기준 상위 K명 검토 후 수락 확률로 배차 (findRoute needs valid edge)
+            if state == "empty" and waiting_passengers and self._is_valid_road_edge(road_id):
+                if self._taxi_on_dispatch_cooldown(veh_id, sim_time):
+                    continue
+                if not self._find_route_budget_ok():
+                    continue
+                if eligible_empty_taxis is not None and veh_id not in eligible_empty_taxis:
+                    continue
+                local_waiting = self._waiting_passengers_near_taxi(
+                    tx, ty, waiting_passengers,
+                )
+                local_waiting = self._filter_by_pickup_euclidean(tx, ty, local_waiting)
                 candidates = heapq.nsmallest(
-                    DISPATCH_MAX_CANDIDATES, waiting_passengers,
+                    self._dispatch_max_candidates(), local_waiting,
                     key=lambda p: (p.x - tx) ** 2 + (p.y - ty) ** 2,
                 )
                 for candidate in candidates:
+                    if self._is_rejected_dispatch_pair(veh_id, candidate.id):
+                        continue
+                    if self._pair_on_dispatch_cooldown(veh_id, candidate.id, sim_time):
+                        continue
+                    if not self._find_route_budget_ok():
+                        break
                     try:
-                        route = traci.simulation.findRoute(road_id, candidate.pickup_edge)
+                        route = self._sim_find_route(road_id, candidate.pickup_edge)
                         if not route.edges:
                             continue
                     except traci.exceptions.TraCIException:
+                        self._set_dispatch_cooldowns(veh_id, candidate.id, sim_time)
                         continue
 
                     dispatch_id = str(uuid.uuid4())
@@ -1818,7 +2485,8 @@ class SimulationManager:
                             current_veh_id=veh_id,
                             current_route=route,
                         )
-                        fare_usd = pricing["final_fare_usd"]
+                        band_incentive_usd = self._band_incentive_usd(pricing["raw_surge"])
+                        fare_usd = pricing["final_fare_usd"] + band_incentive_usd
                         trip_miles = candidate.expected_distance_m / 1609.344
                         call_dt    = SIM_BASE_DATETIME + timedelta(seconds=sim_time)
                         last_cell  = (self._taxi_last_dropoff_cells.get(veh_id)
@@ -1845,6 +2513,18 @@ class SimulationManager:
                                 candidate.h3_pickup, candidate.h3_dropoff, e,
                             )
                             p = 1.0
+                        if (
+                            self.experiment_config is not None
+                            and self.experiment_config.policy_mode == "rebalance"
+                        ):
+                            bonus = acceptance_bonus_from_raw_surge(
+                                pricing["raw_surge"],
+                                coef=self.experiment_config.rebalance_acceptance_coef,
+                                activation=float(
+                                    self._pricing_policy.get("surge_min", 1.2)
+                                ),
+                            )
+                            p = min(1.0, p + bonus)
                         accepted = _random.random() < p
                         target_matching_rate = pricing["target_matching_rate"]
                         decision_payload.update({
@@ -1860,6 +2540,7 @@ class SimulationManager:
                             "required_fare_usd": pricing["required_fare_usd"],
                             "surge_clamped": pricing["surge_clamped"],
                             "pricing_driver_count": pricing["pricing_driver_count"],
+                            "band_incentive_usd": band_incentive_usd,
                             "target_gap": (
                                 target_matching_rate - p
                                 if target_matching_rate is not None else 0.0
@@ -1870,8 +2551,17 @@ class SimulationManager:
                             ),
                         })
                     if not accepted:
+                        self._set_dispatch_cooldowns(veh_id, candidate.id, sim_time)
+                        self._record_dispatch_rejection(veh_id, candidate.id)
                         self._record_dispatch_kpi(decision_payload, accepted=False)
-                        self._emit_event("dispatch_decision", {**decision_payload, "accepted": False})
+                        if not (
+                            self.experiment_config is not None
+                            and self.experiment_config.fast
+                        ):
+                            self._emit_event(
+                                "dispatch_decision",
+                                {**decision_payload, "accepted": False},
+                            )
                         self._push_db_event({**dispatch_payload, **decision_payload, "accepted": False})
                         continue
 
@@ -1884,6 +2574,7 @@ class SimulationManager:
                     traci.vehicle.setRoute(veh_id, dispatch_edges)
                     self._taxi_route_len[veh_id] = len(dispatch_edges)
                     candidate.state = "assigned"
+                    self._clear_rejection_history_for_passenger(candidate.id)
                     waiting_passengers.remove(candidate)
                     self._taxi_targets[veh_id] = candidate.id
                     self._taxi_states[veh_id] = "dispatched"
@@ -1895,7 +2586,14 @@ class SimulationManager:
                         # 첫 승객 전 대기시간은 정의상 제외하고, 하차 이후 다음 수락까지의 search time만 기록한다.
                         decision_payload["empty_wait_time_s"] = sim_time - previous_dropoff_time
                     self._record_dispatch_kpi(decision_payload, accepted=True)
-                    self._emit_event("dispatch_decision", {**decision_payload, "accepted": True})
+                    if not (
+                        self.experiment_config is not None
+                        and self.experiment_config.fast
+                    ):
+                        self._emit_event(
+                            "dispatch_decision",
+                            {**decision_payload, "accepted": True},
+                        )
                     self._push_db_event({**dispatch_payload, **decision_payload, "accepted": True})
                     if self._is_manual_entity(candidate.id, veh_id):
                         self._schedule_ws_event(
@@ -1927,7 +2625,7 @@ class SimulationManager:
                     if old_dispatch_id:
                         self._push_db_event({"type": "dispatch_timeout", "id": old_dispatch_id})
                     continue
-                if road_id == passenger.pickup_edge:
+                if road_id == passenger.pickup_edge and self._is_valid_road_edge(road_id):
                     try:
                         route = traci.simulation.findRoute(road_id, passenger.dropoff_edge)
                         if not route.edges:
@@ -2016,9 +2714,8 @@ class SimulationManager:
                         traci.vehicle.setRoute(veh_id, route)
                         self._taxi_route_len[veh_id] = len(route)
                     else:
-                        # 픽업 시 붙인 버퍼가 하차 지점 너머까지 이어져 있다. route_len=0으로 두어
-                        # 다음 스텝에 _extend_vehicle_routes가 즉시 연장을 시도하게 한다.
-                        self._taxi_route_len[veh_id] = 0
+                        # 경로 연장 필요 — None이면 _extend_vehicle_routes가 재시도 (0은 매 스텝 무한 재시도 버그)
+                        self._taxi_route_len.pop(veh_id, None)
                     continue
                 if road_id == passenger.dropoff_edge:
                     accum = self._active_trips[veh_id]
@@ -2065,8 +2762,7 @@ class SimulationManager:
                         traci.vehicle.setRoute(veh_id, route)
                         self._taxi_route_len[veh_id] = len(route)
                     else:
-                        # 하차 후 경로를 못 찾으면 route_len=0으로 두어 다음 스텝에 즉시 재연장.
-                        self._taxi_route_len[veh_id] = 0
+                        self._taxi_route_len.pop(veh_id, None)
 
         # Detect dispatched taxis that have exited the network (not in sub_results)
         for veh_id, state in list(self._taxi_states.items()):
@@ -2142,7 +2838,10 @@ class SimulationManager:
                 accum.distance_m += delta
             accum.last_distance_snapshot = dist
             if vals[tc.VAR_SPEED] < SPEED_THRESHOLD_MPS:
-                step_length = self.experiment_config.step_length if self.experiment_config else STEP_LENGTH
+                if self.experiment_config:
+                    step_length, _ = resolve_experiment_pacing(self.experiment_config)
+                else:
+                    step_length = STEP_LENGTH
                 accum.low_speed_seconds += step_length
         return fare_updates
 
@@ -2198,7 +2897,7 @@ class SimulationManager:
         return list(largest)
 
     def _add_initial_vehicles(self) -> None:
-        """Place 200 background cars and 50 taxis on the network at t=0."""
+        """Place N_BACKGROUND_CARS bg vehicles and n_taxis on the network at t=0."""
         edges = self._routable_edges
 
         # Define a yellow taxi vehicle type based on the default
@@ -2243,6 +2942,15 @@ class SimulationManager:
                 lat, lng = self._latlng(*pt)
                 self._taxi_last_dropoff_cells[f"taxi_{i}"] = get_cell(lat, lng)
 
+    def _should_attempt_route_extend(self, veh_id: str, route_len: int | None, sim_time: float) -> bool:
+        if route_len is not None:
+            return True
+        retry_after = self._route_extend_retry_after.get(veh_id, -1.0)
+        if sim_time < retry_after:
+            return False
+        self._route_extend_retry_after[veh_id] = sim_time + _ROUTE_EXTEND_RETRY_SIM_S
+        return True
+
     def _extend_vehicle_routes(self, sub_results: dict) -> None:
         """경로 끝에 근접한 bg 차량·empty/dispatched 택시에 새 경로를 이어 붙여 arrival 제거를 막는다.
 
@@ -2250,17 +2958,22 @@ class SimulationManager:
         증가하므로 한 번 임계값(_ROUTE_EXTEND_REMAINING)을 넘으면 매 스텝 참이 되어, 짧은
         엣지를 한 스텝에 통과해도 연장이 누락되지 않는다. 연장에 실패하면 route_len을 그대로
         두므로 다음 스텝에 자동으로 재시도된다(임계값이 계속 참이기 때문)."""
+        sim_time = traci.simulation.getTime()
         for veh_id, vals in sub_results.items():
             road_id = vals.get(tc.VAR_ROAD_ID, "")
-            if not road_id or road_id.startswith(":"):
-                continue  # 내부 정션 엣지에서는 경로 산출 불가 — 다음 스텝에 재시도
+            if not self._is_valid_road_edge(road_id):
+                continue
             route_index = vals.get(tc.VAR_ROUTE_INDEX)
             if route_index is None or route_index < 0:
                 continue  # 미구독이거나 아직 미출발(-1)한 차량은 건너뜀
 
             if veh_id.startswith("bg_"):
+                if N_BACKGROUND_CARS <= 0:
+                    continue
                 route_len = self._bg_route_len.get(veh_id)
-                if route_len is None or route_len - 1 - route_index > _ROUTE_EXTEND_REMAINING:
+                if route_len is not None and route_len - 1 - route_index > _ROUTE_EXTEND_REMAINING:
+                    continue
+                if not self._should_attempt_route_extend(veh_id, route_len, sim_time):
                     continue
                 new_route = self._random_route_from(road_id)
                 if new_route:
@@ -2275,15 +2988,146 @@ class SimulationManager:
                 if self._taxi_states.get(veh_id, "empty") not in ("empty", "dispatched"):
                     continue
                 route_len = self._taxi_route_len.get(veh_id)
-                if route_len is None or route_len - 1 - route_index > _ROUTE_EXTEND_REMAINING:
+                if route_len is not None and route_len - 1 - route_index > _ROUTE_EXTEND_REMAINING:
                     continue
-                new_route = self._random_route_from(road_id)
+                if not self._should_attempt_route_extend(veh_id, route_len, sim_time):
+                    continue
+                new_route = self._random_route_from(road_id, weights=self._cruise_route_weights())
                 if new_route:
                     try:
                         traci.vehicle.setRoute(veh_id, new_route)
                         self._taxi_route_len[veh_id] = len(new_route)
                     except traci.exceptions.TraCIException:
                         pass  # route_len 유지 → 다음 스텝 재시도
+
+    def _is_rebalance_policy(self) -> bool:
+        return (
+            self.experiment_config is not None
+            and self.experiment_config.policy_mode == "rebalance"
+        )
+
+    def _cruise_route_weights(self) -> list[float] | None:
+        if (
+            self._rebalance_edge_weights is not None
+            and len(self._rebalance_edge_weights) == len(self._routable_edges)
+            and self._is_rebalance_policy()
+        ):
+            return self._rebalance_edge_weights
+        if len(self._edge_weights) == len(self._routable_edges):
+            return self._edge_weights
+        return None
+
+    def _build_h3_edge_index(self) -> dict[str, list[str]]:
+        if self._latlng is None:
+            return {}
+        h3_edges: dict[str, list[str]] = {}
+        for edge_id in self._routable_edges:
+            pt = self._get_edge_midpoint(edge_id)
+            if pt is None:
+                continue
+            lat, lng = self._latlng(*pt)
+            cell = get_cell(lat, lng)
+            h3_edges.setdefault(cell, []).append(edge_id)
+        return h3_edges
+
+    def _update_rebalance_edge_weights(self) -> None:
+        config = self.experiment_config
+        if config is None or config.policy_mode != "rebalance" or self._latlng is None:
+            self._rebalance_edge_weights = None
+            return
+        targets = select_top_surge_deficit_cells(
+            self._raw_surge_by_h3,
+            self._last_grid_supply,
+            self._last_grid_demand,
+            top_k=config.rebalance_top_k,
+            min_raw_surge=config.rebalance_min_raw_surge,
+        )
+        if not targets:
+            self._rebalance_edge_weights = None
+            return
+        target_meta: list[tuple[float, float, float]] = []
+        for cell in targets:
+            raw = float(self._raw_surge_by_h3.get(cell, 1.0))
+            importance = max(0.0, raw - 1.0)
+            if importance <= 0:
+                continue
+            lat, lng = cell_center_latlng(cell)
+            try:
+                x, y = traci.simulation.convertGeo(lng, lat, fromGeo=True)
+            except Exception:
+                continue
+            target_meta.append((x, y, importance))
+        if not target_meta:
+            self._rebalance_edge_weights = None
+            return
+        weights: list[float] = []
+        for edge_id in self._routable_edges:
+            pt = self._get_edge_midpoint(edge_id)
+            if pt is None:
+                weights.append(HOTSPOT_BASE_WEIGHT)
+                continue
+            w = HOTSPOT_BASE_WEIGHT
+            for cx, cy, importance in target_meta:
+                w += gaussian_cell_weight(
+                    pt,
+                    (cx, cy),
+                    importance,
+                    sigma_m=REBALANCE_SIGMA_M,
+                )
+            weights.append(w)
+        self._rebalance_edge_weights = weights
+
+    def _maybe_rebalance_empty_taxis(self, sim_time: float, sub_results: dict) -> None:
+        config = self.experiment_config
+        if config is None or config.policy_mode != "rebalance":
+            return
+        interval = int(sim_time / config.rebalance_interval_s)
+        if interval <= self._last_rebalance_interval:
+            return
+        self._last_rebalance_interval = interval
+
+        targets = select_top_surge_deficit_cells(
+            self._raw_surge_by_h3,
+            self._last_grid_supply,
+            self._last_grid_demand,
+            top_k=config.rebalance_top_k,
+            min_raw_surge=config.rebalance_min_raw_surge,
+        )
+        if not targets:
+            return
+
+        empty_taxis = [
+            veh_id
+            for veh_id, state in self._taxi_states.items()
+            if state == "empty" and veh_id in sub_results
+        ]
+        for index, veh_id in enumerate(empty_taxis):
+            cell = targets[index % len(targets)]
+            edges = self._h3_to_edges.get(cell)
+            if not edges:
+                continue
+            road_id = sub_results[veh_id].get(tc.VAR_ROAD_ID, "")
+            if not self._is_valid_road_edge(road_id):
+                continue
+            dst = _random.choice(edges)
+            new_route = self._route_to_edge(road_id, dst)
+            if not new_route:
+                continue
+            try:
+                traci.vehicle.setRoute(veh_id, new_route)
+            except traci.exceptions.TraCIException:
+                continue
+            self._taxi_route_len[veh_id] = len(new_route)
+            self._emit_event(
+                "rebalance_redirect",
+                {
+                    "sim_time": sim_time,
+                    "taxi_id": veh_id,
+                    "target_h3": cell,
+                    "raw_surge": self._raw_surge_by_h3.get(cell),
+                    "destination_edge": dst,
+                },
+            )
 
     def _compute_edge_weights(self) -> list[float]:
         """Compute weighted destination probability for each routable edge.
@@ -2315,11 +3159,36 @@ class SimulationManager:
             weights.append(w)
         return weights
 
-    def _random_route_from(self, current_edge: str, attempts: int = 10) -> list[str] | None:
+    def _route_to_edge(self, current_edge: str, dst_edge: str, attempts: int = 10) -> list[str] | None:
+        if not self._is_valid_road_edge(current_edge) or not dst_edge:
+            return None
+        if current_edge == dst_edge:
+            return [current_edge]
+        for _ in range(attempts):
+            try:
+                result = traci.simulation.findRoute(current_edge, dst_edge)
+                if result.edges:
+                    return list(result.edges)
+            except traci.exceptions.TraCIException:
+                continue
+        return None
+
+    def _random_route_from(
+        self,
+        current_edge: str,
+        attempts: int = 10,
+        *,
+        weights: list[float] | None = None,
+    ) -> list[str] | None:
         """current_edge에서 시작하는 경로를 반환. _MIN_ROUTE_EDGES개 이상을 우선 시도하고
         점차 길이를 낮춰 2개까지 폴백, 모두 실패 시 None."""
+        if not self._is_valid_road_edge(current_edge):
+            return None
         edges = self._routable_edges
-        weights = self._edge_weights if len(self._edge_weights) == len(edges) else None
+        if weights is None:
+            weights = self._cruise_route_weights()
+        if weights is not None and len(weights) != len(edges):
+            weights = None
 
         def _pick() -> str:
             return _random.choices(edges, weights=weights, k=1)[0] if weights else _random.choice(edges)
@@ -2352,6 +3221,26 @@ class SimulationManager:
                 except traci.exceptions.TraCIException:
                     continue
         return [_random.choice(edges)]
+
+    def _capture_grid_only(
+        self, sub_results: dict
+    ) -> tuple[dict[str, int], dict[str, int]]:
+        """H3 supply/demand only — fast bench (no WebSocket vehicle/passenger payloads)."""
+        grid_supply: dict[str, int] = defaultdict(int)
+        grid_demand: dict[str, int] = defaultdict(int)
+        for veh_id, vals in sub_results.items():
+            if not self._is_taxi_id(veh_id):
+                continue
+            if self._taxi_states.get(veh_id, "empty") != "empty":
+                continue
+            x, y = vals[tc.VAR_POSITION]
+            lat, lng = self._latlng(x, y)
+            if math.isfinite(lat) and math.isfinite(lng):
+                grid_supply[get_cell(lat, lng)] += 1
+        for passenger in self._passengers.values():
+            if passenger.state in ("waiting", "assigned") and passenger.h3_pickup:
+                grid_demand[passenger.h3_pickup] += 1
+        return grid_supply, grid_demand
 
     def _capture_state(
         self, sim_time: float, sub_results: dict
@@ -2404,13 +3293,7 @@ class SimulationManager:
         demand_for_surge: dict[str, float | int] = grid_demand
         config = self.experiment_config
         if config is not None and config.demand_source == "predicted":
-            if self._prediction_demand_provider is None:
-                raise RuntimeError("predicted demand source requires a prediction demand provider")
-            demand_for_surge = self._prediction_demand_provider.demand_by_h3(
-                SIM_BASE_DATETIME + timedelta(seconds=sim_time),
-                mode=self._provider_prediction_mode(config.prediction_mode),
-                actual_demand=grid_demand,
-            )
+            demand_for_surge = self._resolve_predicted_demand(sim_time, grid_demand)
 
         # 일반 실행은 기본 탄력성을 유지하고, 실험 실행만 sweep 입력값으로 override한다.
         elasticity = (
@@ -2447,7 +3330,7 @@ class SimulationManager:
                 "target_matching_rate": target_matching_rate,
                 "center": {"lat": lat_c, "lng": lng_c},
             })
-            if self.experiment_config is not None:
+            if self.experiment_config is not None and not self._bench_skip_surge_cell_diagnostics():
                 self._surge_diagnostics.append({
                     "sim_time": sim_time,
                     "h3": cell,
@@ -2462,3 +3345,6 @@ class SimulationManager:
         self._surge_by_h3 = surge_by_h3
         self._raw_surge_by_h3 = raw_surge_by_h3
         self._target_matching_rate_by_h3 = target_matching_rate_by_h3
+        self._last_grid_supply = dict(grid_supply)
+        self._last_grid_demand = dict(grid_demand)
+        self._update_rebalance_edge_weights()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -11,8 +12,15 @@ from typing import Literal
 import httpx
 
 from app.demand_history import DemandHistoryStore, floor_to_15min
+from app.prediction_config import (
+    prediction_retry_backoff_s,
+    prediction_retry_max,
+    prediction_timeout_s,
+    prediction_warmup_enabled,
+)
 from app.weather import WeatherProvider
 
+_logger = logging.getLogger(__name__)
 
 class PredictionFallbackError(RuntimeError):
     pass
@@ -21,6 +29,82 @@ class PredictionFallbackError(RuntimeError):
 DemandMap = dict[str, float]
 FallbackPolicy = Literal["error", "last_prediction", "actual"]
 PredictionMode = Literal["sync", "async"]
+
+_WARMUP_LOCK = threading.Lock()
+_WARMUP_DONE_URLS: set[str] = set()
+
+
+def prediction_base_url(prediction_url: str) -> str:
+    """Service root used to wake cold Render instances (strip trailing /predict)."""
+    url = prediction_url.rstrip("/")
+    if url.endswith("/predict"):
+        return url[: -len("/predict")] or url
+    return url
+
+
+def _should_retry_http(status_code: int) -> bool:
+    return status_code == 429 or status_code >= 500
+
+
+def _should_retry_exception(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.TimeoutException | httpx.ConnectError | httpx.NetworkError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return _should_retry_http(exc.response.status_code)
+    return False
+
+
+def warm_prediction_service(
+    *,
+    prediction_url: str,
+    api_key: str | None = None,
+    client: httpx.Client | None = None,
+    timeout_s: float | None = None,
+    retry_max: int | None = None,
+) -> bool:
+    """Wake a cold Module 3 host (e.g. Render) via GET on the service root with retries."""
+    if not prediction_warmup_enabled():
+        return True
+
+    timeout_s = prediction_timeout_s() if timeout_s is None else timeout_s
+    retry_max = prediction_retry_max() if retry_max is None else retry_max
+    base = prediction_base_url(prediction_url)
+    owns_client = client is None
+    if client is None:
+        client = httpx.Client()
+
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["X-API-Key"] = api_key.strip()
+
+    attempts = retry_max + 1
+    backoff = prediction_retry_backoff_s()
+    try:
+        for attempt in range(attempts):
+            try:
+                response = client.get(base, headers=headers or None, timeout=timeout_s)
+                if response.status_code < 500:
+                    _logger.info("prediction warmup ok: %s status=%s", base, response.status_code)
+                    return True
+                _logger.warning(
+                    "prediction warmup retryable status: %s status=%s attempt=%s",
+                    base,
+                    response.status_code,
+                    attempt + 1,
+                )
+            except Exception as exc:
+                _logger.warning(
+                    "prediction warmup failed: %s attempt=%s err=%s",
+                    base,
+                    attempt + 1,
+                    exc,
+                )
+            if attempt < attempts - 1:
+                time.sleep(backoff * (2**attempt))
+    finally:
+        if owns_client:
+            client.close()
+    return False
 
 
 @dataclass
@@ -33,7 +117,8 @@ class PredictionDemandProvider:
     fallback_policy: FallbackPolicy = "error"
     api_key: str | None = None
     client: httpx.Client | None = None
-    timeout_s: float = 10.0
+    timeout_s: float = field(default_factory=prediction_timeout_s)
+    retry_max: int = field(default_factory=prediction_retry_max)
     _cache: dict[datetime, DemandMap] = field(default_factory=dict, init=False)
     _last_prediction: DemandMap | None = field(default=None, init=False)
     _inflight_targets: set[datetime] = field(default_factory=set, init=False)
@@ -44,6 +129,7 @@ class PredictionDemandProvider:
     _prediction_request_count: int = field(default=0, init=False)
     _prediction_success_count: int = field(default=0, init=False)
     _prediction_failure_count: int = field(default=0, init=False)
+    _prediction_retry_count: int = field(default=0, init=False)
     _prediction_fallback_count: int = field(default=0, init=False)
     _prediction_stale_use_count: int = field(default=0, init=False)
     _prediction_missing_h3_count: int = field(default=0, init=False)
@@ -58,6 +144,7 @@ class PredictionDemandProvider:
         if not self.api_key:
             raise ValueError("PREDICTION_API_KEY is required for Module3 prediction requests")
         self._owns_client = self.client is None
+        self._ensure_warmup()
 
     def __enter__(self) -> PredictionDemandProvider:
         return self
@@ -111,6 +198,7 @@ class PredictionDemandProvider:
             request_count = self._prediction_request_count
             success_count = self._prediction_success_count
             failure_count = self._prediction_failure_count
+            retry_count = self._prediction_retry_count
             fallback_count = self._prediction_fallback_count
             stale_use_count = self._prediction_stale_use_count
 
@@ -122,12 +210,28 @@ class PredictionDemandProvider:
             "prediction_request_count": request_count,
             "prediction_success_count": success_count,
             "prediction_failure_count": failure_count,
+            "prediction_retry_count": retry_count,
             "prediction_latency_ms_avg": mean(latencies) if latencies else 0.0,
             "prediction_latency_ms_p95": self._p95(latencies),
             "prediction_fallback_count": fallback_count,
             "prediction_stale_use_count": stale_use_count,
             "prediction_missing_h3_rate": missing_rate,
         }
+
+    def _ensure_warmup(self) -> None:
+        if not prediction_warmup_enabled():
+            return
+        with _WARMUP_LOCK:
+            if self.prediction_url in _WARMUP_DONE_URLS:
+                return
+            warm_prediction_service(
+                prediction_url=self.prediction_url,
+                api_key=self.api_key,
+                client=self._http_client() if self.client is not None else None,
+                timeout_s=self.timeout_s,
+                retry_max=self.retry_max,
+            )
+            _WARMUP_DONE_URLS.add(self.prediction_url)
 
     def _target_time(self, sim_datetime: datetime) -> datetime:
         return floor_to_15min(sim_datetime + timedelta(minutes=self.prediction_horizon_min))
@@ -145,24 +249,47 @@ class PredictionDemandProvider:
             if self._closed:
                 raise PredictionFallbackError("prediction provider is closed")
         self._record_request()
-        try:
-            payload = self._request_payload(sim_datetime, target_time)
-            response = self._http_client().post(
-                self.prediction_url,
-                json=payload,
-                headers={"X-API-Key": self.api_key},
-                timeout=self.timeout_s,
-            )
-            response.raise_for_status()
-            demand = self._parse_predictions(response.json(), target_time)
-        except Exception as exc:
-            latency_ms = (time.perf_counter() - started_at) * 1000
-            self._record_failure(latency_ms)
-            raise PredictionFallbackError("prediction request failed") from exc
+        payload = self._request_payload(sim_datetime, target_time)
+        headers = {"X-API-Key": self.api_key}
+        attempts = self.retry_max + 1
+        backoff = prediction_retry_backoff_s()
+        last_exc: BaseException | None = None
+
+        for attempt in range(attempts):
+            try:
+                response = self._http_client().post(
+                    self.prediction_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout_s,
+                )
+                response.raise_for_status()
+                demand = self._parse_predictions(response.json(), target_time)
+                latency_ms = (time.perf_counter() - started_at) * 1000
+                self._record_success(target_time, demand, latency_ms)
+                return dict(demand)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < attempts - 1 and _should_retry_exception(exc):
+                    with self._lock:
+                        self._prediction_retry_count += 1
+                    sleep_s = backoff * (2**attempt)
+                    _logger.warning(
+                        "prediction request retry in %.1fs (attempt %s/%s): %s",
+                        sleep_s,
+                        attempt + 2,
+                        attempts,
+                        exc,
+                    )
+                    time.sleep(sleep_s)
+                    continue
+                latency_ms = (time.perf_counter() - started_at) * 1000
+                self._record_failure(latency_ms)
+                raise PredictionFallbackError("prediction request failed") from exc
 
         latency_ms = (time.perf_counter() - started_at) * 1000
-        self._record_success(target_time, demand, latency_ms)
-        return dict(demand)
+        self._record_failure(latency_ms)
+        raise PredictionFallbackError("prediction request failed") from last_exc
 
     def _request_payload(self, sim_datetime: datetime, target_time: datetime) -> dict[str, object]:
         del target_time

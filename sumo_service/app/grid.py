@@ -13,6 +13,11 @@ def get_cell(lat: float, lng: float) -> str:
     return h3.latlng_to_cell(lat, lng, H3_RESOLUTION)
 
 
+def cells_within_k_ring(cell: str, k: int = 1) -> set[str]:
+    """Return H3 cell ids within k grid steps of center (k=0 → center only)."""
+    return set(h3.grid_disk(cell, max(0, int(k))))
+
+
 def cell_center_latlng(cell: str) -> tuple[float, float]:
     return h3.cell_to_latlng(cell)
 
