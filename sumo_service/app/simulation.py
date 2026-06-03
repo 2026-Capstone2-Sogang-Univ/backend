@@ -80,6 +80,8 @@ SUMO_NET = str(
 )
 # Set SUMO_GUI=1 to open the SUMO GUI window (useful for local debugging).
 SUMO_BINARY = "sumo-gui" if os.getenv("SUMO_GUI") == "1" else "sumo"
+SUMO_ROUTING_ALGORITHM = os.getenv("SUMO_ROUTING_ALGORITHM", "astar")
+SUMO_REROUTING_THREADS = int(os.getenv("SUMO_REROUTING_THREADS", "0"))
 
 SIM_DURATION = float(os.getenv("SIM_DURATION", "3600"))        # simulated seconds
 FRAME_RATE = 60.0  # broadcast fps (WebSocket messages per real second)
@@ -161,7 +163,7 @@ _BG_ROUTE_EXTENSION_MAX_PER_TICK = 4
 # 라우팅이 돌려주는 경로 길이의 최소 목표치를 둔다 (재연장 주기 ≥ _MIN_ROUTE_EDGES - _ROUTE_EXTEND_REMAINING - 1).
 _MIN_ROUTE_EDGES = 10
 _BG_EXTENSION_MIN_ROUTE_EDGES = 25
-_TAXI_EXTENSION_MIN_ROUTE_EDGES = 25
+_TAXI_EXTENSION_MIN_ROUTE_EDGES = 10
 # 차량별 경로 연장 cooldown: extension 성공 후 이 sim_seconds 동안 같은 차량은 재시도하지 않는다.
 # 정체로 정지·저속 주행하는 차량이 매 bg-tick마다 trigger zone에 머물러 무의미한 findRoute를
 # 반복하는 폭증을 차단. 차량이 충분히 진행해 다시 trigger zone에 진입하기 전까지 사실상
@@ -936,7 +938,11 @@ class SimulationManager:
                 "--no-warnings",
                 "--step-length",
                 str(step_length),
+                "--routing-algorithm",
+                SUMO_ROUTING_ALGORITHM,
             ]
+            if SUMO_REROUTING_THREADS > 0:
+                cmd.extend(["--device.rerouting.threads", str(SUMO_REROUTING_THREADS)])
             traci.start(cmd, label="main")
             (min_x, min_y), (max_x, max_y) = traci.simulation.getNetBoundary()
             corners = [(min_x, min_y), (min_x, max_y), (max_x, min_y), (max_x, max_y)]
