@@ -32,6 +32,7 @@ class TripAccumulator:
     dispatch_id: str | None = None
     dispatch_sim_time: float = 0.0
     surge: float = 1.0
+    fare_cap: int | None = None
 
 
 def calculate_meter_fare(a: TripAccumulator) -> int:

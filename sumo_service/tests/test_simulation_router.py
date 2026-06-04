@@ -65,6 +65,19 @@ def make_manager(status: SimStatus) -> MagicMock:
     })
     mgr.enqueue_manual_passenger = MagicMock(return_value="upax_1")
     mgr.enqueue_manual_taxi = MagicMock(return_value="utaxi_1")
+    mgr.quote_manual_passenger = MagicMock(return_value={
+        "ok": True,
+        "expected_fare": 8200,
+        "expected_distance_m": 3100,
+        "estimated_wait_sec": 95,
+        "surge_multiplier": 1.36,
+        "incentive_limit": 3000,
+        "total_amount": 11200,
+    })
+    mgr.create_manual_passenger = MagicMock(return_value={"ok": True, "passenger_id": "upax_1"})
+    mgr.create_manual_taxi = MagicMock(return_value={"ok": True, "taxi_id": "utaxi_1"})
+    mgr.get_taxi_standby_context = MagicMock(return_value=None)
+    mgr.get_taxi_call_detail = MagicMock(return_value=None)
     return mgr
 
 
@@ -438,15 +451,54 @@ def test_get_kpi_returns_200():
 # POST /simulation/passengers and /taxis
 # ---------------------------------------------------------------------------
 
+def test_quote_passenger_returns_frontend_contract_fields():
+    app.state.manager = make_manager(SimStatus.RUNNING)
+    with TestClient(app) as client:
+        resp = client.post("/simulation/passengers/quote", json={
+            "pickup": {"lat": 40.75, "lng": -73.98},
+            "dropoff": {"lat": 40.76, "lng": -73.97},
+            "incentive_limit": 3000,
+        })
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "expected_fare": 8200,
+        "expected_distance_m": 3100,
+        "estimated_wait_sec": 95,
+        "surge_multiplier": 1.36,
+        "incentive_limit": 3000,
+        "total_amount": 11200,
+    }
+
+
+def test_quote_passenger_maps_manager_error_to_400():
+    mgr = make_manager(SimStatus.RUNNING)
+    mgr.quote_manual_passenger = MagicMock(return_value={
+        "ok": False,
+        "error": "no_route_found",
+        "message": "No route found between pickup and dropoff.",
+    })
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        resp = client.post("/simulation/passengers/quote", json={
+            "pickup": {"lat": 40.75, "lng": -73.98},
+            "dropoff": {"lat": 40.76, "lng": -73.97},
+            "incentive_limit": 3000,
+        })
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "no_route_found"
+
+
 def test_create_passenger_returns_reserved_id():
     app.state.manager = make_manager(SimStatus.RUNNING)
     with TestClient(app) as client:
         resp = client.post("/simulation/passengers", json={
             "pickup": {"lat": 40.75, "lng": -73.98},
             "dropoff": {"lat": 40.76, "lng": -73.97},
+            "incentive_limit": 3000,
         })
     assert resp.status_code == 200
     assert resp.json() == {"passenger_id": "upax_1"}
+    app.state.manager.create_manual_passenger.assert_called_once()
 
 
 def test_create_passenger_requires_running_simulation():
@@ -480,6 +532,44 @@ def test_create_taxi_returns_reserved_id():
         resp = client.post("/simulation/taxis", json={"lat": 40.748, "lng": -73.985})
     assert resp.status_code == 200
     assert resp.json() == {"taxi_id": "utaxi_1"}
+
+
+def test_get_taxi_standby_returns_context():
+    mgr = make_manager(SimStatus.RUNNING)
+    mgr.get_taxi_standby_context = MagicMock(return_value={
+        "taxi_id": "utaxi_1",
+        "location": {"lat": 40.748, "lng": -73.985},
+        "current_incentive": 1200,
+        "current_surge": 1.5,
+        "recommended_cells": [],
+    })
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        resp = client.get("/simulation/taxis/utaxi_1/standby")
+    assert resp.status_code == 200
+    assert resp.json()["taxi_id"] == "utaxi_1"
+
+
+def test_get_taxi_call_returns_context():
+    mgr = make_manager(SimStatus.RUNNING)
+    mgr.get_taxi_call_detail = MagicMock(return_value={
+        "taxi_id": "utaxi_1",
+        "passenger_id": "upax_1",
+        "pickup": {"lat": 40.748, "lng": -73.985},
+        "dropoff": {"lat": 40.758, "lng": -73.975},
+        "incentive": 8500,
+        "destination_surge": 1.6,
+        "incentive_breakdown": {
+            "base_fare": 6200,
+            "passenger_incentive": 2300,
+            "surge_bonus": 0,
+        },
+    })
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        resp = client.get("/simulation/taxis/utaxi_1/call")
+    assert resp.status_code == 200
+    assert resp.json()["incentive_breakdown"]["passenger_incentive"] == 2300
 
 
 # ---------------------------------------------------------------------------

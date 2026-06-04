@@ -124,6 +124,29 @@ def test_no_dispatch_when_no_waiting_passengers():
     assert mgr._taxi_states.get("taxi_0") != "dispatched"
 
 
+def test_dispatch_pricing_applies_passenger_incentive_limit():
+    mgr = make_manager()
+    p = make_passenger()
+    p.h3_pickup = "pickup_cell"
+    p.h3_dropoff = "dropoff_cell"
+    p.expected_fare = 1000
+    p.incentive_limit = 300
+    mgr._surge_by_h3 = {"pickup_cell": 2.0}
+
+    pricing = mgr._dispatch_pricing(
+        candidate=p,
+        sim_time=0.0,
+        sub_results={"taxi_0": make_sub_entry()},
+        current_veh_id="taxi_0",
+        current_route=MagicMock(edges=["some_edge", "pickup_edge"], length=1000.0),
+    )
+
+    assert pricing["system_surge"] == 2.0
+    assert pricing["final_fare_cents"] == 1300
+    assert pricing["final_surge"] == pytest.approx(1.3)
+    assert pricing["incentive_cap_applied"] is True
+
+
 def test_dispatch_skipped_when_findroute_raises():
     mgr = make_manager()
     p = make_passenger()
@@ -326,6 +349,30 @@ def test_dropoff_when_taxi_on_dropoff_edge():
     assert mgr._taxi_states["taxi_0"] == "empty"
     assert "p_0" not in mgr._passengers
     assert "taxi_0" not in mgr._active_trips
+
+
+def test_dropoff_fare_update_respects_passenger_cap():
+    mgr = make_manager()
+    p = make_passenger(state="picked_up", dropoff_edge="dropoff_edge")
+    p.expected_fare = 300
+    p.incentive_limit = 100
+    mgr._passengers["p_0"] = p
+    mgr._taxi_states["taxi_0"] = "occupied"
+    mgr._taxi_targets["taxi_0"] = "p_0"
+    mgr._active_trips["taxi_0"] = TripAccumulator(
+        passenger_id="p_0",
+        pickup_sim_time=0.0,
+        distance_m=2000.0,
+        surge=2.0,
+        fare_cap=400,
+    )
+    sub = {"taxi_0": make_sub_entry(road_id="dropoff_edge")}
+
+    fare_updates = mgr._update_taxi_states(200.0, sub)
+
+    assert fare_updates[0]["fare"] == 400
+    assert fare_updates[0]["uncapped_fare"] > fare_updates[0]["fare"]
+    assert fare_updates[0]["incentive_cap_applied"] is True
 
 
 def test_dropoff_when_taxi_passed_dropoff_route_index(monkeypatch):

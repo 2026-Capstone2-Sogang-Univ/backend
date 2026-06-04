@@ -22,3 +22,4 @@ class Passenger:
     taxi_id: Optional[str] = None
     h3_pickup: Optional[str] = None
     h3_dropoff: Optional[str] = None
+    incentive_limit: Optional[int] = None

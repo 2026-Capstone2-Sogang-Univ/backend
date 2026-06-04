@@ -28,6 +28,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from collections.abc import Callable
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import datetime as _datetime, timedelta
 from enum import Enum
@@ -110,6 +111,9 @@ PICKUP_THRESHOLD_M = 30.0
 MAX_COMPLETED_PASSENGERS = 100
 DISPATCH_TIMEOUT_S = 600.0   # 배차 후 이 시간 내 픽업 못하면 재배차
 TRIP_TIMEOUT_S = 1800.0      # 탑승 후 이 시간 내 하차 못하면 강제 완료
+MANUAL_COMMAND_TIMEOUT_S = float(os.getenv("MANUAL_COMMAND_TIMEOUT_S", "5.0"))
+PASSENGER_WAIT_TIMEOUT_S = float(os.getenv("PASSENGER_WAIT_TIMEOUT_S", "900.0"))
+DEFAULT_AVERAGE_TRIP_DISTANCE_M = 3000.0
 
 # 기사 행동 모델: V/s 테이블은 2013 NYC 데이터 기반 → 동일 시간대 사용
 SIM_BASE_DATETIME = _datetime(2013, 7, 8, 8, 0, 0)
@@ -312,6 +316,8 @@ class ManualCreationRequest:
     dropoff_lng: float | None = None
     lat: float | None = None
     lng: float | None = None
+    incentive_limit: int = 0
+    reply: Future | None = None
 
 
 @dataclass
@@ -409,6 +415,8 @@ class SimulationManager:
         self._db_writer_task: asyncio.Task | None = None
         self._taxi_dispatch_ids: dict[str, str] = {}
         self._taxi_dispatch_surge: dict[str, float] = {}
+        self._taxi_dispatch_fare_caps: dict[str, int] = {}
+        self._taxi_active_call_details: dict[str, dict] = {}
         self._taxi_pickup_route_index: dict[str, int] = {}
         self._taxi_dropoff_route_index: dict[str, int] = {}
         self._passenger_dispatch_buckets: dict[str, str] = {}
@@ -769,6 +777,181 @@ class SimulationManager:
             ))
             return taxi_id
 
+    def quote_manual_passenger(
+        self,
+        *,
+        pickup_lat: float,
+        pickup_lng: float,
+        dropoff_lat: float,
+        dropoff_lng: float,
+        incentive_limit: int = 0,
+        timeout_s: float = MANUAL_COMMAND_TIMEOUT_S,
+    ) -> dict:
+        return self._submit_manual_request(
+            ManualCreationRequest(
+                kind="passenger_quote",
+                entity_id="quote",
+                pickup_lat=pickup_lat,
+                pickup_lng=pickup_lng,
+                dropoff_lat=dropoff_lat,
+                dropoff_lng=dropoff_lng,
+                incentive_limit=max(0, int(incentive_limit)),
+            ),
+            timeout_s=timeout_s,
+        )
+
+    def create_manual_passenger(
+        self,
+        *,
+        pickup_lat: float,
+        pickup_lng: float,
+        dropoff_lat: float,
+        dropoff_lng: float,
+        incentive_limit: int = 0,
+        timeout_s: float = MANUAL_COMMAND_TIMEOUT_S,
+    ) -> dict:
+        with self._lock:
+            passenger_id = f"upax_{self._manual_passenger_counter + 1}"
+            self._manual_passenger_counter += 1
+        return self._submit_manual_request(
+            ManualCreationRequest(
+                kind="passenger",
+                entity_id=passenger_id,
+                pickup_lat=pickup_lat,
+                pickup_lng=pickup_lng,
+                dropoff_lat=dropoff_lat,
+                dropoff_lng=dropoff_lng,
+                incentive_limit=max(0, int(incentive_limit)),
+            ),
+            timeout_s=timeout_s,
+        )
+
+    def create_manual_taxi(
+        self,
+        *,
+        lat: float,
+        lng: float,
+        timeout_s: float = MANUAL_COMMAND_TIMEOUT_S,
+    ) -> dict:
+        with self._lock:
+            taxi_id = f"utaxi_{self._manual_taxi_counter + 1}"
+            self._manual_taxi_counter += 1
+        return self._submit_manual_request(
+            ManualCreationRequest(kind="taxi", entity_id=taxi_id, lat=lat, lng=lng),
+            timeout_s=timeout_s,
+        )
+
+    def _submit_manual_request(
+        self,
+        request: ManualCreationRequest,
+        *,
+        timeout_s: float,
+    ) -> dict:
+        reply: Future = Future()
+        queued_request = ManualCreationRequest(
+            kind=request.kind,
+            entity_id=request.entity_id,
+            pickup_lat=request.pickup_lat,
+            pickup_lng=request.pickup_lng,
+            dropoff_lat=request.dropoff_lat,
+            dropoff_lng=request.dropoff_lng,
+            lat=request.lat,
+            lng=request.lng,
+            incentive_limit=request.incentive_limit,
+            reply=reply,
+        )
+        with self._lock:
+            self._manual_requests.append(queued_request)
+        try:
+            return reply.result(timeout=max(0.1, timeout_s))
+        except FutureTimeoutError:
+            reply.cancel()
+            return {
+                "ok": False,
+                "error": "simulation_busy",
+                "message": "Simulation is busy. Please retry.",
+            }
+
+    def get_taxi_call_detail(self, taxi_id: str) -> dict | None:
+        with self._lock:
+            detail = self._taxi_active_call_details.get(taxi_id)
+            return dict(detail) if detail else None
+
+    def get_taxi_standby_context(self, taxi_id: str) -> dict | None:
+        with self._lock:
+            vehicle = next(
+                (v for v in self._state.get("vehicles", []) if v.get("id") == taxi_id),
+                None,
+            )
+            if vehicle is None:
+                return None
+            lat = float(vehicle["lat"])
+            lng = float(vehicle["lng"])
+            current_h3 = get_cell(lat, lng)
+            current_surge = float(self._surge_by_h3.get(current_h3, 1.0))
+            average_fare = self._average_trip_fare_cents()
+            cells = list(self._surge_cells)
+
+        recommended = []
+        for cell in cells:
+            h3 = cell.get("h3")
+            center = cell.get("center") or {}
+            center_lat = center.get("lat")
+            center_lng = center.get("lng")
+            if not h3 or center_lat is None or center_lng is None or h3 == current_h3:
+                continue
+            surge = float(cell.get("surge", 1.0))
+            supply = int(cell.get("supply", 0) or 0)
+            demand = int(cell.get("demand", 0) or 0)
+            if surge <= current_surge and demand <= supply:
+                continue
+            distance_km = self._haversine_km(lat, lng, float(center_lat), float(center_lng))
+            imbalance = max(0, demand - supply)
+            score = (2.0 * max(0.0, surge - 1.0)) + math.log1p(imbalance) - (0.15 * distance_km)
+            recommended.append((
+                score,
+                {
+                    "h3_index": h3,
+                    "center": {"lat": float(center_lat), "lng": float(center_lng)},
+                    "supply": supply,
+                    "demand": demand,
+                    "surge": surge,
+                    "expected_incentive": self._surge_incentive_cents(average_fare, surge),
+                },
+            ))
+        recommended.sort(key=lambda item: item[0], reverse=True)
+        return {
+            "taxi_id": taxi_id,
+            "location": {"lat": lat, "lng": lng},
+            "current_incentive": self._surge_incentive_cents(average_fare, current_surge),
+            "current_surge": current_surge,
+            "recommended_cells": [item[1] for item in recommended[:5]],
+        }
+
+    def _average_trip_fare_cents(self) -> int:
+        if self._runtime_kpi.completed_trip_count > 0:
+            return round(
+                self._runtime_kpi.total_fare_cents / self._runtime_kpi.completed_trip_count
+            )
+        return estimate_fare(DEFAULT_AVERAGE_TRIP_DISTANCE_M)
+
+    @staticmethod
+    def _surge_incentive_cents(base_fare: int, surge: float) -> int:
+        return max(0, round(base_fare * max(0.0, surge - 1.0)))
+
+    @staticmethod
+    def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+        radius_km = 6371.0
+        dlat = math.radians(lat2 - lat1)
+        dlng = math.radians(lng2 - lng1)
+        a = (
+            math.sin(dlat / 2.0) ** 2
+            + math.cos(math.radians(lat1))
+            * math.cos(math.radians(lat2))
+            * math.sin(dlng / 2.0) ** 2
+        )
+        return 2.0 * radius_km * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+
     @staticmethod
     def _percentile(values: list[float], percentile: float) -> float:
         if not values:
@@ -896,6 +1079,8 @@ class SimulationManager:
             self._db_writer_task = None
             self._taxi_dispatch_ids = {}
             self._taxi_dispatch_surge = {}
+            self._taxi_dispatch_fare_caps = {}
+            self._taxi_active_call_details = {}
             self._taxi_pickup_route_index = {}
             self._taxi_dropoff_route_index = {}
             self._passenger_dispatch_buckets = {}
@@ -1211,6 +1396,7 @@ class SimulationManager:
                 _pt = time.perf_counter() if SIM_PROFILE else 0.0
                 self._process_manual_requests(sim_time)
                 self._spawn_passengers(sim_time)
+                self._cancel_timed_out_passengers(sim_time, sub_results)
                 if SIM_PROFILE:
                     _prof["totals"]["spawn"] += time.perf_counter() - _pt
 
@@ -1416,13 +1602,16 @@ class SimulationManager:
                             p = self._passengers.pop(pid, None) if pid else None
                             if p:
                                 dropoff_h3 = p.h3_dropoff or get_cell(p.dropoff_lat, p.dropoff_lng)
-                                meter_fare = calculate_meter_fare(accum)
-                                fare = calculate_fare(accum)
+                                fare_result = self._fare_result_for_accumulator(p, accum)
+                                meter_fare = fare_result["meter_fare"]
+                                fare = fare_result["fare"]
                                 self._completed_passengers.append({
                                     "passenger_id": pid,
                                     "taxi_id": taxi_id,
                                     "meter_fare": meter_fare,
+                                    "uncapped_fare": fare_result["uncapped_fare"],
                                     "fare": fare,
+                                    "incentive_cap_applied": fare_result["incentive_cap_applied"],
                                     "surge": accum.surge,
                                     "expected_fare": p.expected_fare,
                                     "distance_m": accum.distance_m,
@@ -1444,7 +1633,9 @@ class SimulationManager:
                                     "distance_m": accum.distance_m,
                                     "low_speed_seconds": accum.low_speed_seconds,
                                     "meter_fare": meter_fare,
+                                    "uncapped_fare": fare_result["uncapped_fare"],
                                     "fare": fare,
+                                    "incentive_cap_applied": fare_result["incentive_cap_applied"],
                                     "surge": accum.surge,
                                     "expected_fare": p.expected_fare,
                                     "completion": "forced_at_end",
@@ -1452,6 +1643,8 @@ class SimulationManager:
                                 self._record_history_dropoff(sim_time, dropoff_h3)
                             self._taxi_dispatch_ids.pop(taxi_id, None)
                             self._taxi_dispatch_surge.pop(taxi_id, None)
+                            self._taxi_dispatch_fare_caps.pop(taxi_id, None)
+                            self._taxi_active_call_details.pop(taxi_id, None)
                             self._taxi_pickup_route_index.pop(taxi_id, None)
                             self._taxi_dropoff_route_index.pop(taxi_id, None)
                         self._active_trips.clear()
@@ -1931,10 +2124,24 @@ class SimulationManager:
             self._manual_requests.clear()
 
         for request in requests:
-            if request.kind == "passenger":
-                self._process_manual_passenger_request(request, sim_time)
+            if request.reply is not None and request.reply.cancelled():
+                continue
+            if request.kind == "passenger_quote":
+                self._complete_manual_request(
+                    request,
+                    self._build_manual_passenger_quote(request),
+                )
+            elif request.kind == "passenger":
+                result = self._process_manual_passenger_request(request, sim_time)
+                self._complete_manual_request(request, result)
             elif request.kind == "taxi":
-                self._process_manual_taxi_request(request, sim_time)
+                result = self._process_manual_taxi_request(request, sim_time)
+                self._complete_manual_request(request, result)
+
+    @staticmethod
+    def _complete_manual_request(request: ManualCreationRequest, result: dict | None) -> None:
+        if request.reply is not None and not request.reply.done():
+            request.reply.set_result(result or {"ok": True})
 
     def _snap_latlng_to_routable_edge(
         self,
@@ -1952,31 +2159,119 @@ class SimulationManager:
             return None
         return edge_id, x, y
 
-    def _process_manual_passenger_request(
+    def _manual_request_error(self, code: str, message: str | None = None) -> dict:
+        messages = {
+            "invalid_request": "Request validation failed",
+            "out_of_network": "Selected location is outside the routable network.",
+            "no_route_found": "No route found between pickup and dropoff.",
+        }
+        return {
+            "ok": False,
+            "error": code,
+            "message": message or messages.get(code, "Request failed"),
+        }
+
+    def _quote_fare_payload(
         self,
-        request: ManualCreationRequest,
-        sim_time: float,
-    ) -> None:
+        *,
+        expected_fare: int,
+        expected_distance_m: float,
+        h3_pickup: str | None,
+        incentive_limit: int,
+        estimated_wait_sec: int,
+    ) -> dict:
+        system_surge = self._surge_by_h3.get(h3_pickup or "", 1.0)
+        uncapped_total = round(expected_fare * system_surge)
+        cap_total = expected_fare + max(0, int(incentive_limit))
+        total_amount = min(uncapped_total, cap_total)
+        effective_surge = total_amount / expected_fare if expected_fare > 0 else 1.0
+        return {
+            "ok": True,
+            "expected_fare": expected_fare,
+            "expected_distance_m": int(round(expected_distance_m)),
+            "estimated_wait_sec": estimated_wait_sec,
+            "surge_multiplier": effective_surge,
+            "incentive_limit": max(0, int(incentive_limit)),
+            "total_amount": total_amount,
+            "system_surge": system_surge,
+            "uncapped_total_amount": uncapped_total,
+            "incentive_cap_applied": total_amount < uncapped_total,
+        }
+
+    def _build_manual_passenger_quote(self, request: ManualCreationRequest) -> dict:
         if (
             request.pickup_lat is None or request.pickup_lng is None
             or request.dropoff_lat is None or request.dropoff_lng is None
         ):
-            self._schedule_ws_event(
-                "broadcast_passenger_creation_failed",
-                request.entity_id,
-                "invalid_request",
-            )
-            return
+            return self._manual_request_error("invalid_request")
 
         pickup = self._snap_latlng_to_routable_edge(request.pickup_lat, request.pickup_lng)
         dropoff = self._snap_latlng_to_routable_edge(request.dropoff_lat, request.dropoff_lng)
         if pickup is None or dropoff is None:
-            self._schedule_ws_event(
-                "broadcast_passenger_creation_failed",
-                request.entity_id,
-                "out_of_network",
-            )
-            return
+            return self._manual_request_error("out_of_network")
+
+        pickup_edge, x, y = pickup
+        dropoff_edge, _, _ = dropoff
+        traci_mod = _traci_module()
+        try:
+            route = traci_mod.simulation.findRoute(pickup_edge, dropoff_edge)
+        except traci_mod.exceptions.TraCIException:
+            return self._manual_request_error("no_route_found")
+        if not route.edges:
+            return self._manual_request_error("no_route_found")
+
+        lat, lng = self._latlng(x, y)
+        h3_pickup = get_cell(lat, lng)
+        expected_fare = estimate_fare(route.length)
+        return self._quote_fare_payload(
+            expected_fare=expected_fare,
+            expected_distance_m=route.length,
+            h3_pickup=h3_pickup,
+            incentive_limit=request.incentive_limit,
+            estimated_wait_sec=self._estimate_wait_seconds(lat, lng),
+        )
+
+    def _estimate_wait_seconds(self, lat: float, lng: float) -> int:
+        with self._lock:
+            empty_taxis = [
+                v for v in self._state.get("vehicles", [])
+                if v.get("state") == "empty" and self._is_taxi_id(str(v.get("id", "")))
+            ]
+        if not empty_taxis:
+            return 0
+        nearest_km = min(
+            self._haversine_km(lat, lng, float(v["lat"]), float(v["lng"]))
+            for v in empty_taxis
+        )
+        return int(round((nearest_km * 1000.0) / 8.0))
+
+    def _process_manual_passenger_request(
+        self,
+        request: ManualCreationRequest,
+        sim_time: float,
+    ) -> dict:
+        if (
+            request.pickup_lat is None or request.pickup_lng is None
+            or request.dropoff_lat is None or request.dropoff_lng is None
+        ):
+            if request.reply is None:
+                self._schedule_ws_event(
+                    "broadcast_passenger_creation_failed",
+                    request.entity_id,
+                    "invalid_request",
+                )
+            return self._manual_request_error("invalid_request")
+
+        pickup = self._snap_latlng_to_routable_edge(request.pickup_lat, request.pickup_lng)
+        dropoff = self._snap_latlng_to_routable_edge(request.dropoff_lat, request.dropoff_lng)
+        if pickup is None or dropoff is None:
+            if request.reply is None:
+                self._schedule_ws_event(
+                    "broadcast_passenger_creation_failed",
+                    request.entity_id,
+                    "out_of_network",
+                )
+            return self._manual_request_error("out_of_network")
 
         pickup_edge, x, y = pickup
         dropoff_edge, dx, dy = dropoff
@@ -1984,19 +2279,21 @@ class SimulationManager:
         try:
             route = traci_mod.simulation.findRoute(pickup_edge, dropoff_edge)
         except traci_mod.exceptions.TraCIException:
-            self._schedule_ws_event(
-                "broadcast_passenger_creation_failed",
-                request.entity_id,
-                "no_route_found",
-            )
-            return
+            if request.reply is None:
+                self._schedule_ws_event(
+                    "broadcast_passenger_creation_failed",
+                    request.entity_id,
+                    "no_route_found",
+                )
+            return self._manual_request_error("no_route_found")
         if not route.edges:
-            self._schedule_ws_event(
-                "broadcast_passenger_creation_failed",
-                request.entity_id,
-                "no_route_found",
-            )
-            return
+            if request.reply is None:
+                self._schedule_ws_event(
+                    "broadcast_passenger_creation_failed",
+                    request.entity_id,
+                    "no_route_found",
+                )
+            return self._manual_request_error("no_route_found")
 
         lat, lng = self._latlng(x, y)
         dlat, dlng = self._latlng(dx, dy)
@@ -2013,6 +2310,7 @@ class SimulationManager:
             state="waiting",
             h3_pickup=h3,
             h3_dropoff=h3_dropoff,
+            incentive_limit=max(0, int(request.incentive_limit)),
         )
         self._push_db_event({
             "type": "passenger",
@@ -2039,17 +2337,18 @@ class SimulationManager:
             expected_fare,
             int(round(route.length)),
         )
+        return {"ok": True, "passenger_id": request.entity_id}
 
     def _process_manual_taxi_request(
         self,
         request: ManualCreationRequest,
         sim_time: float,
-    ) -> None:
+    ) -> dict:
         if request.lat is None or request.lng is None:
-            return
+            return self._manual_request_error("invalid_request")
         snapped = self._snap_latlng_to_routable_edge(request.lat, request.lng)
         if snapped is None:
-            return
+            return self._manual_request_error("out_of_network")
         edge_id, x, y = snapped
         route_edges = self._random_route_from_profiled("manual_taxi", edge_id)
         if not route_edges:
@@ -2069,7 +2368,7 @@ class SimulationManager:
             )
             traci_mod.vehicle.subscribe(request.entity_id, _SUB_VARS)
         except traci_mod.exceptions.TraCIException:
-            return
+            return self._manual_request_error("out_of_network")
         self._taxi_states[request.entity_id] = "empty"
         self._taxi_route_len[request.entity_id] = len(route_edges)
         self._taxi_pickup_route_index.pop(request.entity_id, None)
@@ -2077,6 +2376,61 @@ class SimulationManager:
         lat, lng = self._latlng(x, y)
         self._taxi_last_dropoff_cells[request.entity_id] = get_cell(lat, lng)
         self._schedule_ws_event("broadcast_taxi_created", request.entity_id, lat, lng)
+        return {"ok": True, "taxi_id": request.entity_id}
+
+    def _cancel_timed_out_passengers(self, sim_time: float, sub_results: dict) -> None:
+        if PASSENGER_WAIT_TIMEOUT_S <= 0:
+            return
+        timed_out = [
+            passenger
+            for passenger in self._passengers.values()
+            if passenger.state in ("waiting", "assigned")
+            and sim_time - passenger.spawn_time > PASSENGER_WAIT_TIMEOUT_S
+        ]
+        for passenger in timed_out:
+            taxi_id = passenger.taxi_id
+            if not taxi_id:
+                taxi_id = next(
+                    (
+                        candidate_taxi
+                        for candidate_taxi, passenger_id in self._taxi_targets.items()
+                        if passenger_id == passenger.id
+                    ),
+                    None,
+                )
+            if taxi_id:
+                self._taxi_targets.pop(taxi_id, None)
+                self._taxi_states[taxi_id] = "empty"
+                self._taxi_dispatch_times.pop(taxi_id, None)
+                old_dispatch_id = self._taxi_dispatch_ids.pop(taxi_id, None)
+                self._taxi_dispatch_surge.pop(taxi_id, None)
+                self._taxi_dispatch_fare_caps.pop(taxi_id, None)
+                self._taxi_active_call_details.pop(taxi_id, None)
+                self._taxi_pickup_route_index.pop(taxi_id, None)
+                self._taxi_dropoff_route_index.pop(taxi_id, None)
+                self._taxi_last_extend_route_index.pop(taxi_id, None)
+                vals = sub_results.get(taxi_id)
+                road_id = vals.get(tc.VAR_ROAD_ID, "") if vals else ""
+                if road_id and not road_id.startswith(":") and road_id in self._routable_edges_set:
+                    route = self._random_route_from_profiled("post_cancel_idle", road_id)
+                    if route:
+                        try:
+                            traci.vehicle.setRoute(taxi_id, route)
+                            self._taxi_route_len[taxi_id] = len(route)
+                        except traci.exceptions.TraCIException:
+                            self._taxi_route_len[taxi_id] = 0
+                    else:
+                        self._taxi_route_len[taxi_id] = 0
+                if old_dispatch_id:
+                    self._push_db_event({"type": "dispatch_timeout", "id": old_dispatch_id})
+            self._passengers.pop(passenger.id, None)
+            self._passenger_dispatch_buckets.pop(passenger.id, None)
+            self._schedule_ws_event("broadcast_passenger_cancelled", passenger.id, "timeout")
+            self._emit_event("passenger_cancelled", {
+                "sim_time": sim_time,
+                "passenger_id": passenger.id,
+                "reason": "timeout",
+            })
 
     def _current_driver_features(
         self,
@@ -2107,6 +2461,67 @@ class SimulationManager:
             pickup_cell=candidate.h3_pickup,
         )
         return features.dV_without_fare, D_pu_miles, features.t_pu
+
+    @staticmethod
+    def _fare_cap_for_passenger(passenger: Passenger) -> int | None:
+        if passenger.incentive_limit is None:
+            return None
+        return passenger.expected_fare + max(0, int(passenger.incentive_limit))
+
+    @staticmethod
+    def _apply_fare_cap(
+        *,
+        meter_fare: int,
+        surge: float,
+        fare_cap: int | None,
+    ) -> dict:
+        uncapped_fare = round(meter_fare * surge)
+        if fare_cap is None:
+            final_fare = uncapped_fare
+        else:
+            final_fare = min(uncapped_fare, fare_cap)
+        effective_surge = final_fare / meter_fare if meter_fare > 0 else 1.0
+        return {
+            "meter_fare": meter_fare,
+            "uncapped_fare": uncapped_fare,
+            "fare": final_fare,
+            "effective_surge": effective_surge,
+            "incentive_cap_applied": final_fare < uncapped_fare,
+        }
+
+    def _fare_result_for_accumulator(
+        self,
+        passenger: Passenger,
+        accum: TripAccumulator,
+    ) -> dict:
+        return self._apply_fare_cap(
+            meter_fare=calculate_meter_fare(accum),
+            surge=accum.surge,
+            fare_cap=accum.fare_cap,
+        )
+
+    def _store_call_detail(
+        self,
+        *,
+        taxi_id: str,
+        passenger: Passenger,
+        final_fare: int,
+    ) -> None:
+        base_fare = passenger.expected_fare
+        destination_surge = self._surge_by_h3.get(passenger.h3_dropoff or "", 1.0)
+        self._taxi_active_call_details[taxi_id] = {
+            "taxi_id": taxi_id,
+            "passenger_id": passenger.id,
+            "pickup": {"lat": passenger.lat, "lng": passenger.lng},
+            "dropoff": {"lat": passenger.dropoff_lat, "lng": passenger.dropoff_lng},
+            "incentive": final_fare,
+            "destination_surge": destination_surge,
+            "incentive_breakdown": {
+                "base_fare": base_fare,
+                "passenger_incentive": max(0, final_fare - base_fare),
+                "surge_bonus": 0,
+            },
+        }
 
     def _dispatch_pricing(
         self,
@@ -2157,7 +2572,17 @@ class SimulationManager:
             final_surge = self._surge_by_h3.get(candidate.h3_pickup or "", 1.0)
             calculated_surge = final_surge
 
-        final_fare_usd = base_fare_usd * final_surge
+        uncapped_fare_cents = round(candidate.expected_fare * final_surge)
+        fare_cap_cents = self._fare_cap_for_passenger(candidate)
+        final_fare_cents = (
+            min(uncapped_fare_cents, fare_cap_cents)
+            if fare_cap_cents is not None else uncapped_fare_cents
+        )
+        effective_surge = (
+            final_fare_cents / candidate.expected_fare
+            if candidate.expected_fare > 0 else final_surge
+        )
+        final_fare_usd = final_fare_cents / 100.0
         return {
             "base_fare_usd": base_fare_usd,
             "raw_surge": raw_surge,
@@ -2165,8 +2590,15 @@ class SimulationManager:
             "target_matching_rate": target_matching_rate,
             "required_fare_usd": required_fare_usd,
             "calculated_surge": calculated_surge,
-            "final_surge": final_surge,
+            "system_surge": final_surge,
+            "final_surge": effective_surge,
             "final_fare_usd": final_fare_usd,
+            "final_fare_cents": final_fare_cents,
+            "uncapped_fare_cents": uncapped_fare_cents,
+            "quote_cap_fare_cents": fare_cap_cents,
+            "incentive_cap_applied": (
+                fare_cap_cents is not None and final_fare_cents < uncapped_fare_cents
+            ),
             "surge_clamped": abs(calculated_surge - final_surge) > 1e-6,
             "pricing_driver_count": pricing_driver_count,
         }
@@ -2237,7 +2669,12 @@ class SimulationManager:
                         "raw_surge": 1.0,
                         "calculated_surge": 1.0,
                         "final_surge": 1.0,
+                        "system_surge": 1.0,
                         "final_fare_usd": candidate.expected_fare / 100.0,
+                        "final_fare_cents": candidate.expected_fare,
+                        "uncapped_fare_cents": candidate.expected_fare,
+                        "quote_cap_fare_cents": self._fare_cap_for_passenger(candidate),
+                        "incentive_cap_applied": False,
                         "required_fare_usd": None,
                         "surge_clamped": False,
                         "pricing_driver_count": None,
@@ -2293,7 +2730,12 @@ class SimulationManager:
                             "bucket": pricing["bucket"],
                             "calculated_surge": pricing["calculated_surge"],
                             "final_surge": pricing["final_surge"],
+                            "system_surge": pricing["system_surge"],
                             "final_fare_usd": pricing["final_fare_usd"],
+                            "final_fare_cents": pricing["final_fare_cents"],
+                            "uncapped_fare_cents": pricing["uncapped_fare_cents"],
+                            "quote_cap_fare_cents": pricing["quote_cap_fare_cents"],
+                            "incentive_cap_applied": pricing["incentive_cap_applied"],
                             "required_fare_usd": pricing["required_fare_usd"],
                             "surge_clamped": pricing["surge_clamped"],
                             "pricing_driver_count": pricing["pricing_driver_count"],
@@ -2323,12 +2765,20 @@ class SimulationManager:
                     self._taxi_route_len[veh_id] = len(dispatch_edges)
                     self._taxi_last_extend_route_index.pop(veh_id, None)
                     candidate.state = "assigned"
+                    candidate.taxi_id = veh_id
                     waiting_passengers.remove(candidate)
                     self._taxi_targets[veh_id] = candidate.id
                     self._taxi_states[veh_id] = "dispatched"
                     self._taxi_dispatch_times[veh_id] = sim_time
                     self._taxi_dispatch_ids[veh_id] = dispatch_id
                     self._taxi_dispatch_surge[veh_id] = decision_payload["final_surge"]
+                    if decision_payload["quote_cap_fare_cents"] is not None:
+                        self._taxi_dispatch_fare_caps[veh_id] = decision_payload["quote_cap_fare_cents"]
+                    self._store_call_detail(
+                        taxi_id=veh_id,
+                        passenger=candidate,
+                        final_fare=decision_payload["final_fare_cents"],
+                    )
                     self._taxi_pickup_route_index[veh_id] = pickup_route_index
                     self._taxi_dropoff_route_index.pop(veh_id, None)
                     previous_dropoff_time = self._taxi_previous_dropoff_times.get(veh_id)
@@ -2359,6 +2809,7 @@ class SimulationManager:
                 dispatch_time = self._taxi_dispatch_times.get(veh_id, sim_time)
                 if sim_time - dispatch_time > DISPATCH_TIMEOUT_S:
                     passenger.state = "waiting"
+                    passenger.taxi_id = None
                     del self._taxi_targets[veh_id]
                     self._taxi_states[veh_id] = "empty"
                     self._taxi_last_extend_route_index.pop(veh_id, None)
@@ -2366,6 +2817,8 @@ class SimulationManager:
                     self._taxi_dropoff_route_index.pop(veh_id, None)
                     self._taxi_dispatch_times.pop(veh_id, None)
                     self._taxi_dispatch_surge.pop(veh_id, None)
+                    self._taxi_dispatch_fare_caps.pop(veh_id, None)
+                    self._taxi_active_call_details.pop(veh_id, None)
                     waiting_passengers.append(passenger)
                     old_dispatch_id = self._taxi_dispatch_ids.pop(veh_id, None)
                     if old_dispatch_id:
@@ -2396,6 +2849,7 @@ class SimulationManager:
                     except traci.exceptions.TraCIException:
                         continue
                     passenger.state = "picked_up"
+                    passenger.taxi_id = veh_id
                     self._record_passenger_boarded_kpi(passenger, sim_time)
                     self._taxi_states[veh_id] = "occupied"
                     self._taxi_last_extend_route_index.pop(veh_id, None)
@@ -2405,6 +2859,7 @@ class SimulationManager:
                         self._prof_counters["pickup_index_reached"] += 1
                     dispatch_time = self._taxi_dispatch_times.pop(veh_id, sim_time)
                     dispatch_surge = self._taxi_dispatch_surge.pop(veh_id, 1.0)
+                    dispatch_fare_cap = self._taxi_dispatch_fare_caps.pop(veh_id, None)
                     self._active_trips[veh_id] = TripAccumulator(
                         passenger_id=passenger_id,
                         pickup_sim_time=sim_time,
@@ -2412,6 +2867,7 @@ class SimulationManager:
                         dispatch_sim_time=dispatch_time,
                         last_distance_snapshot=traci.vehicle.getDistance(veh_id),
                         surge=dispatch_surge,
+                        fare_cap=dispatch_fare_cap,
                     )
                     if self._is_manual_entity(passenger_id, veh_id):
                         self._schedule_ws_event(
@@ -2433,13 +2889,16 @@ class SimulationManager:
                 # 트립 타임아웃: 누적된 요금으로 강제 완료
                 if accum and sim_time - accum.pickup_sim_time > TRIP_TIMEOUT_S:
                     dropoff_h3 = passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
-                    meter_fare = calculate_meter_fare(accum)
-                    fare = calculate_fare(accum)
+                    fare_result = self._fare_result_for_accumulator(passenger, accum)
+                    meter_fare = fare_result["meter_fare"]
+                    fare = fare_result["fare"]
                     fare_updates.append({
                         "passenger_id": passenger_id,
                         "taxi_id": veh_id,
                         "meter_fare": meter_fare,
+                        "uncapped_fare": fare_result["uncapped_fare"],
                         "fare": fare,
+                        "incentive_cap_applied": fare_result["incentive_cap_applied"],
                         "surge": accum.surge,
                         "expected_fare": passenger.expected_fare,
                         "distance_m": accum.distance_m,
@@ -2457,7 +2916,9 @@ class SimulationManager:
                         "distance_m": accum.distance_m,
                         "low_speed_seconds": accum.low_speed_seconds,
                         "meter_fare": meter_fare,
+                        "uncapped_fare": fare_result["uncapped_fare"],
                         "fare": fare,
+                        "incentive_cap_applied": fare_result["incentive_cap_applied"],
                         "surge": accum.surge,
                         "expected_fare": passenger.expected_fare,
                         "completion": "trip_timeout",
@@ -2473,6 +2934,8 @@ class SimulationManager:
                     self._taxi_dropoff_route_index.pop(veh_id, None)
                     self._taxi_dispatch_ids.pop(veh_id, None)
                     self._taxi_dispatch_surge.pop(veh_id, None)
+                    self._taxi_dispatch_fare_caps.pop(veh_id, None)
+                    self._taxi_active_call_details.pop(veh_id, None)
                     route = self._random_route_from_profiled("post_timeout_idle", road_id)
                     if route:
                         traci.vehicle.setRoute(veh_id, route)
@@ -2492,13 +2955,16 @@ class SimulationManager:
                 if road_id == passenger.dropoff_edge or dropoff_reached_by_index:
                     accum = self._active_trips[veh_id]
                     dropoff_h3 = passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
-                    meter_fare = calculate_meter_fare(accum)
-                    fare = calculate_fare(accum)
+                    fare_result = self._fare_result_for_accumulator(passenger, accum)
+                    meter_fare = fare_result["meter_fare"]
+                    fare = fare_result["fare"]
                     fare_updates.append({
                         "passenger_id": passenger_id,
                         "taxi_id": veh_id,
                         "meter_fare": meter_fare,
+                        "uncapped_fare": fare_result["uncapped_fare"],
                         "fare": fare,
+                        "incentive_cap_applied": fare_result["incentive_cap_applied"],
                         "surge": accum.surge,
                         "expected_fare": passenger.expected_fare,
                         "distance_m": accum.distance_m,
@@ -2516,7 +2982,9 @@ class SimulationManager:
                         "distance_m": accum.distance_m,
                         "low_speed_seconds": accum.low_speed_seconds,
                         "meter_fare": meter_fare,
+                        "uncapped_fare": fare_result["uncapped_fare"],
                         "fare": fare,
+                        "incentive_cap_applied": fare_result["incentive_cap_applied"],
                         "surge": accum.surge,
                         "expected_fare": passenger.expected_fare,
                         "completion": "normal",
@@ -2534,6 +3002,8 @@ class SimulationManager:
                         self._prof_counters["dropoff_index_reached"] += 1
                     self._taxi_dispatch_ids.pop(veh_id, None)
                     self._taxi_dispatch_surge.pop(veh_id, None)
+                    self._taxi_dispatch_fare_caps.pop(veh_id, None)
+                    self._taxi_active_call_details.pop(veh_id, None)
                     route = self._random_route_from_profiled("post_dropoff_idle", road_id)
                     if route:
                         traci.vehicle.setRoute(veh_id, route)
@@ -2554,6 +3024,7 @@ class SimulationManager:
                 passenger = self._passengers.get(passenger_id)
                 if passenger and passenger.state == "assigned":
                     passenger.state = "waiting"
+                    passenger.taxi_id = None
                     waiting_passengers.append(passenger)
             self._taxi_states[veh_id] = "empty"
             self._taxi_last_extend_route_index.pop(veh_id, None)
@@ -2562,6 +3033,8 @@ class SimulationManager:
             self._taxi_dispatch_times.pop(veh_id, None)
             self._taxi_dispatch_ids.pop(veh_id, None)
             self._taxi_dispatch_surge.pop(veh_id, None)
+            self._taxi_dispatch_fare_caps.pop(veh_id, None)
+            self._taxi_active_call_details.pop(veh_id, None)
 
         return fare_updates
 
@@ -2576,13 +3049,16 @@ class SimulationManager:
                 passenger = self._passengers.pop(passenger_id, None) if passenger_id else None
                 if passenger:
                     dropoff_h3 = passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
-                    meter_fare = calculate_meter_fare(accum)
-                    fare = calculate_fare(accum)
+                    fare_result = self._fare_result_for_accumulator(passenger, accum)
+                    meter_fare = fare_result["meter_fare"]
+                    fare = fare_result["fare"]
                     fare_updates.append({
                         "passenger_id": passenger_id,
                         "taxi_id": taxi_id,
                         "meter_fare": meter_fare,
+                        "uncapped_fare": fare_result["uncapped_fare"],
                         "fare": fare,
+                        "incentive_cap_applied": fare_result["incentive_cap_applied"],
                         "surge": accum.surge,
                         "expected_fare": passenger.expected_fare,
                         "distance_m": accum.distance_m,
@@ -2600,7 +3076,9 @@ class SimulationManager:
                         "distance_m": accum.distance_m,
                         "low_speed_seconds": accum.low_speed_seconds,
                         "meter_fare": meter_fare,
+                        "uncapped_fare": fare_result["uncapped_fare"],
                         "fare": fare,
+                        "incentive_cap_applied": fare_result["incentive_cap_applied"],
                         "surge": accum.surge,
                         "expected_fare": passenger.expected_fare,
                         "completion": "sumo_removed",
@@ -2614,6 +3092,8 @@ class SimulationManager:
                 self._taxi_dispatch_times.pop(taxi_id, None)
                 self._taxi_dispatch_ids.pop(taxi_id, None)
                 self._taxi_dispatch_surge.pop(taxi_id, None)
+                self._taxi_dispatch_fare_caps.pop(taxi_id, None)
+                self._taxi_active_call_details.pop(taxi_id, None)
                 continue
             dist = vals[tc.VAR_DISTANCE]
             delta = dist - accum.last_distance_snapshot

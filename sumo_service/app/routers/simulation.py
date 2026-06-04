@@ -51,6 +51,7 @@ class LatLngBody(BaseModel):
 class CreatePassengerBody(BaseModel):
     pickup: LatLngBody
     dropoff: LatLngBody
+    incentive_limit: int = Field(default=0, ge=0)
 
 
 class CreateTaxiBody(BaseModel):
@@ -95,6 +96,18 @@ def _error(status_code: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content={"error": code, "message": message},
+    )
+
+
+def _manual_result_response(result: dict, success_keys: set[str] | None = None):
+    if result.get("ok"):
+        if success_keys is None:
+            return {k: v for k, v in result.items() if k != "ok"}
+        return {k: result[k] for k in success_keys if k in result}
+    return _error(
+        400,
+        str(result.get("error", "invalid_request")),
+        str(result.get("message", "Request failed")),
     )
 
 
@@ -248,6 +261,36 @@ async def get_passengers(request: Request):
     return {"passengers": manager.get_passengers()}
 
 
+@router.post("/passengers/quote")
+async def quote_passenger(body: CreatePassengerBody, request: Request):
+    manager = request.app.state.manager
+    if manager.status != SimStatus.RUNNING:
+        return _error(400, "simulation_not_running", "Simulation is not running")
+    if not _validate_lat_lng(body.pickup.lat, body.pickup.lng):
+        return _error(400, "invalid_request", "pickup lat/lng is invalid")
+    if not _validate_lat_lng(body.dropoff.lat, body.dropoff.lng):
+        return _error(400, "invalid_request", "dropoff lat/lng is invalid")
+    result = await asyncio.to_thread(
+        manager.quote_manual_passenger,
+        pickup_lat=body.pickup.lat,
+        pickup_lng=body.pickup.lng,
+        dropoff_lat=body.dropoff.lat,
+        dropoff_lng=body.dropoff.lng,
+        incentive_limit=body.incentive_limit,
+    )
+    return _manual_result_response(
+        result,
+        {
+            "expected_fare",
+            "expected_distance_m",
+            "estimated_wait_sec",
+            "surge_multiplier",
+            "incentive_limit",
+            "total_amount",
+        },
+    )
+
+
 @router.post("/passengers")
 async def create_passenger(body: CreatePassengerBody, request: Request):
     manager = request.app.state.manager
@@ -257,13 +300,15 @@ async def create_passenger(body: CreatePassengerBody, request: Request):
         return _error(400, "invalid_request", "pickup lat/lng is invalid")
     if not _validate_lat_lng(body.dropoff.lat, body.dropoff.lng):
         return _error(400, "invalid_request", "dropoff lat/lng is invalid")
-    passenger_id = manager.enqueue_manual_passenger(
+    result = await asyncio.to_thread(
+        manager.create_manual_passenger,
         pickup_lat=body.pickup.lat,
         pickup_lng=body.pickup.lng,
         dropoff_lat=body.dropoff.lat,
         dropoff_lng=body.dropoff.lng,
+        incentive_limit=body.incentive_limit,
     )
-    return {"passenger_id": passenger_id}
+    return _manual_result_response(result, {"passenger_id"})
 
 
 @router.post("/taxis")
@@ -273,8 +318,26 @@ async def create_taxi(body: CreateTaxiBody, request: Request):
         return _error(400, "simulation_not_running", "Simulation is not running")
     if not _validate_lat_lng(body.lat, body.lng):
         return _error(400, "invalid_request", "lat/lng is invalid")
-    taxi_id = manager.enqueue_manual_taxi(lat=body.lat, lng=body.lng)
-    return {"taxi_id": taxi_id}
+    result = await asyncio.to_thread(manager.create_manual_taxi, lat=body.lat, lng=body.lng)
+    return _manual_result_response(result, {"taxi_id"})
+
+
+@router.get("/taxis/{taxi_id}/standby")
+async def get_taxi_standby(taxi_id: str, request: Request):
+    manager = request.app.state.manager
+    detail = manager.get_taxi_standby_context(taxi_id)
+    if detail is None:
+        return _error(404, "not_found", "Taxi standby context was not found")
+    return detail
+
+
+@router.get("/taxis/{taxi_id}/call")
+async def get_taxi_call(taxi_id: str, request: Request):
+    manager = request.app.state.manager
+    detail = manager.get_taxi_call_detail(taxi_id)
+    if detail is None:
+        return _error(404, "not_found", "Current call was not found")
+    return detail
 
 
 @router.get("/fare/{passenger_id}")
