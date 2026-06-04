@@ -245,7 +245,7 @@ def test_bg_route_extension_caps_attempts_per_tick():
 
 def test_taxi_route_extension_still_runs_when_bg_gate_is_closed():
     mgr = make_manager()
-    mgr._taxi_route_len["taxi_0"] = 3
+    mgr._taxi_route_len["taxi_0"] = 2
     mgr._random_route_from = MagicMock(return_value=["taxi_edge", "next_edge"])
     _traci_stub.vehicle.setRoute = MagicMock()
 

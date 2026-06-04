@@ -87,6 +87,15 @@ SIM_DURATION = float(os.getenv("SIM_DURATION", "3600"))        # simulated secon
 FRAME_RATE = 60.0  # broadcast fps (WebSocket messages per real second)
 SIMULATION_SPEED = float(os.getenv("SIMULATION_SPEED", "20"))  # simulated seconds per real second
 SIM_PROFILE = os.getenv("SIM_PROFILE", "0").strip().lower() in {"1", "true", "yes", "on"}
+_PROFILE_SLOW_SPEED_MPS = 1.0
+_PROFILE_BOTTLENECK_EDGES = {
+    edge.strip()
+    for edge in os.getenv(
+        "SIM_PROFILE_BOTTLENECK_EDGES",
+        "5670996#0,-420895733#0,195743220#1",
+    ).split(",")
+    if edge.strip()
+}
 STEP_LENGTH = (
     SIMULATION_SPEED / FRAME_RATE
 )  # simulated seconds per TraCI step (passed to SUMO)
@@ -108,7 +117,8 @@ SIM_BASE_DATETIME = _datetime(2013, 7, 8, 8, 0, 0)
 DISPATCH_MAX_CANDIDATES = int(os.getenv("DISPATCH_MAX_CANDIDATES", "3"))
 
 PASSENGER_SOURCE = os.getenv("PASSENGER_SOURCE", "parquet")
-TRIPS_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "trips_processed.json"
+_DEFAULT_TRIPS_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "trips_processed.json"
+TRIPS_FILE = Path(os.getenv("TRIPS_FILE", str(_DEFAULT_TRIPS_FILE)))
 SCC_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "routable_scc.json"
 
 DEFAULT_TARGET_MATCHING_RATES = {
@@ -164,12 +174,15 @@ _BG_ROUTE_EXTENSION_MAX_PER_TICK = 4
 _MIN_ROUTE_EDGES = 10
 _BG_EXTENSION_MIN_ROUTE_EDGES = 25
 _TAXI_EXTENSION_MIN_ROUTE_EDGES = 10
+_EMPTY_TAXI_ROUTE_EXTEND_REMAINING = int(os.getenv("EMPTY_TAXI_ROUTE_EXTEND_REMAINING", "1"))
+_DISPATCHED_TAXI_ROUTE_EXTEND_REMAINING = _ROUTE_EXTEND_REMAINING
 # 차량별 경로 연장 cooldown: extension 성공 후 이 sim_seconds 동안 같은 차량은 재시도하지 않는다.
 # 정체로 정지·저속 주행하는 차량이 매 bg-tick마다 trigger zone에 머물러 무의미한 findRoute를
 # 반복하는 폭증을 차단. 차량이 충분히 진행해 다시 trigger zone에 진입하기 전까지 사실상
 # extension은 일어나지 않으므로 안전.
 _BG_EXTENSION_COOLDOWN_S = 30.0
 _TAXI_EXTENSION_COOLDOWN_S = 15.0
+_EMPTY_TAXI_EXTENSION_COOLDOWN_S = float(os.getenv("EMPTY_TAXI_EXTENSION_COOLDOWN_S", "30.0"))
 _BG_ROUTE_EXTENSION_MIN_SPEED_MPS = 0.1
 _TAXI_ROUTE_EXTENSION_MIN_SPEED_MPS = 0.1
 _TAXI_CRITICAL_REMAINING_EDGES = 0
@@ -188,6 +201,12 @@ def _poisson_sample(lam: float) -> int:
 
 def _traci_module():
     return sys.modules.get("traci", traci)
+
+
+def _valid_speed_mps(value: object) -> float | None:
+    if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
+        return float(value)
+    return None
 
 
 def _kosaraju_scc(graph: dict[str, set[str]]) -> list[set[str]]:
@@ -338,6 +357,15 @@ class SimulationManager:
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._prof_counters: defaultdict = defaultdict(int)
+        self._prof_route_from_edges: defaultdict = defaultdict(int)
+        self._prof_stopped_edges: defaultdict = defaultdict(int)
+        self._prof_slow_edges: defaultdict = defaultdict(int)
+        self._prof_stopped_h3: defaultdict = defaultdict(int)
+        self._prof_slow_h3: defaultdict = defaultdict(int)
+        self._prof_route_bottleneck_edges: defaultdict = defaultdict(int)
+        self._prof_route_bottleneck_sources: defaultdict = defaultdict(int)
+        self._prof_route_bottleneck_dest_h3: defaultdict = defaultdict(int)
+        self._prof_route_dest_h3: defaultdict = defaultdict(int)
         self._state_queue: Optional[asyncio.Queue] = None
         self._executor_task: Optional[asyncio.Future] = None
         self._broadcast_task: Optional[asyncio.Task] = None
@@ -352,6 +380,7 @@ class SimulationManager:
         self._last_spawn_interval: int = -1
         self._last_surge_interval: int = -1
         self._routable_edges: list[str] = []
+        self._edge_h3_cache: dict[str, str | None] = {}
         self._surge_cells: list[dict] = []
         # WebSocket은 list 형태가 필요하지만 배차 판단은 pickup H3로 즉시 조회해야 하므로 dict 캐시를 함께 둔다.
         self._surge_by_h3: dict[str, float] = {}
@@ -838,6 +867,7 @@ class SimulationManager:
             self._last_spawn_interval = -1
             self._last_surge_interval = -1
             self._routable_edges = []
+            self._edge_h3_cache = {}
             self._surge_cells = []
             self._surge_by_h3 = {}
             self._raw_surge_by_h3 = {}
@@ -875,6 +905,16 @@ class SimulationManager:
             self._bg_appeared.clear()
             self._bg_missing_since.clear()
             self._event_log = []
+            self._prof_counters.clear()
+            self._prof_route_from_edges.clear()
+            self._prof_stopped_edges.clear()
+            self._prof_slow_edges.clear()
+            self._prof_stopped_h3.clear()
+            self._prof_slow_h3.clear()
+            self._prof_route_bottleneck_edges.clear()
+            self._prof_route_bottleneck_sources.clear()
+            self._prof_route_bottleneck_dest_h3.clear()
+            self._prof_route_dest_h3.clear()
             self._taxi_previous_dropoff_times = {}
             self._manual_requests.clear()
             self._manual_passenger_counter = 0
@@ -1024,6 +1064,52 @@ class SimulationManager:
                 sub_results = traci.vehicle.getAllSubscriptionResults()
                 if SIM_PROFILE:
                     _prof["totals"]["sumo_step"] += time.perf_counter() - _pt
+                    _pt = time.perf_counter()
+                    _vehicle_count = len(sub_results)
+                    _taxi_count = 0
+                    _bg_count = 0
+                    _stopped_count = 0
+                    _slow_count = 0
+                    _invalid_speed_count = 0
+                    _speed_sum = 0.0
+                    _speed_samples = 0
+                    for _veh_id, _vals in sub_results.items():
+                        if self._is_taxi_id(_veh_id):
+                            _taxi_count += 1
+                        elif _veh_id.startswith("bg_"):
+                            _bg_count += 1
+                        _speed = _valid_speed_mps(_vals.get(tc.VAR_SPEED))
+                        if _speed is None:
+                            _invalid_speed_count += 1
+                            continue
+                        _speed_samples += 1
+                        _speed_sum += _speed
+                        if _speed <= _BG_ROUTE_EXTENSION_MIN_SPEED_MPS:
+                            _stopped_count += 1
+                            _road_id = _vals.get(tc.VAR_ROAD_ID, "")
+                            if _road_id and not _road_id.startswith(":"):
+                                self._prof_stopped_edges[_road_id] += 1
+                                _cell = self._h3_for_edge(_road_id)
+                                if _cell:
+                                    self._prof_stopped_h3[_cell] += 1
+                        if _speed <= _PROFILE_SLOW_SPEED_MPS:
+                            _slow_count += 1
+                            _road_id = _vals.get(tc.VAR_ROAD_ID, "")
+                            if _road_id and not _road_id.startswith(":"):
+                                self._prof_slow_edges[_road_id] += 1
+                                _cell = self._h3_for_edge(_road_id)
+                                if _cell:
+                                    self._prof_slow_h3[_cell] += 1
+                    self._prof_counters["traffic_steps"] += 1
+                    self._prof_counters["traffic_vehicle_count_sum"] += _vehicle_count
+                    self._prof_counters["traffic_taxi_count_sum"] += _taxi_count
+                    self._prof_counters["traffic_bg_count_sum"] += _bg_count
+                    self._prof_counters["traffic_stopped_sum"] += _stopped_count
+                    self._prof_counters["traffic_slow_sum"] += _slow_count
+                    self._prof_counters["traffic_invalid_speed_sum"] += _invalid_speed_count
+                    self._prof_counters["traffic_speed_sum"] += _speed_sum
+                    self._prof_counters["traffic_speed_samples"] += _speed_samples
+                    _prof["totals"]["traffic_profile"] += time.perf_counter() - _pt
 
                 _pt = time.perf_counter() if SIM_PROFILE else 0.0
                 # Track which vehicles have appeared at least once, and clear stale missing records
@@ -1053,7 +1139,10 @@ class SimulationManager:
                     if missing_since is None:
                         self._taxi_missing_since[veh_id] = sim_time
                     elif sim_time - missing_since >= _RESPAWN_THRESHOLD:
-                        route_edges = self._random_route(self._routable_edges)
+                        route_edges = self._random_route(
+                            self._routable_edges,
+                            profile_source="respawn_taxi",
+                        )
                         if route_edges:
                             route_id = f"respawn_{veh_id}_{int(sim_time)}"
                             try:
@@ -1086,7 +1175,10 @@ class SimulationManager:
                     if missing_since is None:
                         self._bg_missing_since[veh_id] = sim_time
                     elif sim_time - missing_since >= _RESPAWN_THRESHOLD:
-                        route_edges = self._random_route(self._routable_edges)
+                        route_edges = self._random_route(
+                            self._routable_edges,
+                            profile_source="respawn_bg",
+                        )
                         if route_edges:
                             route_id = f"respawn_{veh_id}_{int(sim_time)}"
                             try:
@@ -1204,8 +1296,83 @@ class SimulationManager:
                     _skip_bg_budget = self._prof_counters.get("skip_bg_budget", 0)
                     _skip_taxi_stopped = self._prof_counters.get("skip_taxi_stopped", 0)
                     _skip_taxi_static_index = self._prof_counters.get("skip_taxi_static_index", 0)
+                    _skip_taxi_static_index_empty = self._prof_counters.get(
+                        "skip_taxi_static_index_empty", 0
+                    )
+                    _skip_taxi_static_index_dispatched = self._prof_counters.get(
+                        "skip_taxi_static_index_dispatched", 0
+                    )
+                    _traffic_steps = self._prof_counters.get("traffic_steps", 0)
+                    _traffic_div = _traffic_steps if _traffic_steps else 1
+                    _traffic_speed_samples = self._prof_counters.get("traffic_speed_samples", 0)
+                    _traffic_speed_div = _traffic_speed_samples if _traffic_speed_samples else 1
+                    _traffic_avg_vehicles = self._prof_counters.get("traffic_vehicle_count_sum", 0) / _traffic_div
+                    _traffic_avg_taxis = self._prof_counters.get("traffic_taxi_count_sum", 0) / _traffic_div
+                    _traffic_avg_bg = self._prof_counters.get("traffic_bg_count_sum", 0) / _traffic_div
+                    _traffic_avg_stopped = self._prof_counters.get("traffic_stopped_sum", 0) / _traffic_div
+                    _traffic_avg_slow = self._prof_counters.get("traffic_slow_sum", 0) / _traffic_div
+                    _traffic_avg_invalid_speed = self._prof_counters.get("traffic_invalid_speed_sum", 0) / _traffic_div
+                    _traffic_avg_speed = self._prof_counters.get("traffic_speed_sum", 0.0) / _traffic_speed_div
+                    _route_from_total = sum(self._prof_route_from_edges.values())
+                    _route_from_unique = len(self._prof_route_from_edges)
+                    _route_from_repeat = max(0, _route_from_total - _route_from_unique)
+                    _route_from_repeat_ratio = (
+                        _route_from_repeat / _route_from_total if _route_from_total else 0
+                    )
+                    _route_from_top = sorted(
+                        self._prof_route_from_edges.items(), key=lambda kv: -kv[1]
+                    )[:3]
+                    _route_from_top_text = ",".join(
+                        f"{_edge}:{_count}" for _edge, _count in _route_from_top
+                    ) or "-"
+                    _top_stopped_edges = self._format_prof_top(self._prof_stopped_edges)
+                    _top_slow_edges = self._format_prof_top(self._prof_slow_edges)
+                    _top_stopped_h3 = self._format_prof_top(self._prof_stopped_h3)
+                    _top_slow_h3 = self._format_prof_top(self._prof_slow_h3)
+                    _route_generated = self._prof_counters.get("route_generated_total", 0)
+                    _route_bottleneck_hits = self._prof_counters.get("route_bottleneck_hit", 0)
+                    _route_bottleneck_ratio = (
+                        _route_bottleneck_hits / _route_generated if _route_generated else 0
+                    )
+                    _top_route_bottleneck_edges = self._format_prof_top(
+                        self._prof_route_bottleneck_edges
+                    )
+                    _top_route_bottleneck_sources = self._format_prof_top(
+                        self._prof_route_bottleneck_sources
+                    )
+                    _top_route_bottleneck_dest_h3 = self._format_prof_top(
+                        self._prof_route_bottleneck_dest_h3
+                    )
+                    _top_route_dest_h3 = self._format_prof_top(self._prof_route_dest_h3)
                     _avg_fr_per_rrf = (_fr / _rrf) if _rrf else 0
                     _avg_rrf_time_ms = (1000 * _prof["totals"].get("extend_routes", 0) / _rrf) if _rrf else 0
+                    _lines.append(
+                        f"[prof]   traffic: vehicles={_traffic_avg_vehicles:.1f} "
+                        f"taxis={_traffic_avg_taxis:.1f} bg={_traffic_avg_bg:.1f} "
+                        f"stopped={_traffic_avg_stopped:.1f} slow={_traffic_avg_slow:.1f} "
+                        f"invalid_speed={_traffic_avg_invalid_speed:.1f} "
+                        f"avg_speed={_traffic_avg_speed:.2f}mps"
+                    )
+                    _lines.append(
+                        f"[prof]   route_from: total={_route_from_total} "
+                        f"unique={_route_from_unique} repeat={_route_from_repeat} "
+                        f"repeat_ratio={_route_from_repeat_ratio:.2f} "
+                        f"top={_route_from_top_text}"
+                    )
+                    _lines.append(
+                        f"[prof]   congestion: stopped_edges={_top_stopped_edges} "
+                        f"slow_edges={_top_slow_edges} "
+                        f"stopped_h3={_top_stopped_h3} slow_h3={_top_slow_h3}"
+                    )
+                    _lines.append(
+                        f"[prof]   route_bottleneck: generated={_route_generated} "
+                        f"hits={_route_bottleneck_hits} "
+                        f"hit_ratio={_route_bottleneck_ratio:.2f} "
+                        f"edges={_top_route_bottleneck_edges} "
+                        f"sources={_top_route_bottleneck_sources} "
+                        f"dest_h3={_top_route_bottleneck_dest_h3} "
+                        f"all_dest_h3={_top_route_dest_h3}"
+                    )
                     _lines.append(
                         f"[prof]   counts: trigger_bg={_tbg} trigger_taxi={_ttx} "
                         f"trigger_taxi_empty={_ttx_empty} "
@@ -1221,7 +1388,9 @@ class SimulationManager:
                         f"[prof]   skips: bg_cooldown={_skip_bg_cd} "
                         f"bg_stopped={_skip_bg_stopped} bg_budget={_skip_bg_budget} "
                         f"taxi_stopped={_skip_taxi_stopped} "
-                        f"taxi_static_index={_skip_taxi_static_index}"
+                        f"taxi_static_index={_skip_taxi_static_index} "
+                        f"taxi_static_empty={_skip_taxi_static_index_empty} "
+                        f"taxi_static_dispatched={_skip_taxi_static_index_dispatched}"
                     )
                     print("\n".join(_lines), flush=True)
                     _prof["totals"].clear()
@@ -1229,6 +1398,15 @@ class SimulationManager:
                     _prof["last_sim"] = sim_time
                     _prof["last_real"] = time.perf_counter()
                     self._prof_counters.clear()
+                    self._prof_route_from_edges.clear()
+                    self._prof_stopped_edges.clear()
+                    self._prof_slow_edges.clear()
+                    self._prof_stopped_h3.clear()
+                    self._prof_slow_h3.clear()
+                    self._prof_route_bottleneck_edges.clear()
+                    self._prof_route_bottleneck_sources.clear()
+                    self._prof_route_bottleneck_dest_h3.clear()
+                    self._prof_route_dest_h3.clear()
 
                 if sim_time >= sim_duration:
                     # Force-complete all trips still in progress so their fares are recorded.
@@ -1543,6 +1721,70 @@ class SimulationManager:
         mid = len(shape) // 2
         return shape[mid]
 
+    def _h3_for_edge(self, edge_id: str) -> str | None:
+        if edge_id in self._edge_h3_cache:
+            return self._edge_h3_cache[edge_id]
+        cell = None
+        pt = self._get_edge_midpoint(edge_id)
+        if pt is not None and self._latlng is not None:
+            lat, lng = self._latlng(*pt)
+            if math.isfinite(lat) and math.isfinite(lng):
+                cell = get_cell(lat, lng)
+        self._edge_h3_cache[edge_id] = cell
+        return cell
+
+    @staticmethod
+    def _format_prof_top(counter: dict[str, int], limit: int = 3) -> str:
+        top = sorted(counter.items(), key=lambda kv: -kv[1])[:limit]
+        return ",".join(f"{key}:{value}" for key, value in top) or "-"
+
+    def _profile_generated_route(
+        self,
+        source: str,
+        dst_edge: str | None,
+        route_edges: list[str] | tuple[str, ...],
+    ) -> None:
+        if not SIM_PROFILE:
+            return
+        self._prof_counters["route_generated_total"] += 1
+        self._prof_counters[f"route_generated_{source}"] += 1
+        dst_h3 = self._h3_for_edge(dst_edge) if dst_edge else None
+        if dst_h3:
+            self._prof_route_dest_h3[dst_h3] += 1
+        hits = sorted(_PROFILE_BOTTLENECK_EDGES.intersection(route_edges))
+        if not hits:
+            return
+        self._prof_counters["route_bottleneck_hit"] += 1
+        self._prof_counters[f"route_bottleneck_hit_{source}"] += 1
+        self._prof_route_bottleneck_sources[source] += 1
+        if dst_h3:
+            self._prof_route_bottleneck_dest_h3[dst_h3] += 1
+        for edge_id in hits:
+            self._prof_route_bottleneck_edges[edge_id] += 1
+
+    def _random_route_from_profiled(
+        self,
+        source: str,
+        current_edge: str,
+        attempts: int = 10,
+        *,
+        min_edges: int = _MIN_ROUTE_EDGES,
+        pass_min_edges: bool = False,
+    ) -> list[str] | None:
+        if attempts == 10 and min_edges == _MIN_ROUTE_EDGES and not pass_min_edges:
+            route_edges = self._random_route_from(current_edge)
+        elif attempts == 10:
+            route_edges = self._random_route_from(current_edge, min_edges=min_edges)
+        else:
+            route_edges = self._random_route_from(
+                current_edge,
+                attempts,
+                min_edges=min_edges,
+            )
+        if route_edges:
+            self._profile_generated_route(source, route_edges[-1], route_edges)
+        return route_edges
+
     def _create_passenger_random(self, sim_time: float) -> None:
         pickup_edge = _random.choice(self._routable_edges)
         dropoff_edge = _random.choice(self._routable_edges)
@@ -1809,7 +2051,7 @@ class SimulationManager:
         if snapped is None:
             return
         edge_id, x, y = snapped
-        route_edges = self._random_route_from(edge_id)
+        route_edges = self._random_route_from_profiled("manual_taxi", edge_id)
         if not route_edges:
             route_edges = [edge_id]
         route_id = f"manual_taxi_route_{request.entity_id}_{int(sim_time * 1000)}"
@@ -2074,7 +2316,7 @@ class SimulationManager:
                     pickup_route_index = len(dispatch_edges) - 1
                     # Buffer past pickup edge: prevents network exit if taxi traverses
                     # pickup edge in one step before our pickup detection fires.
-                    buf = self._random_route_from(candidate.pickup_edge)
+                    buf = self._random_route_from_profiled("pickup_buffer", candidate.pickup_edge)
                     if buf and len(buf) > 1:
                         dispatch_edges = dispatch_edges + buf[1:]
                     traci.vehicle.setRoute(veh_id, dispatch_edges)
@@ -2147,7 +2389,7 @@ class SimulationManager:
                         dropoff_route_index = len(trip_edges) - 1
                         # Buffer past dropoff edge: prevents network exit if taxi traverses
                         # dropoff edge in one step before our dropoff detection fires.
-                        buf = self._random_route_from(passenger.dropoff_edge)
+                        buf = self._random_route_from_profiled("dropoff_buffer", passenger.dropoff_edge)
                         if buf and len(buf) > 1:
                             trip_edges = trip_edges + buf[1:]
                         traci.vehicle.setRoute(veh_id, trip_edges)
@@ -2231,7 +2473,7 @@ class SimulationManager:
                     self._taxi_dropoff_route_index.pop(veh_id, None)
                     self._taxi_dispatch_ids.pop(veh_id, None)
                     self._taxi_dispatch_surge.pop(veh_id, None)
-                    route = self._random_route_from(road_id)
+                    route = self._random_route_from_profiled("post_timeout_idle", road_id)
                     if route:
                         traci.vehicle.setRoute(veh_id, route)
                         self._taxi_route_len[veh_id] = len(route)
@@ -2292,7 +2534,7 @@ class SimulationManager:
                         self._prof_counters["dropoff_index_reached"] += 1
                     self._taxi_dispatch_ids.pop(veh_id, None)
                     self._taxi_dispatch_surge.pop(veh_id, None)
-                    route = self._random_route_from(road_id)
+                    route = self._random_route_from_profiled("post_dropoff_idle", road_id)
                     if route:
                         traci.vehicle.setRoute(veh_id, route)
                         self._taxi_route_len[veh_id] = len(route)
@@ -2378,7 +2620,8 @@ class SimulationManager:
             if delta > 0:
                 accum.distance_m += delta
             accum.last_distance_snapshot = dist
-            if vals[tc.VAR_SPEED] < SPEED_THRESHOLD_MPS:
+            speed = _valid_speed_mps(vals.get(tc.VAR_SPEED))
+            if speed is not None and speed < SPEED_THRESHOLD_MPS:
                 step_length = self.experiment_config.step_length if self.experiment_config else STEP_LENGTH
                 accum.low_speed_seconds += step_length
         return fare_updates
@@ -2444,7 +2687,7 @@ class SimulationManager:
 
         route_index = 0
         for i in range(N_BACKGROUND_CARS):
-            route_edges = self._random_route(edges)
+            route_edges = self._random_route(edges, profile_source="init_bg")
             route_id = f"init_route_{route_index}"
             route_index += 1
             traci.route.add(route_id, route_edges)
@@ -2461,7 +2704,7 @@ class SimulationManager:
             self._bg_route_len[f"bg_{i}"] = len(route_edges)
 
         for i in range(self._runtime_taxi_count):
-            route_edges = self._random_route(edges)
+            route_edges = self._random_route(edges, profile_source="init_taxi")
             route_id = f"init_route_{route_index}"
             route_index += 1
             traci.route.add(route_id, route_edges)
@@ -2506,7 +2749,9 @@ class SimulationManager:
                 route_len = self._bg_route_len.get(veh_id)
                 if route_len is None or route_len - 1 - route_index > _BG_ROUTE_EXTEND_REMAINING:
                     continue
-                speed = vals.get(tc.VAR_SPEED, _BG_ROUTE_EXTENSION_MIN_SPEED_MPS + 1.0)
+                speed = _valid_speed_mps(vals.get(tc.VAR_SPEED))
+                if speed is None:
+                    speed = _BG_ROUTE_EXTENSION_MIN_SPEED_MPS + 1.0
                 if speed <= _BG_ROUTE_EXTENSION_MIN_SPEED_MPS:
                     if SIM_PROFILE:
                         self._prof_counters["skip_bg_stopped"] += 1
@@ -2522,6 +2767,8 @@ class SimulationManager:
                     road_id,
                     min_edges=_BG_EXTENSION_MIN_ROUTE_EDGES,
                 )
+                if new_route:
+                    self._profile_generated_route("bg_extension", new_route[-1], new_route)
                 if new_route:
                     try:
                         traci.vehicle.setRoute(veh_id, new_route)
@@ -2542,14 +2789,21 @@ class SimulationManager:
                     continue
                 route_len = self._taxi_route_len.get(veh_id)
                 remaining_edges = route_len - 1 - route_index if route_len is not None else None
-                if remaining_edges is None or remaining_edges > _ROUTE_EXTEND_REMAINING:
+                extend_remaining = (
+                    _DISPATCHED_TAXI_ROUTE_EXTEND_REMAINING
+                    if taxi_state == "dispatched"
+                    else _EMPTY_TAXI_ROUTE_EXTEND_REMAINING
+                )
+                if remaining_edges is None or remaining_edges > extend_remaining:
                     continue
                 critical_remaining_edges = (
                     _DISPATCHED_TAXI_CRITICAL_REMAINING_EDGES
                     if taxi_state == "dispatched"
                     else _TAXI_CRITICAL_REMAINING_EDGES
                 )
-                speed = vals.get(tc.VAR_SPEED, _TAXI_ROUTE_EXTENSION_MIN_SPEED_MPS + 1.0)
+                speed = _valid_speed_mps(vals.get(tc.VAR_SPEED))
+                if speed is None:
+                    speed = _TAXI_ROUTE_EXTENSION_MIN_SPEED_MPS + 1.0
                 if (
                     speed <= _TAXI_ROUTE_EXTENSION_MIN_SPEED_MPS
                     and remaining_edges > critical_remaining_edges
@@ -2563,19 +2817,39 @@ class SimulationManager:
                     if previous_route_index == route_index:
                         if SIM_PROFILE:
                             self._prof_counters["skip_taxi_static_index"] += 1
+                            self._prof_counters[f"skip_taxi_static_index_{taxi_state}"] += 1
                         continue
                 if SIM_PROFILE:
                     self._prof_counters["trigger_taxi"] += 1
                     self._prof_counters[f"trigger_taxi_{taxi_state}"] += 1
-                new_route = self._random_route_from(
-                    road_id,
-                    min_edges=_TAXI_EXTENSION_MIN_ROUTE_EDGES,
-                )
+                if taxi_state == "empty":
+                    new_route = self._random_route_from_profiled(
+                        "taxi_empty_extension",
+                        road_id,
+                        min_edges=_TAXI_EXTENSION_MIN_ROUTE_EDGES,
+                        pass_min_edges=True,
+                    )
+                else:
+                    new_route = self._random_route_from(
+                        road_id,
+                        min_edges=_TAXI_EXTENSION_MIN_ROUTE_EDGES,
+                    )
+                    if new_route:
+                        self._profile_generated_route(
+                            f"taxi_{taxi_state}_extension",
+                            new_route[-1],
+                            new_route,
+                        )
                 if new_route:
                     try:
                         traci.vehicle.setRoute(veh_id, new_route)
                         self._taxi_route_len[veh_id] = len(new_route)
-                        self._taxi_extend_cooldown[veh_id] = sim_time + _TAXI_EXTENSION_COOLDOWN_S
+                        cooldown_s = (
+                            _TAXI_EXTENSION_COOLDOWN_S
+                            if taxi_state == "dispatched"
+                            else _EMPTY_TAXI_EXTENSION_COOLDOWN_S
+                        )
+                        self._taxi_extend_cooldown[veh_id] = sim_time + cooldown_s
                         self._taxi_last_extend_route_index.pop(veh_id, None)
                     except traci.exceptions.TraCIException:
                         pass  # route_len 유지 → 다음 스텝 재시도
@@ -2629,6 +2903,8 @@ class SimulationManager:
             if SIM_PROFILE:
                 self._prof_counters["rrf_invalid_current_edge"] += 1
             return None
+        if SIM_PROFILE:
+            self._prof_route_from_edges[current_edge] += 1
         edges = self._routable_edges
         weights = self._edge_weights if len(self._edge_weights) == len(edges) else None
 
@@ -2652,7 +2928,13 @@ class SimulationManager:
             self._prof_counters["rrf_none"] += 1
         return None
 
-    def _random_route(self, edges: list[str], attempts: int = 10) -> list[str]:
+    def _random_route(
+        self,
+        edges: list[str],
+        attempts: int = 10,
+        *,
+        profile_source: str = "unknown",
+    ) -> list[str]:
         """_MIN_ROUTE_EDGES개 이상의 엣지로 구성된 경로를 우선 시도하고 점차 낮춰 폴백, 최후엔 1개."""
         for min_len in range(_MIN_ROUTE_EDGES, 0, -1):
             for _ in range(attempts):
@@ -2663,10 +2945,15 @@ class SimulationManager:
                 try:
                     result = traci.simulation.findRoute(src, dst)
                     if len(result.edges) >= min_len:
-                        return list(result.edges)
+                        route_edges = list(result.edges)
+                        self._profile_generated_route(profile_source, dst, route_edges)
+                        return route_edges
                 except traci.exceptions.TraCIException:
                     continue
-        return [_random.choice(edges)]
+        fallback_edge = _random.choice(edges)
+        route_edges = [fallback_edge]
+        self._profile_generated_route(profile_source, fallback_edge, route_edges)
+        return route_edges
 
     def _capture_state(
         self, sim_time: float, sub_results: dict
@@ -2684,7 +2971,9 @@ class SimulationManager:
                 continue
             x, y = vals[tc.VAR_POSITION]
             angle = vals[tc.VAR_ANGLE]
-            speed = vals[tc.VAR_SPEED]
+            speed = _valid_speed_mps(vals.get(tc.VAR_SPEED))
+            if speed is None:
+                speed = 0.0
             lat, lng = self._latlng(x, y)
             if not (math.isfinite(lat) and math.isfinite(lng)):
                 continue
