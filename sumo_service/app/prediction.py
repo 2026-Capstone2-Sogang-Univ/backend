@@ -23,6 +23,18 @@ FallbackPolicy = Literal["error", "last_prediction", "actual"]
 PredictionMode = Literal["sync", "async"]
 
 
+def _prediction_timeout_s() -> float:
+    return float(os.getenv("PREDICTION_TIMEOUT_S", "10.0"))
+
+
+def _prediction_retry_max() -> int:
+    return max(0, int(os.getenv("PREDICTION_RETRY_MAX", "0")))
+
+
+def _prediction_retry_backoff_s() -> float:
+    return max(0.0, float(os.getenv("PREDICTION_RETRY_BACKOFF_S", "0.25")))
+
+
 @dataclass
 class PredictionDemandProvider:
     prediction_url: str
@@ -33,7 +45,9 @@ class PredictionDemandProvider:
     fallback_policy: FallbackPolicy = "error"
     api_key: str | None = None
     client: httpx.Client | None = None
-    timeout_s: float = 10.0
+    timeout_s: float = field(default_factory=_prediction_timeout_s)
+    retry_max: int = field(default_factory=_prediction_retry_max)
+    retry_backoff_s: float = field(default_factory=_prediction_retry_backoff_s)
     _cache: dict[datetime, DemandMap] = field(default_factory=dict, init=False)
     _last_prediction: DemandMap | None = field(default=None, init=False)
     _inflight_targets: set[datetime] = field(default_factory=set, init=False)
@@ -46,6 +60,7 @@ class PredictionDemandProvider:
     _prediction_failure_count: int = field(default=0, init=False)
     _prediction_fallback_count: int = field(default=0, init=False)
     _prediction_stale_use_count: int = field(default=0, init=False)
+    _prediction_retry_count: int = field(default=0, init=False)
     _prediction_missing_h3_count: int = field(default=0, init=False)
     _prediction_expected_h3_count: int = field(default=0, init=False)
     _latencies_ms: list[float] = field(default_factory=list, init=False)
@@ -113,6 +128,7 @@ class PredictionDemandProvider:
             failure_count = self._prediction_failure_count
             fallback_count = self._prediction_fallback_count
             stale_use_count = self._prediction_stale_use_count
+            retry_count = self._prediction_retry_count
 
         missing_rate = 0.0
         if expected_h3_count:
@@ -126,6 +142,7 @@ class PredictionDemandProvider:
             "prediction_latency_ms_p95": self._p95(latencies),
             "prediction_fallback_count": fallback_count,
             "prediction_stale_use_count": stale_use_count,
+            "prediction_retry_count": retry_count,
             "prediction_missing_h3_rate": missing_rate,
         }
 
@@ -145,20 +162,31 @@ class PredictionDemandProvider:
             if self._closed:
                 raise PredictionFallbackError("prediction provider is closed")
         self._record_request()
+        last_exc: Exception | None = None
         try:
             payload = self._request_payload(sim_datetime, target_time)
-            response = self._http_client().post(
-                self.prediction_url,
-                json=payload,
-                headers={"X-API-Key": self.api_key},
-                timeout=self.timeout_s,
-            )
-            response.raise_for_status()
+            for attempt in range(self.retry_max + 1):
+                try:
+                    response = self._http_client().post(
+                        self.prediction_url,
+                        json=payload,
+                        headers={"X-API-Key": self.api_key},
+                        timeout=self.timeout_s,
+                    )
+                    response.raise_for_status()
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt >= self.retry_max or not self._should_retry(exc):
+                        raise
+                    self._record_retry()
+                    if self.retry_backoff_s > 0:
+                        time.sleep(self.retry_backoff_s * (2 ** attempt))
             demand = self._parse_predictions(response.json(), target_time)
         except Exception as exc:
             latency_ms = (time.perf_counter() - started_at) * 1000
             self._record_failure(latency_ms)
-            raise PredictionFallbackError("prediction request failed") from exc
+            raise PredictionFallbackError("prediction request failed") from (last_exc or exc)
 
         latency_ms = (time.perf_counter() - started_at) * 1000
         self._record_success(target_time, demand, latency_ms)
@@ -263,6 +291,12 @@ class PredictionDemandProvider:
                 self.client = httpx.Client()
             return self.client
 
+    @staticmethod
+    def _should_retry(exc: Exception) -> bool:
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code == 429 or exc.response.status_code >= 500
+        return isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError))
+
     def _record_request(self) -> None:
         with self._lock:
             self._prediction_request_count += 1
@@ -278,6 +312,10 @@ class PredictionDemandProvider:
         with self._lock:
             self._prediction_failure_count += 1
             self._latencies_ms.append(latency_ms)
+
+    def _record_retry(self) -> None:
+        with self._lock:
+            self._prediction_retry_count += 1
 
     def _record_fallback(self, stale_use: bool) -> None:
         with self._lock:

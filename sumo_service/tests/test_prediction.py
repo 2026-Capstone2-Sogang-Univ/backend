@@ -177,6 +177,47 @@ def test_error_fallback_policy_raises_prediction_fallback_error():
         assert diagnostics["prediction_fallback_count"] == 0
 
 
+def test_prediction_retries_transient_server_error_when_enabled():
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            return httpx.Response(503, json={"error": "try later"})
+        return httpx.Response(
+            200,
+            json={
+                "timestamp": "2013-07-08T08:15:00",
+                "target_time": "2013-07-08T08:30:00",
+                "horizon": "15min",
+                "count": 1,
+                "predictions": [{"h3": "h3_a", "predicted_demand_count": 4}],
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        provider = PredictionDemandProvider(
+            prediction_url="https://prediction.test/predict",
+            model_h3_cells=["h3_a"],
+            history_store=DemandHistoryStore(model_h3_cells=["h3_a"]),
+            weather_provider=StaticWeatherProvider(),
+            client=client,
+            api_key="test-key",
+            retry_max=1,
+            retry_backoff_s=0.0,
+        )
+        try:
+            assert provider.demand_by_h3(datetime(2013, 7, 8, 8, 17)) == {"h3_a": 4.0}
+            diagnostics = provider.diagnostics()
+            assert request_count == 2
+            assert diagnostics["prediction_request_count"] == 1
+            assert diagnostics["prediction_retry_count"] == 1
+            assert diagnostics["prediction_success_count"] == 1
+        finally:
+            provider.close()
+
+
 def test_missing_h3_rate_zero_fills_absent_model_cells():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
