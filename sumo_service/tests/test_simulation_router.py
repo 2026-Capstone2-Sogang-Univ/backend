@@ -36,6 +36,8 @@ def make_manager(status: SimStatus) -> MagicMock:
         "simulation_speed": 20.0,
         "vehicle_count": 0,
         "taxi_count": 0,
+        "background_vehicle_count": 0,
+        "configured_background_vehicle_count": 0,
         "empty_taxi_count": 0,
         "dispatched_taxi_count": 0,
         "occupied_taxi_count": 0,
@@ -139,6 +141,9 @@ def test_start_accepts_frontend_lab_body():
             "alpha_sensitivity": 1.0,
         },
         "taxi_count": 150,
+        "background_vehicle_count": 600,
+        "passengers_per_5min": 50,
+        "simulation_speed": 30,
         "initial_passenger_count": 60,
     }
     with TestClient(app) as client:
@@ -146,6 +151,10 @@ def test_start_accepts_frontend_lab_body():
     assert resp.status_code == 200
     assert mgr.start.call_args.args[0].duration == 1200
     assert mgr.start.call_args.args[0].target_matching_rates["raw_gte_3_5"] == 0.85
+    assert mgr.start.call_args.args[0].taxi_count == 150
+    assert mgr.start.call_args.args[0].background_vehicle_count == 600
+    assert mgr.start.call_args.args[0].passengers_per_5min == 50
+    assert mgr.start.call_args.args[0].simulation_speed == 30
 
 
 def test_start_rejects_invalid_passenger_source():
@@ -163,6 +172,36 @@ def test_start_rejects_taxi_count_above_limit():
     app.state.manager = mgr
     with TestClient(app) as client:
         resp = client.post("/simulation/start", json={"taxi_count": 1001})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+    mgr.start.assert_not_called()
+
+
+def test_start_rejects_background_vehicle_count_above_limit():
+    mgr = make_manager(SimStatus.IDLE)
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        resp = client.post("/simulation/start", json={"background_vehicle_count": 3001})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+    mgr.start.assert_not_called()
+
+
+def test_start_rejects_passengers_per_5min_above_limit():
+    mgr = make_manager(SimStatus.IDLE)
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        resp = client.post("/simulation/start", json={"passengers_per_5min": 1001})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_request"
+    mgr.start.assert_not_called()
+
+
+def test_start_rejects_simulation_speed_above_limit():
+    mgr = make_manager(SimStatus.IDLE)
+    app.state.manager = mgr
+    with TestClient(app) as client:
+        resp = client.post("/simulation/start", json={"simulation_speed": 121})
     assert resp.status_code == 400
     assert resp.json()["error"] == "invalid_request"
     mgr.start.assert_not_called()

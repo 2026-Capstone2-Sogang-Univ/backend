@@ -47,7 +47,7 @@ def _make_traci_stub():
 
 _traci_stub = _make_traci_stub()
 
-from app.simulation import SimulationManager, _poisson_sample  # noqa: E402
+from app.simulation import SimulationManager, SimulationStartOptions, _poisson_sample  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +72,21 @@ def make_manager() -> SimulationManager:
 # ---------------------------------------------------------------------------
 # random 모드 — 5분 경계 확인
 # ---------------------------------------------------------------------------
+
+def test_start_options_apply_runtime_simulation_controls():
+    mgr = make_manager()
+    mgr._apply_start_options(SimulationStartOptions(
+        taxi_count=200,
+        background_vehicle_count=600,
+        passengers_per_5min=50,
+        simulation_speed=30.0,
+    ))
+
+    assert mgr._runtime_taxi_count == 200
+    assert mgr._runtime_background_vehicle_count == 600
+    assert mgr._runtime_passengers_per_5min == 50
+    assert mgr._runtime_simulation_speed == 30.0
+
 
 def test_no_spawn_within_same_interval():
     # int(299/300)=0 — interval 0 이미 처리됐으면 299초에 재스폰 없음
@@ -124,6 +139,15 @@ def test_random_spawn_uses_passengers_per_5min_from_experiment_config():
          patch("app.simulation._poisson_sample", return_value=0) as poisson:
         mgr._spawn_passengers(300.0)
     poisson.assert_called_once_with(7)
+
+
+def test_random_spawn_uses_runtime_passengers_per_5min_without_experiment_config():
+    mgr = make_manager()
+    mgr._runtime_passengers_per_5min = 11
+    with patch("app.simulation.PASSENGER_SOURCE", "random"), \
+         patch("app.simulation._poisson_sample", return_value=0) as poisson:
+        mgr._spawn_passengers(300.0)
+    poisson.assert_called_once_with(11)
 
 
 def test_passenger_counter_increments():

@@ -314,6 +314,9 @@ class SimulationStartOptions:
     target_matching_rates: dict[str, float] | None = None
     pricing_policy: dict[str, float] | None = None
     taxi_count: int | None = None
+    background_vehicle_count: int | None = None
+    passengers_per_5min: int | None = None
+    simulation_speed: float | None = None
     initial_passenger_count: int | None = None
 
 
@@ -454,6 +457,9 @@ class SimulationManager:
         self._runtime_passenger_source: str = PASSENGER_SOURCE
         self._runtime_passenger_source_overridden: bool = False
         self._runtime_taxi_count: int = N_TAXIS
+        self._runtime_background_vehicle_count: int = N_BACKGROUND_CARS
+        self._runtime_passengers_per_5min: int = PASSENGERS_PER_5MIN
+        self._runtime_simulation_speed: float = SIMULATION_SPEED
         self._runtime_initial_passenger_count: int = 0
         self._target_matching_rates: dict[str, float] = dict(DEFAULT_TARGET_MATCHING_RATES)
         self._pricing_policy: dict[str, float] = dict(DEFAULT_PRICING_POLICY)
@@ -481,9 +487,11 @@ class SimulationManager:
             params = json.dumps({
                 "n_taxis": N_TAXIS,
                 "runtime_taxi_count": self._runtime_taxi_count,
-                "n_background_cars": N_BACKGROUND_CARS,
+                "n_background_cars": self._runtime_background_vehicle_count,
+                "env_background_cars": N_BACKGROUND_CARS,
                 "frame_rate": FRAME_RATE,
-                "simulation_speed": SIMULATION_SPEED,
+                "simulation_speed": self._runtime_simulation_speed,
+                "env_simulation_speed": SIMULATION_SPEED,
                 "passengers_per_5min": self._passengers_per_5min(),
                 "passenger_lambda": self._passengers_per_5min(),
                 "dispatch_timeout_s": DISPATCH_TIMEOUT_S,
@@ -579,7 +587,7 @@ class SimulationManager:
                 return max(0, int(self.experiment_config.passengers_per_5min))
             if self.experiment_config.passenger_lambda is not None:
                 return max(0, int(self.experiment_config.passenger_lambda))
-        return max(0, int(PASSENGERS_PER_5MIN))
+        return max(0, int(self._runtime_passengers_per_5min))
 
     def _apply_start_options(self, options: SimulationStartOptions | None) -> None:
         if options is None:
@@ -593,6 +601,12 @@ class SimulationManager:
             self._runtime_passenger_source_overridden = True
         if options.taxi_count is not None:
             self._runtime_taxi_count = int(options.taxi_count)
+        if options.background_vehicle_count is not None:
+            self._runtime_background_vehicle_count = int(options.background_vehicle_count)
+        if options.passengers_per_5min is not None:
+            self._runtime_passengers_per_5min = int(options.passengers_per_5min)
+        if options.simulation_speed is not None:
+            self._runtime_simulation_speed = float(options.simulation_speed)
         if options.initial_passenger_count is not None:
             self._runtime_initial_passenger_count = int(options.initial_passenger_count)
         if options.target_matching_rates:
@@ -614,6 +628,9 @@ class SimulationManager:
         self._runtime_passenger_source = PASSENGER_SOURCE
         self._runtime_passenger_source_overridden = False
         self._runtime_taxi_count = N_TAXIS
+        self._runtime_background_vehicle_count = N_BACKGROUND_CARS
+        self._runtime_passengers_per_5min = PASSENGERS_PER_5MIN
+        self._runtime_simulation_speed = SIMULATION_SPEED
         self._runtime_initial_passenger_count = 0
         self._target_matching_rates = dict(DEFAULT_TARGET_MATCHING_RATES)
         self._pricing_policy = dict(DEFAULT_PRICING_POLICY)
@@ -635,6 +652,9 @@ class SimulationManager:
                 if self._is_taxi_id(str(vehicle.get("id", "")))
             ]
             taxi_count = len(taxi_vehicles)
+            background_vehicle_count = sum(
+                1 for vehicle in vehicles if str(vehicle.get("id", "")).startswith("bg_")
+            )
             empty_taxi_count = sum(1 for vehicle in taxi_vehicles if vehicle.get("state") == "empty")
             dispatched_taxi_count = sum(1 for vehicle in taxi_vehicles if vehicle.get("state") == "dispatched")
             occupied_taxi_count = sum(1 for vehicle in taxi_vehicles if vehicle.get("state") == "occupied")
@@ -645,9 +665,11 @@ class SimulationManager:
                 "vehicles": vehicles,
                 "passengers": passengers,
                 "frame_rate": FRAME_RATE,
-                "simulation_speed": SIMULATION_SPEED,
+                "simulation_speed": self._runtime_simulation_speed,
                 "vehicle_count": len(vehicles),
                 "taxi_count": taxi_count,
+                "background_vehicle_count": background_vehicle_count,
+                "configured_background_vehicle_count": self._runtime_background_vehicle_count,
                 "empty_taxi_count": empty_taxi_count,
                 "dispatched_taxi_count": dispatched_taxi_count,
                 "occupied_taxi_count": occupied_taxi_count,
@@ -1208,7 +1230,8 @@ class SimulationManager:
             # 일반 모드는 기존 상수와 broadcast queue를 사용하고,
             # 실험 모드는 SUMO step만 최대한 빠르게 진행한 뒤 메모리 이벤트만 남긴다.
             experiment = self.experiment_config is not None
-            step_length = self.experiment_config.step_length if experiment else STEP_LENGTH
+            runtime_step_length = self._runtime_simulation_speed / FRAME_RATE
+            step_length = self.experiment_config.step_length if experiment else runtime_step_length
             sim_duration = self.experiment_config.sim_duration if experiment else self._runtime_duration
             self._runtime_duration = sim_duration
             real_step_sleep = self.experiment_config.real_sleep if experiment else REAL_STEP_SLEEP
@@ -3299,7 +3322,11 @@ class SimulationManager:
             accum.last_distance_snapshot = dist
             speed = _valid_speed_mps(vals.get(tc.VAR_SPEED))
             if speed is not None and speed < SPEED_THRESHOLD_MPS:
-                step_length = self.experiment_config.step_length if self.experiment_config else STEP_LENGTH
+                step_length = (
+                    self.experiment_config.step_length
+                    if self.experiment_config
+                    else self._runtime_simulation_speed / FRAME_RATE
+                )
                 accum.low_speed_seconds += step_length
         return fare_updates
 
@@ -3355,7 +3382,7 @@ class SimulationManager:
         return list(largest)
 
     def _add_initial_vehicles(self) -> None:
-        """Place 200 background cars and 50 taxis on the network at t=0."""
+        """Place configured background cars and taxis on the network at t=0."""
         edges = self._routable_edges
 
         # Define a yellow taxi vehicle type based on the default
@@ -3363,7 +3390,7 @@ class SimulationManager:
         traci.vehicletype.setColor("taxi", (255, 200, 0, 255))
 
         route_index = 0
-        for i in range(N_BACKGROUND_CARS):
+        for i in range(self._runtime_background_vehicle_count):
             route_edges = self._random_route(edges, profile_source="init_bg")
             route_id = f"init_route_{route_index}"
             route_index += 1

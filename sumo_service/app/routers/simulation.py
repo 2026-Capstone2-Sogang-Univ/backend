@@ -16,7 +16,10 @@ router = APIRouter()
 
 MAX_DURATION_S = 604800.0
 MAX_TAXI_COUNT = 1000
+MAX_BACKGROUND_VEHICLE_COUNT = 3000
 MAX_INITIAL_PASSENGER_COUNT = 5000
+MAX_PASSENGERS_PER_5MIN = 1000
+MAX_SIMULATION_SPEED = 120.0
 PASSENGER_SOURCES = {"random", "parquet"}
 
 
@@ -41,6 +44,9 @@ class StartSimulationBody(BaseModel):
     target_matching_rates: TargetMatchingRatesBody | None = None
     pricing_policy: PricingPolicyBody | None = None
     taxi_count: int | None = Field(default=None, gt=0)
+    background_vehicle_count: int | None = Field(default=None, ge=0)
+    passengers_per_5min: int | None = Field(default=None, ge=0)
+    simulation_speed: float | None = Field(default=None, gt=0)
     initial_passenger_count: int | None = Field(default=None, ge=0)
 
 
@@ -80,6 +86,9 @@ def _start_options(body: StartSimulationBody | None) -> SimulationStartOptions |
             if body.pricing_policy else None
         ),
         taxi_count=body.taxi_count,
+        background_vehicle_count=body.background_vehicle_count,
+        passengers_per_5min=body.passengers_per_5min,
+        simulation_speed=body.simulation_speed,
         initial_passenger_count=body.initial_passenger_count,
     )
 
@@ -133,6 +142,33 @@ def _validate_start_body(body: StartSimulationBody | None) -> JSONResponse | Non
             "invalid_request",
             f"taxi_count must be <= {MAX_TAXI_COUNT}",
         )
+    if (
+        body.background_vehicle_count is not None
+        and body.background_vehicle_count > MAX_BACKGROUND_VEHICLE_COUNT
+    ):
+        return _error(
+            400,
+            "invalid_request",
+            f"background_vehicle_count must be <= {MAX_BACKGROUND_VEHICLE_COUNT}",
+        )
+    if (
+        body.passengers_per_5min is not None
+        and body.passengers_per_5min > MAX_PASSENGERS_PER_5MIN
+    ):
+        return _error(
+            400,
+            "invalid_request",
+            f"passengers_per_5min must be <= {MAX_PASSENGERS_PER_5MIN}",
+        )
+    if body.simulation_speed is not None:
+        if not math.isfinite(body.simulation_speed):
+            return _error(400, "invalid_request", "simulation_speed must be finite")
+        if body.simulation_speed > MAX_SIMULATION_SPEED:
+            return _error(
+                400,
+                "invalid_request",
+                f"simulation_speed must be <= {MAX_SIMULATION_SPEED:g}",
+            )
     if (
         body.initial_passenger_count is not None
         and body.initial_passenger_count > MAX_INITIAL_PASSENGER_COUNT
