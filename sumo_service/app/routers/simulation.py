@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from ..db.engine import get_pool
 from ..grid import H3_RESOLUTION
+from ..h3_regions import load_h3_region_map
 from ..simulation import DEFAULT_PRICING_POLICY, SimStatus, SimulationStartOptions
 
 router = APIRouter()
@@ -253,6 +254,15 @@ async def get_kpi(request: Request):
 async def get_surge(request: Request):
     manager = request.app.state.manager
     return {"h3_resolution": H3_RESOLUTION, "cells": manager.get_surge()}
+
+
+@router.get("/h3-regions")
+async def get_h3_regions():
+    return {
+        "h3_resolution": H3_RESOLUTION,
+        "regions": load_h3_region_map(),
+        "fallback": "lat_lng",
+    }
 
 
 @router.get("/passengers")

@@ -279,6 +279,21 @@ def test_get_surge_with_cells():
     assert len(resp.json()["cells"]) == 1
 
 
+def test_get_h3_regions_returns_display_name_lookup():
+    app.state.manager = make_manager(SimStatus.RUNNING)
+    with TestClient(app) as client:
+        resp = client.get("/simulation/h3-regions")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["h3_resolution"] == 9
+    assert body["fallback"] == "lat_lng"
+    assert isinstance(body["regions"], dict)
+    assert len(body["regions"]) == 564
+    first_region = next(iter(body["regions"].values()))
+    assert set(first_region) == {"name", "display_name", "lat", "lng"}
+
+
 # ---------------------------------------------------------------------------
 # GET /simulation/passengers
 # ---------------------------------------------------------------------------
