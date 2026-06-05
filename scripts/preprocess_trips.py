@@ -221,6 +221,37 @@ def map_edges_parallel(
     return pickup_edges, dropoff_edges, error_counts, error_samples
 
 
+def load_scc_edges(scc_path: str | None) -> set[str] | None:
+    if not scc_path:
+        return None
+    path = Path(scc_path)
+    if not path.exists():
+        print(f"      SCC filter disabled: file not found ({path})")
+        return None
+    with open(path, encoding="utf-8") as f:
+        edges = set(json.load(f))
+    print(f"      SCC filter loaded: {len(edges):,} edges from {path}")
+    return edges
+
+
+def filter_df_to_scc(df: pd.DataFrame, scc_edges: set[str] | None) -> pd.DataFrame:
+    if scc_edges is None:
+        return df
+    before = len(df)
+    pickup_ok = df["pickup_edge"].isin(scc_edges)
+    dropoff_ok = df["dropoff_edge"].isin(scc_edges)
+    pickup_removed = int((~pickup_ok).sum())
+    dropoff_removed_after_pickup_ok = int((pickup_ok & ~dropoff_ok).sum())
+    filtered = df[pickup_ok & dropoff_ok].copy()
+    print(
+        "      SCC filter: "
+        f"{before:,} -> {len(filtered):,} rows "
+        f"(pickup outside={pickup_removed:,}, "
+        f"dropoff outside after pickup ok={dropoff_removed_after_pickup_ok:,})"
+    )
+    return filtered
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="NYC 택시 parquet → trips_processed.json 변환"
@@ -242,6 +273,14 @@ def main() -> None:
         type=int,
         default=DEFAULT_WORKERS,
         help=f"엣지 변환 스레드 수 (기본값: {DEFAULT_WORKERS})",
+    )
+    parser.add_argument(
+        "--scc",
+        default=None,
+        help=(
+            "routable_scc.json 경로. 지정하지 않으면 net.xml과 같은 디렉터리의 "
+            "routable_scc.json을 자동 사용합니다."
+        ),
     )
     args = parser.parse_args()
 
@@ -321,6 +360,17 @@ def main() -> None:
             print(f"        - {sample}")
     if len(df) == 0:
         print("ERROR: 엣지 변환 후 유효한 행이 없습니다.")
+        sys.exit(1)
+
+    scc_path = args.scc
+    if scc_path is None:
+        inferred_scc_path = Path(args.net).with_name("routable_scc.json")
+        if inferred_scc_path.exists():
+            scc_path = str(inferred_scc_path)
+    scc_edges = load_scc_edges(scc_path)
+    df = filter_df_to_scc(df, scc_edges)
+    if len(df) == 0:
+        print("ERROR: SCC 필터 후 유효한 행이 없습니다.")
         sys.exit(1)
 
     # 4. sim_time 정규화 (start 기준 상대 초)
