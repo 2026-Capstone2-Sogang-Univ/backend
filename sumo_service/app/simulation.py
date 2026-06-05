@@ -425,6 +425,7 @@ class SimulationManager:
         self._run_id: int | None = None
         self._db_queue: asyncio.Queue | None = None
         self._db_writer_task: asyncio.Task | None = None
+        self._run_end_recorded: bool = False
         self._taxi_dispatch_ids: dict[str, str] = {}
         self._taxi_dispatch_surge: dict[str, float] = {}
         self._taxi_dispatch_fare_caps: dict[str, int] = {}
@@ -1041,26 +1042,51 @@ class SimulationManager:
             self._executor_task = None
         # Flush any pending call_soon_threadsafe callbacks from the run thread
         await asyncio.sleep(0)
-        # Push run_end and drain DB writer before resetting state
-        if self._run_id is not None and self._db_queue is not None:
-            end_reason = (
-                "duration" if self.status == SimStatus.FINISHED
-                else "error" if self.status == SimStatus.IDLE
-                else "manual_stop"
-            )
-            await self._db_queue.put({"type": "run_end", "run_id": self._run_id, "end_reason": end_reason})
-        if self._db_queue is not None:
-            await self._db_queue.put(None)
-        if self._db_writer_task is not None:
-            try:
-                await self._db_writer_task
-            except Exception:
-                pass
-            self._db_writer_task = None
+        end_reason = (
+            "duration" if self.status == SimStatus.FINISHED
+            else "error" if self.status == SimStatus.IDLE
+            else "manual_stop"
+        )
+        await self._close_db_writer(end_reason)
         self.status = SimStatus.IDLE
         if self.connection_manager is not None:
             self.connection_manager.clear_boundary()
         self._reset_run_state()
+
+    async def _close_db_writer(self, end_reason: str | None = None) -> None:
+        queue = self._db_queue
+        writer_task = self._db_writer_task
+        if queue is None:
+            return
+        if end_reason is not None and self._run_id is not None and not self._run_end_recorded:
+            self._run_end_recorded = True
+            await queue.put({
+                "type": "run_end",
+                "run_id": self._run_id,
+                "end_reason": end_reason,
+            })
+        await queue.put(None)
+        if writer_task is not None:
+            try:
+                await writer_task
+            except Exception:
+                pass
+        if self._db_writer_task is writer_task:
+            self._db_writer_task = None
+            self._db_queue = None
+
+    def _close_db_writer_from_run_thread(self, end_reason: str) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._close_db_writer(end_reason),
+            loop,
+        )
+        try:
+            future.result(timeout=10.0)
+        except Exception as exc:
+            _logger.warning("DB writer close failed [%s]: %s", end_reason, exc)
 
     def _reset_run_state(self) -> None:
         """Clear per-run mutable state while preserving manager configuration."""
@@ -1098,6 +1124,7 @@ class SimulationManager:
             self._edge_weights = []
             self._routable_edges_set = set()
             self._run_id = None
+            self._run_end_recorded = False
             self._loop = None
             self._state_queue = None
             self._executor_task = None
@@ -1684,6 +1711,7 @@ class SimulationManager:
                     self.status = SimStatus.FINISHED
                     if broadcast_enabled and self._loop is not None and self._state_queue is not None:
                         self._loop.call_soon_threadsafe(self._state_queue.put_nowait, None)
+                    self._close_db_writer_from_run_thread("duration")
                     break
 
                 remaining = next_deadline - time.perf_counter()
@@ -1693,8 +1721,10 @@ class SimulationManager:
         except traci.exceptions.FatalTraCIError:
             # SUMO closed the connection (e.g. reached configured end time)
             self.status = SimStatus.FINISHED
+            self._close_db_writer_from_run_thread("sumo_closed")
         except Exception:
             self.status = SimStatus.IDLE
+            self._close_db_writer_from_run_thread("error")
             raise
         finally:
             try:
