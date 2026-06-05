@@ -369,6 +369,7 @@ def _run_one(
     prediction_url: str = ExperimentConfig.prediction_url,
     prediction_horizon_min: int = ExperimentConfig.prediction_horizon_min,
     passenger_elasticity: float = ExperimentConfig.passenger_elasticity,
+    passengers_per_5min: int | None = ExperimentConfig.passengers_per_5min,
     alpha_sensitivity: float = ExperimentConfig.alpha_sensitivity,
     weather_source: str = ExperimentConfig.weather_source,
 ) -> dict:
@@ -385,6 +386,7 @@ def _run_one(
         "prediction_url": prediction_url,
         "prediction_horizon_min": prediction_horizon_min,
         "passenger_elasticity": passenger_elasticity,
+        "passengers_per_5min": passengers_per_5min,
         "alpha_sensitivity": alpha_sensitivity,
         "weather_source": weather_source,
     }
@@ -404,6 +406,7 @@ def _run_one(
             prediction_url=prediction_url,
             prediction_horizon_min=prediction_horizon_min,
             passenger_elasticity=passenger_elasticity,
+            passengers_per_5min=passengers_per_5min,
             alpha_sensitivity=alpha_sensitivity,
             weather_source=weather_source,
         )
@@ -472,6 +475,7 @@ def main() -> int:
     )
     parser.add_argument("--prediction-horizon-min", type=int, default=15)
     parser.add_argument("--passenger-elasticity", type=float, default=0.0)
+    parser.add_argument("--passengers-per-5min", type=int)
     parser.add_argument("--alpha-sensitivity", type=float, default=1.0)
     parser.add_argument("--alpha-sensitivity-list")
     parser.add_argument("--weather-source", choices=("static",), default="static")
@@ -508,6 +512,7 @@ def main() -> int:
             prediction_url=args.prediction_url,
             prediction_horizon_min=args.prediction_horizon_min,
             passenger_elasticity=args.passenger_elasticity,
+            passengers_per_5min=args.passengers_per_5min,
             alpha_sensitivity=alpha_sensitivity,
             weather_source=args.weather_source,
         )

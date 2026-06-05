@@ -160,6 +160,56 @@ def test_dispatch_skipped_when_findroute_raises():
     assert p.state == "waiting"
 
 
+def test_rejected_dispatch_sets_cooldown_and_skips_immediate_retry():
+    mgr = make_manager()
+    p = make_passenger()
+    p.h3_pickup = "pickup_cell"
+    p.h3_dropoff = "dropoff_cell"
+    mgr._passengers["p_0"] = p
+    mgr._taxi_last_dropoff_cells["taxi_0"] = "last_cell"
+    mgr._dispatch_pricing = MagicMock(return_value={
+        "base_fare_usd": 7.75,
+        "raw_surge": 1.0,
+        "bucket": "low",
+        "target_matching_rate": 0.7,
+        "required_fare_usd": None,
+        "calculated_surge": 1.0,
+        "system_surge": 1.0,
+        "final_surge": 1.0,
+        "final_fare_usd": 7.75,
+        "final_fare_cents": 775,
+        "uncapped_fare_cents": 775,
+        "quote_cap_fare_cents": None,
+        "incentive_cap_applied": False,
+        "surge_clamped": False,
+        "pricing_driver_count": 1,
+    })
+    sub = {"taxi_0": make_sub_entry()}
+
+    with patch("app.simulation._acceptance_probability", return_value=0.0), \
+         patch("app.simulation._random.random", return_value=1.0):
+        mgr._update_taxi_states(0.0, sub)
+        assert p.state == "waiting"
+        assert ("taxi_0", "p_0") in mgr._rejected_dispatch_pairs
+        assert mgr._taxi_dispatch_cooldown_until["taxi_0"] > 0.0
+
+        _traci_stub.simulation.findRoute.reset_mock()
+        mgr._update_taxi_states(1.0, sub)
+
+    _traci_stub.simulation.findRoute.assert_not_called()
+
+
+def test_rejected_dispatch_pair_is_retryable_after_cooldown_expires():
+    mgr = make_manager()
+    mgr._set_dispatch_cooldowns("taxi_0", "p_0", 0.0)
+    mgr._record_dispatch_rejection("taxi_0", "p_0")
+
+    mgr._prune_dispatch_cooldowns(61.0)
+
+    assert ("taxi_0", "p_0") not in mgr._rejected_dispatch_pairs
+    assert not mgr._pair_on_dispatch_cooldown("taxi_0", "p_0", 61.0)
+
+
 @pytest.mark.parametrize("road_id", ["", ":junction_edge", "outside_edge"])
 def test_dispatch_skips_invalid_current_road_without_findroute(road_id):
     mgr = make_manager()

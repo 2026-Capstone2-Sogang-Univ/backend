@@ -106,13 +106,17 @@ N_TAXIS = int(os.getenv("N_TAXIS", "300"))
 N_BACKGROUND_CARS = int(os.getenv("N_BACKGROUND_CARS", "800"))
 
 PASSENGER_SPAWN_INTERVAL = 300.0
-PASSENGER_LAMBDA = int(os.getenv("PASSENGER_LAMBDA", "5"))
+PASSENGERS_PER_5MIN = int(os.getenv("PASSENGERS_PER_5MIN", os.getenv("PASSENGER_LAMBDA", "5")))
+# Deprecated alias kept for older scripts/tests. New code should use PASSENGERS_PER_5MIN.
+PASSENGER_LAMBDA = PASSENGERS_PER_5MIN
 PICKUP_THRESHOLD_M = 30.0
 MAX_COMPLETED_PASSENGERS = 100
 DISPATCH_TIMEOUT_S = 600.0   # 배차 후 이 시간 내 픽업 못하면 재배차
 TRIP_TIMEOUT_S = 1800.0      # 탑승 후 이 시간 내 하차 못하면 강제 완료
 MANUAL_COMMAND_TIMEOUT_S = float(os.getenv("MANUAL_COMMAND_TIMEOUT_S", "5.0"))
 PASSENGER_WAIT_TIMEOUT_S = float(os.getenv("PASSENGER_WAIT_TIMEOUT_S", "900.0"))
+TAXI_DISPATCH_COOLDOWN_S = float(os.getenv("TAXI_DISPATCH_COOLDOWN_S", "5.0"))
+PAIR_DISPATCH_COOLDOWN_S = float(os.getenv("PAIR_DISPATCH_COOLDOWN_S", "60.0"))
 DEFAULT_AVERAGE_TRIP_DISTANCE_M = 3000.0
 
 # 기사 행동 모델: V/s 테이블은 2013 NYC 데이터 기반 → 동일 시간대 사용
@@ -135,8 +139,13 @@ DEFAULT_PRICING_POLICY = {
     "alpha_sensitivity": 1.0,
 }
 PARQUET_REPLAY_STAT_KEYS = (
+    "original_count",
+    "scheduled_count_per_loop",
+    "source_duration_s",
+    "loop_count",
     "scheduled_due_count",
     "spawned_count",
+    "downsampled_count",
     "skipped_pickup",
     "skipped_dropoff",
     "route_failed",
@@ -291,6 +300,8 @@ class ExperimentConfig:
     prediction_horizon_min: int = 15
     prediction_fallback_policy: str = "error"
     passenger_elasticity: float = 0.0
+    passengers_per_5min: int | None = None
+    passenger_lambda: int | None = None
     alpha_sensitivity: float = 1.0
     weather_source: str = "static"
 
@@ -398,7 +409,8 @@ class SimulationManager:
         self._completed_passengers: list[dict] = []
         self._completed_trip_count: int = 0
         self._trip_queue: list[dict] = []
-        self._parquet_replay_stats: dict[str, int] = self._new_parquet_replay_stats()
+        self._trip_template: list[dict] = []
+        self._parquet_replay_stats: dict[str, float | int] = self._new_parquet_replay_stats()
         self._latlng: Callable[[float, float], tuple[float, float]] | None = None
         # veh_id → 현재 할당된 경로의 엣지 수. route_index와 비교해 끝에 근접했는지 판정.
         self._bg_route_len: dict[str, int] = {}
@@ -416,6 +428,9 @@ class SimulationManager:
         self._taxi_dispatch_ids: dict[str, str] = {}
         self._taxi_dispatch_surge: dict[str, float] = {}
         self._taxi_dispatch_fare_caps: dict[str, int] = {}
+        self._taxi_dispatch_cooldown_until: dict[str, float] = {}
+        self._pair_dispatch_cooldown_until: dict[tuple[str, str], float] = {}
+        self._rejected_dispatch_pairs: set[tuple[str, str]] = set()
         self._taxi_active_call_details: dict[str, dict] = {}
         self._taxi_pickup_route_index: dict[str, int] = {}
         self._taxi_dropoff_route_index: dict[str, int] = {}
@@ -468,7 +483,8 @@ class SimulationManager:
                 "n_background_cars": N_BACKGROUND_CARS,
                 "frame_rate": FRAME_RATE,
                 "simulation_speed": SIMULATION_SPEED,
-                "passenger_lambda": PASSENGER_LAMBDA,
+                "passengers_per_5min": self._passengers_per_5min(),
+                "passenger_lambda": self._passengers_per_5min(),
                 "dispatch_timeout_s": DISPATCH_TIMEOUT_S,
                 "trip_timeout_s": TRIP_TIMEOUT_S,
                 "seed": self._runtime_seed,
@@ -553,8 +569,16 @@ class SimulationManager:
         )
 
     @staticmethod
-    def _new_parquet_replay_stats() -> dict[str, int]:
+    def _new_parquet_replay_stats() -> dict[str, float | int]:
         return {key: 0 for key in PARQUET_REPLAY_STAT_KEYS}
+
+    def _passengers_per_5min(self) -> int:
+        if self.experiment_config is not None:
+            if self.experiment_config.passengers_per_5min is not None:
+                return max(0, int(self.experiment_config.passengers_per_5min))
+            if self.experiment_config.passenger_lambda is not None:
+                return max(0, int(self.experiment_config.passenger_lambda))
+        return max(0, int(PASSENGERS_PER_5MIN))
 
     def _apply_start_options(self, options: SimulationStartOptions | None) -> None:
         if options is None:
@@ -631,6 +655,8 @@ class SimulationManager:
                 "completed_trip_count": self._completed_trip_count,
                 "h3_resolution": H3_RESOLUTION,
                 "passenger_source": self._passenger_source(),
+                "passengers_per_5min": self._passengers_per_5min(),
+                "passenger_lambda": self._passengers_per_5min(),
                 "target_matching_rates": dict(self._target_matching_rates),
                 "pricing_policy": dict(self._pricing_policy),
                 "duration": self._runtime_duration,
@@ -1060,6 +1086,7 @@ class SimulationManager:
             self._completed_passengers = []
             self._completed_trip_count = 0
             self._trip_queue = []
+            self._trip_template = []
             self._parquet_replay_stats = self._new_parquet_replay_stats()
             self._latlng = None
             self._bg_route_len = {}
@@ -1080,6 +1107,9 @@ class SimulationManager:
             self._taxi_dispatch_ids = {}
             self._taxi_dispatch_surge = {}
             self._taxi_dispatch_fare_caps = {}
+            self._taxi_dispatch_cooldown_until = {}
+            self._pair_dispatch_cooldown_until = {}
+            self._rejected_dispatch_pairs = set()
             self._taxi_active_call_details = {}
             self._taxi_pickup_route_index = {}
             self._taxi_dropoff_route_index = {}
@@ -1153,6 +1183,7 @@ class SimulationManager:
             experiment = self.experiment_config is not None
             step_length = self.experiment_config.step_length if experiment else STEP_LENGTH
             sim_duration = self.experiment_config.sim_duration if experiment else self._runtime_duration
+            self._runtime_duration = sim_duration
             real_step_sleep = self.experiment_config.real_sleep if experiment else REAL_STEP_SLEEP
             broadcast_enabled = (not experiment) or bool(self.experiment_config.broadcast)
             cmd = [
@@ -1218,7 +1249,7 @@ class SimulationManager:
 
             if self._passenger_source() == "parquet":
                 with open(TRIPS_FILE) as f:
-                    self._trip_queue = sorted(json.load(f), key=lambda t: t["sim_time"])
+                    self._prepare_parquet_trip_queue(json.load(f))
 
             _PROF_INTERVAL_S = 10.0
             _prof = None
@@ -1600,6 +1631,8 @@ class SimulationManager:
                         for taxi_id, accum in list(self._active_trips.items()):
                             pid = self._taxi_targets.pop(taxi_id, None)
                             p = self._passengers.pop(pid, None) if pid else None
+                            if pid:
+                                self._clear_rejection_history_for_passenger(pid)
                             if p:
                                 dropoff_h3 = p.h3_dropoff or get_cell(p.dropoff_lat, p.dropoff_lng)
                                 fare_result = self._fare_result_for_accumulator(p, accum)
@@ -1880,6 +1913,71 @@ class SimulationManager:
         })
         return adjusted
 
+    def _prepare_parquet_trip_queue(self, trips: list[dict]) -> None:
+        sampled = self._sample_parquet_trips_per_5min(trips)
+        source_duration_s = self._parquet_source_duration_s(sampled or trips)
+        loop_count = (
+            max(1, math.ceil(self._runtime_duration / source_duration_s))
+            if source_duration_s > 0 else 1
+        )
+
+        queue: list[dict] = []
+        for loop_index in range(loop_count):
+            offset = loop_index * source_duration_s
+            for trip in sampled:
+                scheduled = dict(trip)
+                scheduled["sim_time"] = float(trip["sim_time"]) + offset
+                scheduled["_parquet_loop_index"] = loop_index
+                if scheduled["sim_time"] <= self._runtime_duration:
+                    queue.append(scheduled)
+
+        queue.sort(key=lambda t: float(t["sim_time"]))
+        self._trip_template = sampled
+        self._trip_queue = queue
+        self._parquet_replay_stats["original_count"] = len(trips)
+        self._parquet_replay_stats["scheduled_count_per_loop"] = len(sampled)
+        self._parquet_replay_stats["source_duration_s"] = source_duration_s
+        self._parquet_replay_stats["loop_count"] = loop_count
+        self._parquet_replay_stats["downsampled_count"] = max(0, len(trips) - len(sampled))
+
+    def _sample_parquet_trips_per_5min(self, trips: list[dict]) -> list[dict]:
+        target_count = self._passengers_per_5min()
+        if target_count <= 0:
+            return []
+        buckets: dict[int, list[dict]] = defaultdict(list)
+        for trip in trips:
+            sim_time = float(trip.get("sim_time", 0.0))
+            buckets[int(sim_time // PASSENGER_SPAWN_INTERVAL)].append(trip)
+
+        seed = self._runtime_seed
+        if seed is None and self.experiment_config is not None:
+            seed = self.experiment_config.seed
+        if seed is None:
+            seed = 0
+
+        sampled: list[dict] = []
+        for bucket in sorted(buckets):
+            bucket_trips = sorted(buckets[bucket], key=lambda t: float(t.get("sim_time", 0.0)))
+            if len(bucket_trips) <= target_count:
+                selected = bucket_trips
+            else:
+                rng = _random.Random(f"{seed}:{bucket}:{target_count}:{len(bucket_trips)}")
+                selected = rng.sample(bucket_trips, target_count)
+                selected.sort(key=lambda t: float(t.get("sim_time", 0.0)))
+            sampled.extend(dict(trip) for trip in selected)
+        return sampled
+
+    @staticmethod
+    def _parquet_source_duration_s(trips: list[dict]) -> float:
+        if not trips:
+            return PASSENGER_SPAWN_INTERVAL
+        max_sim_time = max(float(trip.get("sim_time", 0.0)) for trip in trips)
+        return max(
+            PASSENGER_SPAWN_INTERVAL,
+            (math.floor(max_sim_time / PASSENGER_SPAWN_INTERVAL) + 1)
+            * PASSENGER_SPAWN_INTERVAL,
+        )
+
     def _spawn_passengers(self, sim_time: float) -> None:
         if self._passenger_source() == "parquet":
             while self._trip_queue and self._trip_queue[0]["sim_time"] <= sim_time:
@@ -1891,7 +1989,7 @@ class SimulationManager:
             if interval <= self._last_spawn_interval:
                 return
             self._last_spawn_interval = interval
-            n = _poisson_sample(PASSENGER_LAMBDA)
+            n = _poisson_sample(self._passengers_per_5min())
             n = self._adjust_spawn_count_for_elasticity(n, None, sim_time)
             for _ in range(n):
                 self._create_passenger_random(sim_time)
@@ -1941,7 +2039,10 @@ class SimulationManager:
             return
         self._prof_counters["route_generated_total"] += 1
         self._prof_counters[f"route_generated_{source}"] += 1
-        dst_h3 = self._h3_for_edge(dst_edge) if dst_edge else None
+        try:
+            dst_h3 = self._h3_for_edge(dst_edge) if dst_edge else None
+        except Exception:
+            dst_h3 = None
         if dst_h3:
             self._prof_route_dest_h3[dst_h3] += 1
         hits = sorted(_PROFILE_BOTTLENECK_EDGES.intersection(route_edges))
@@ -2424,6 +2525,7 @@ class SimulationManager:
                 if old_dispatch_id:
                     self._push_db_event({"type": "dispatch_timeout", "id": old_dispatch_id})
             self._passengers.pop(passenger.id, None)
+            self._clear_rejection_history_for_passenger(passenger.id)
             self._passenger_dispatch_buckets.pop(passenger.id, None)
             self._schedule_ws_event("broadcast_passenger_cancelled", passenger.id, "timeout")
             self._emit_event("passenger_cancelled", {
@@ -2603,8 +2705,55 @@ class SimulationManager:
             "pricing_driver_count": pricing_driver_count,
         }
 
+    def _prune_dispatch_cooldowns(self, sim_time: float) -> None:
+        self._taxi_dispatch_cooldown_until = {
+            taxi_id: until
+            for taxi_id, until in self._taxi_dispatch_cooldown_until.items()
+            if until > sim_time
+        }
+        self._pair_dispatch_cooldown_until = {
+            pair: until
+            for pair, until in self._pair_dispatch_cooldown_until.items()
+            if until > sim_time
+        }
+        self._rejected_dispatch_pairs = {
+            pair for pair in self._rejected_dispatch_pairs
+            if pair in self._pair_dispatch_cooldown_until
+        }
+
+    def _taxi_on_dispatch_cooldown(self, taxi_id: str, sim_time: float) -> bool:
+        return self._taxi_dispatch_cooldown_until.get(taxi_id, 0.0) > sim_time
+
+    def _pair_on_dispatch_cooldown(self, taxi_id: str, passenger_id: str, sim_time: float) -> bool:
+        return self._pair_dispatch_cooldown_until.get((taxi_id, passenger_id), 0.0) > sim_time
+
+    def _set_dispatch_cooldowns(self, taxi_id: str, passenger_id: str, sim_time: float) -> None:
+        if TAXI_DISPATCH_COOLDOWN_S > 0:
+            self._taxi_dispatch_cooldown_until[taxi_id] = sim_time + TAXI_DISPATCH_COOLDOWN_S
+        if PAIR_DISPATCH_COOLDOWN_S > 0:
+            self._pair_dispatch_cooldown_until[(taxi_id, passenger_id)] = (
+                sim_time + PAIR_DISPATCH_COOLDOWN_S
+            )
+
+    def _record_dispatch_rejection(self, taxi_id: str, passenger_id: str) -> None:
+        self._rejected_dispatch_pairs.add((taxi_id, passenger_id))
+
+    def _is_rejected_dispatch_pair(self, taxi_id: str, passenger_id: str) -> bool:
+        return (taxi_id, passenger_id) in self._rejected_dispatch_pairs
+
+    def _clear_rejection_history_for_passenger(self, passenger_id: str) -> None:
+        self._rejected_dispatch_pairs = {
+            pair for pair in self._rejected_dispatch_pairs if pair[1] != passenger_id
+        }
+        self._pair_dispatch_cooldown_until = {
+            pair: until
+            for pair, until in self._pair_dispatch_cooldown_until.items()
+            if pair[1] != passenger_id
+        }
+
     def _update_taxi_states(self, sim_time: float, sub_results: dict) -> list[dict]:
         fare_updates: list[dict] = []
+        self._prune_dispatch_cooldowns(sim_time)
         waiting_passengers = [p for p in self._passengers.values() if p.state == "waiting"]
 
         for veh_id, vals in sub_results.items():
@@ -2616,6 +2765,8 @@ class SimulationManager:
 
             # 단계 1 — 배차: 거리 기준 상위 K명 검토 후 수락 확률로 배차
             if state == "empty" and waiting_passengers:
+                if self._taxi_on_dispatch_cooldown(veh_id, sim_time):
+                    continue
                 if (
                     not road_id
                     or road_id.startswith(":")
@@ -2627,6 +2778,11 @@ class SimulationManager:
                     key=lambda p: (p.x - tx) ** 2 + (p.y - ty) ** 2,
                 )
                 for candidate in candidates:
+                    if (
+                        self._is_rejected_dispatch_pair(veh_id, candidate.id)
+                        or self._pair_on_dispatch_cooldown(veh_id, candidate.id, sim_time)
+                    ):
+                        continue
                     try:
                         route = traci.simulation.findRoute(road_id, candidate.pickup_edge)
                         if not route.edges:
@@ -2749,6 +2905,8 @@ class SimulationManager:
                             ),
                         })
                     if not accepted:
+                        self._set_dispatch_cooldowns(veh_id, candidate.id, sim_time)
+                        self._record_dispatch_rejection(veh_id, candidate.id)
                         self._record_dispatch_kpi(decision_payload, accepted=False)
                         self._emit_event("dispatch_decision", {**decision_payload, "accepted": False})
                         self._push_db_event({**dispatch_payload, **decision_payload, "accepted": False})
@@ -2766,6 +2924,7 @@ class SimulationManager:
                     self._taxi_last_extend_route_index.pop(veh_id, None)
                     candidate.state = "assigned"
                     candidate.taxi_id = veh_id
+                    self._clear_rejection_history_for_passenger(candidate.id)
                     waiting_passengers.remove(candidate)
                     self._taxi_targets[veh_id] = candidate.id
                     self._taxi_states[veh_id] = "dispatched"
@@ -2808,6 +2967,8 @@ class SimulationManager:
                 # 배차 타임아웃: 승객 waiting으로 되돌리고 택시 empty로 리셋
                 dispatch_time = self._taxi_dispatch_times.get(veh_id, sim_time)
                 if sim_time - dispatch_time > DISPATCH_TIMEOUT_S:
+                    self._set_dispatch_cooldowns(veh_id, passenger.id, sim_time)
+                    self._record_dispatch_rejection(veh_id, passenger.id)
                     passenger.state = "waiting"
                     passenger.taxi_id = None
                     del self._taxi_targets[veh_id]
@@ -2926,6 +3087,7 @@ class SimulationManager:
                     self._record_history_dropoff(sim_time, dropoff_h3)
                     self._taxi_last_dropoff_cells[veh_id] = dropoff_h3
                     del self._passengers[passenger_id]
+                    self._clear_rejection_history_for_passenger(passenger_id)
                     del self._active_trips[veh_id]
                     del self._taxi_targets[veh_id]
                     self._taxi_states[veh_id] = "empty"
@@ -2992,6 +3154,7 @@ class SimulationManager:
                     self._record_history_dropoff(sim_time, dropoff_h3)
                     self._taxi_last_dropoff_cells[veh_id] = dropoff_h3
                     del self._passengers[passenger_id]
+                    self._clear_rejection_history_for_passenger(passenger_id)
                     del self._active_trips[veh_id]
                     del self._taxi_targets[veh_id]
                     self._taxi_states[veh_id] = "empty"
@@ -3023,6 +3186,8 @@ class SimulationManager:
             if passenger_id:
                 passenger = self._passengers.get(passenger_id)
                 if passenger and passenger.state == "assigned":
+                    self._set_dispatch_cooldowns(veh_id, passenger.id, sim_time)
+                    self._record_dispatch_rejection(veh_id, passenger.id)
                     passenger.state = "waiting"
                     passenger.taxi_id = None
                     waiting_passengers.append(passenger)
@@ -3047,6 +3212,8 @@ class SimulationManager:
                 _logger.warning("taxi %s removed from network while occupied - vehicle lost", taxi_id)
                 passenger_id = self._taxi_targets.pop(taxi_id, None)
                 passenger = self._passengers.pop(passenger_id, None) if passenger_id else None
+                if passenger_id:
+                    self._clear_rejection_history_for_passenger(passenger_id)
                 if passenger:
                     dropoff_h3 = passenger.h3_dropoff or get_cell(passenger.dropoff_lat, passenger.dropoff_lng)
                     fare_result = self._fare_result_for_accumulator(passenger, accum)

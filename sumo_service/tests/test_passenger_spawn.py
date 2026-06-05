@@ -116,6 +116,16 @@ def test_zero_poisson_spawns_nothing():
     assert len(mgr._passengers) == 0
 
 
+def test_random_spawn_uses_passengers_per_5min_from_experiment_config():
+    from app.simulation import ExperimentConfig
+    mgr = make_manager()
+    mgr.experiment_config = ExperimentConfig(passengers_per_5min=7)
+    with patch("app.simulation.PASSENGER_SOURCE", "random"), \
+         patch("app.simulation._poisson_sample", return_value=0) as poisson:
+        mgr._spawn_passengers(300.0)
+    poisson.assert_called_once_with(7)
+
+
 def test_passenger_counter_increments():
     mgr = make_manager()
     _traci_stub.simulation.findRoute.return_value = _ROUTE
@@ -260,6 +270,41 @@ def test_parquet_counts_route_failure():
     assert len(mgr._passengers) == 0
     assert mgr._parquet_replay_stats["scheduled_due_count"] == 1
     assert mgr._parquet_replay_stats["route_failed"] == 1
+
+
+def test_parquet_trip_queue_samples_each_5min_bucket_and_records_stats():
+    from app.simulation import ExperimentConfig
+    mgr = make_manager()
+    mgr.experiment_config = ExperimentConfig(passengers_per_5min=1, seed=123)
+    mgr._runtime_duration = 600.0
+    trips = [
+        _make_trip(10.0),
+        _make_trip(20.0),
+        _make_trip(310.0),
+        _make_trip(320.0),
+    ]
+
+    mgr._prepare_parquet_trip_queue(trips)
+
+    assert mgr._parquet_replay_stats["original_count"] == 4
+    assert mgr._parquet_replay_stats["scheduled_count_per_loop"] == 2
+    assert mgr._parquet_replay_stats["downsampled_count"] == 2
+    assert len(mgr._trip_template) == 2
+    assert len(mgr._trip_queue) == 2
+
+
+def test_parquet_trip_queue_loops_when_runtime_exceeds_source_duration():
+    from app.simulation import ExperimentConfig
+    mgr = make_manager()
+    mgr.experiment_config = ExperimentConfig(passengers_per_5min=1, seed=123)
+    mgr._runtime_duration = 900.0
+    trips = [_make_trip(10.0)]
+
+    mgr._prepare_parquet_trip_queue(trips)
+
+    assert mgr._parquet_replay_stats["source_duration_s"] == 300.0
+    assert mgr._parquet_replay_stats["loop_count"] == 3
+    assert [trip["sim_time"] for trip in mgr._trip_queue] == [10.0, 310.0, 610.0]
 
 
 def test_passenger_elasticity_zero_keeps_raw_spawn_count():
