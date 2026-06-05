@@ -832,6 +832,7 @@ dependencies = [
     { name = "eclipse-sumo" },
     { name = "fastapi" },
     { name = "h3" },
+    { name = "httpx" },
     { name = "pandas" },
     { name = "protobuf" },
     { name = "pyarrow" },
@@ -843,7 +844,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
@@ -854,6 +854,7 @@ requires-dist = [
     { name = "eclipse-sumo", specifier = ">=1.21.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "h3", specifier = ">=4.0.0" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "pandas", specifier = ">=3.0.3" },
     { name = "protobuf", specifier = ">=5.0" },
     { name = "pyarrow", specifier = ">=24.0.0" },
@@ -865,7 +866,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx", specifier = ">=0.27.0" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.24.0" },
 ]
