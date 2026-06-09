@@ -116,7 +116,7 @@ N_TAXIS = int(os.getenv("N_TAXIS", "300"))
 N_BACKGROUND_CARS = int(os.getenv("N_BACKGROUND_CARS", "800"))
 
 PASSENGER_SPAWN_INTERVAL = 300.0
-PASSENGERS_PER_5MIN = int(os.getenv("PASSENGERS_PER_5MIN", os.getenv("PASSENGER_LAMBDA", "5")))
+PASSENGERS_PER_5MIN = int(os.getenv("PASSENGERS_PER_5MIN", os.getenv("PASSENGER_LAMBDA", "80")))
 # Deprecated alias kept for older scripts/tests. New code should use PASSENGERS_PER_5MIN.
 PASSENGER_LAMBDA = PASSENGERS_PER_5MIN
 PICKUP_THRESHOLD_M = 30.0
@@ -1315,11 +1315,9 @@ class SimulationManager:
             self._initialize_prediction_components()
             self._edge_weights = self._compute_edge_weights()
             self._add_initial_vehicles()
-            if (
-                self._runtime_initial_passenger_count > 0
-                and not experiment
-                and self._passenger_source() == "random"
-            ):
+            # 시작손님수는 모드와 무관하게 시작 시점에 random으로 생성한 승객으로 채운다.
+            # parquet 모드도 이후 정상적으로 parquet 타임라인대로 승객을 추가 스폰한다.
+            if self._runtime_initial_passenger_count > 0 and not experiment:
                 for _ in range(self._runtime_initial_passenger_count):
                     self._create_passenger_random(0.0)
 
