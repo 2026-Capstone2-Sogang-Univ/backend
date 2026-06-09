@@ -3040,12 +3040,24 @@ class SimulationManager:
                     continue
                 route_index = vals.get(tc.VAR_ROUTE_INDEX)
                 pickup_index = self._taxi_pickup_route_index.get(veh_id)
-                pickup_reached_by_index = (
+                # 픽업 엣지를 한 스텝에 통째로 지나치는 overshoot 안전망.
+                # strict '>' — 픽업 엣지에 막 진입한 순간(==)이 아니라 지나친 경우만.
+                overshot = (
                     pickup_index is not None
                     and route_index is not None
-                    and route_index >= pickup_index
+                    and route_index > pickup_index
                 )
-                if road_id == passenger.pickup_edge or pickup_reached_by_index:
+                # 같은 엣지라도 엣지 길이만큼 떨어져 있을 수 있으므로, 픽업 엣지 위에서는
+                # 실제 근거리일 때만 픽업한다. (overshoot일 때만 거리 조건을 우회)
+                near_pickup = (
+                    (tx - passenger.x) ** 2 + (ty - passenger.y) ** 2
+                    <= PICKUP_THRESHOLD_M ** 2
+                )
+                # 픽업은 반드시 실제 근거리(near_pickup)에서만. overshoot는 픽업 엣지를 한
+                # 스텝에 지나친 경우의 안전망이지만, 그 역시 근거리일 때만 유효하다.
+                # (overshoot 단독 허용 시, 먼 택시가 route_index>pickup_index만으로 km 밖에서
+                #  즉시 픽업되어 승객이 생성 직후 사라지는 버그가 있었다.)
+                if near_pickup and (road_id == passenger.pickup_edge or overshot):
                     if not road_id or road_id.startswith(":") or road_id not in self._routable_edges_set:
                         continue
                     try:
@@ -3069,7 +3081,7 @@ class SimulationManager:
                     self._taxi_last_extend_route_index.pop(veh_id, None)
                     self._taxi_pickup_route_index.pop(veh_id, None)
                     self._taxi_dropoff_route_index[veh_id] = dropoff_route_index
-                    if pickup_reached_by_index and road_id != passenger.pickup_edge and SIM_PROFILE:
+                    if overshot and road_id != passenger.pickup_edge and SIM_PROFILE:
                         self._prof_counters["pickup_index_reached"] += 1
                     dispatch_time = self._taxi_dispatch_times.pop(veh_id, sim_time)
                     dispatch_surge = self._taxi_dispatch_surge.pop(veh_id, 1.0)
