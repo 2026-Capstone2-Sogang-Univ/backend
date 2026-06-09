@@ -16,6 +16,7 @@ from tests.test_passenger_spawn import _make_traci_stub, _traci_stub  # reuse st
 from app.fare import SPEED_THRESHOLD_MPS, TripAccumulator
 from app.passenger import Passenger
 from app.simulation import (
+    DISPATCH_DELAY_S,
     DISPATCH_TIMEOUT_S,
     STEP_LENGTH,
     TRIP_TIMEOUT_S,
@@ -35,13 +36,14 @@ def make_passenger(
     pickup_edge: str = "pickup_edge",
     dropoff_edge: str = "dropoff_edge",
     state: str = "waiting",
+    spawn_time: float = 0.0,
 ) -> Passenger:
     return Passenger(
         id=pid, x=x, y=y, lat=40.7, lng=-74.0,
         pickup_edge=pickup_edge, dropoff_edge=dropoff_edge,
         dropoff_x=500.0, dropoff_y=500.0, dropoff_lat=40.71, dropoff_lng=-73.99,
         expected_distance_m=2000.0, expected_fare=775,
-        spawn_time=0.0, state=state,
+        spawn_time=spawn_time, state=state,
     )
 
 
@@ -85,7 +87,7 @@ def make_manager() -> SimulationManager:
 
 def test_dispatch_empty_taxi_to_waiting_passenger():
     mgr = make_manager()
-    p = make_passenger()
+    p = make_passenger(spawn_time=-100.0)  # 유예 지난 승객
     mgr._passengers["p_0"] = p
     sub = {"taxi_0": make_sub_entry()}
     _traci_stub.vehicle.changeTarget = MagicMock()
@@ -100,8 +102,8 @@ def test_dispatch_empty_taxi_to_waiting_passenger():
 
 def test_dispatch_selects_nearest_passenger():
     mgr = make_manager()
-    p_near = make_passenger("p_0", x=10.0, y=0.0)
-    p_far  = make_passenger("p_1", x=1000.0, y=0.0)
+    p_near = make_passenger("p_0", x=10.0, y=0.0, spawn_time=-100.0)
+    p_far  = make_passenger("p_1", x=1000.0, y=0.0, spawn_time=-100.0)
     mgr._passengers["p_0"] = p_near
     mgr._passengers["p_1"] = p_far
     # taxi at origin → nearest is p_0
@@ -113,6 +115,41 @@ def test_dispatch_selects_nearest_passenger():
     assert mgr._taxi_targets["taxi_0"] == "p_0"
     assert p_near.state == "assigned"
     assert p_far.state == "waiting"
+
+
+def test_dispatch_delayed_until_grace_elapsed():
+    mgr = make_manager()
+    spawn = 10.0
+    p = make_passenger(spawn_time=spawn)
+    mgr._passengers["p_0"] = p
+    sub = {"taxi_0": make_sub_entry()}
+    _traci_stub.vehicle.changeTarget = MagicMock()
+
+    # 유예 중(생성 후 DISPATCH_DELAY_S 미만) → 배차 안 됨
+    mgr._update_taxi_states(spawn + DISPATCH_DELAY_S - 1.0, sub)
+    assert mgr._taxi_states.get("taxi_0") != "dispatched"
+    assert p.state == "waiting"
+
+    # 유예 경과 후 → 배차됨
+    mgr._update_taxi_states(spawn + DISPATCH_DELAY_S + 1.0, sub)
+    assert mgr._taxi_states["taxi_0"] == "dispatched"
+    assert p.state == "assigned"
+
+
+def test_manual_passenger_dispatch_delay_can_be_disabled(monkeypatch):
+    # DISPATCH_DELAY_MANUAL=False면 수동 승객은 유예 없이 즉시 배차 후보가 된다.
+    monkeypatch.setattr("app.simulation.DISPATCH_DELAY_MANUAL", False)
+    mgr = make_manager()
+    p = make_passenger(spawn_time=10.0)
+    p.manual = True
+    mgr._passengers["p_0"] = p
+    sub = {"taxi_0": make_sub_entry()}
+    _traci_stub.vehicle.changeTarget = MagicMock()
+
+    # 생성 후 1초(유예 미만)인데도 수동+토글off라 즉시 배차
+    mgr._update_taxi_states(11.0, sub)
+    assert mgr._taxi_states["taxi_0"] == "dispatched"
+    assert p.state == "assigned"
 
 
 def test_no_dispatch_when_no_waiting_passengers():
@@ -162,7 +199,7 @@ def test_dispatch_skipped_when_findroute_raises():
 
 def test_rejected_dispatch_sets_cooldown_and_skips_immediate_retry():
     mgr = make_manager()
-    p = make_passenger()
+    p = make_passenger(spawn_time=-100.0)  # 유예 지난 승객
     p.h3_pickup = "pickup_cell"
     p.h3_dropoff = "dropoff_cell"
     mgr._passengers["p_0"] = p

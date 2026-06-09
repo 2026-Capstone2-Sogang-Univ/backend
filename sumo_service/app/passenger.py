@@ -24,3 +24,4 @@ class Passenger:
     h3_dropoff: Optional[str] = None
     incentive_limit: Optional[int] = None
     pickup_lane_pos: Optional[float] = None  # along-edge position on pickup_edge
+    manual: bool = False  # API로 수동 생성된 승객 여부 (배차 유예 토글에 사용)

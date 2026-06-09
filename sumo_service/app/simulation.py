@@ -137,6 +137,10 @@ DISPATCH_MAX_CANDIDATES = int(os.getenv("DISPATCH_MAX_CANDIDATES", "3"))
 # 탐색이 막히는 starvation을 막기 위해, 실제 평가 후보 K명을 채울 때까지 가까운
 # 순으로 최대 K*MULTIPLIER명까지 훑는다. findRoute 호출 수는 K명으로 그대로 유지된다.
 DISPATCH_SCAN_MULTIPLIER = int(os.getenv("DISPATCH_SCAN_MULTIPLIER", "5"))
+# 승객 생성 후 이 시간(sim초) 동안은 배차 후보에서 제외해 "대기중"으로 표시만 한다.
+DISPATCH_DELAY_S = float(os.getenv("DISPATCH_DELAY_S", "5.0"))
+# 수동(API) 생성 승객에도 배차 유예를 적용할지. 기본 적용(1). 0/false면 수동 승객은 즉시 배차 가능.
+DISPATCH_DELAY_MANUAL = os.getenv("DISPATCH_DELAY_MANUAL", "1").strip().lower() not in ("0", "false", "no")
 
 PASSENGER_SOURCE = os.getenv("PASSENGER_SOURCE", "parquet")
 _DEFAULT_TRIPS_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "trips_processed.json"
@@ -2503,6 +2507,7 @@ class SimulationManager:
             h3_dropoff=h3_dropoff,
             incentive_limit=max(0, int(request.incentive_limit)),
             pickup_lane_pos=self._lane_pos_for_point(x, y),
+            manual=True,
         )
         self._push_db_event({
             "type": "passenger",
@@ -2826,6 +2831,13 @@ class SimulationManager:
                 sim_time + PAIR_DISPATCH_COOLDOWN_S
             )
 
+    def _dispatch_delay_elapsed(self, passenger: Passenger, sim_time: float) -> bool:
+        """승객 생성 후 DISPATCH_DELAY_S(sim초)가 지나 배차 후보로 쓸 수 있는지.
+        수동 승객은 DISPATCH_DELAY_MANUAL=False면 유예 없이 즉시 후보가 된다."""
+        if passenger.manual and not DISPATCH_DELAY_MANUAL:
+            return True
+        return sim_time - passenger.spawn_time >= DISPATCH_DELAY_S
+
     def _record_dispatch_rejection(self, taxi_id: str, passenger_id: str) -> None:
         self._rejected_dispatch_pairs.add((taxi_id, passenger_id))
 
@@ -2845,7 +2857,10 @@ class SimulationManager:
     def _update_taxi_states(self, sim_time: float, sub_results: dict) -> list[dict]:
         fare_updates: list[dict] = []
         self._prune_dispatch_cooldowns(sim_time)
-        waiting_passengers = [p for p in self._passengers.values() if p.state == "waiting"]
+        waiting_passengers = [
+            p for p in self._passengers.values()
+            if p.state == "waiting" and self._dispatch_delay_elapsed(p, sim_time)
+        ]
 
         for veh_id, vals in sub_results.items():
             if not self._is_taxi_id(veh_id):
