@@ -184,8 +184,14 @@ HOTSPOTS: list[tuple[float, float, float]] = [
     (40.7074, -74.0113, 1.0),  # Wall Street / Financial District
     (40.7127, -74.0134, 0.7),  # World Trade Center
 ]
-HOTSPOT_SIGMA_M = 300.0     # 가우시안 감쇠 스케일 (m)
-HOTSPOT_BASE_WEIGHT = 1.0   # 모든 엣지 최소 가중치
+HOTSPOT_SIGMA_M = float(os.getenv("HOTSPOT_SIGMA_M", "300.0"))  # 가우시안 감쇠 스케일 (m)
+# 모든 엣지의 최소 목적지 가중치. 값이 클수록 핫스팟의 상대적 우위가 희석되어
+# 순항 택시 목적지가 고르게 분산된다(미드타운 쏠림 완화). 1.0→2.0이면 미드타운
+# 엣지의 선택 우위가 약 3.5배→2.25배로 줄어든다. env로 추가 튜닝 가능.
+HOTSPOT_BASE_WEIGHT = float(os.getenv("HOTSPOT_BASE_WEIGHT", "2.0"))
+# 초기 택시를 핫스팟 가중치로 분산 배치할지. 기본 ON. 0/false면 기존 균등 랜덤 배치.
+# (배경차는 의도적으로 제외 — 핫스팟 집중 시 미드타운 혼잡이 악화되므로 균등 유지)
+INIT_TAXI_HOTSPOT_WEIGHTED = os.getenv("INIT_TAXI_HOTSPOT_WEIGHTED", "1").strip().lower() not in ("0", "false", "no")
 
 _SUB_VARS = [tc.VAR_POSITION, tc.VAR_ANGLE, tc.VAR_SPEED, tc.VAR_DISTANCE, tc.VAR_ROAD_ID, tc.VAR_ROUTE_INDEX, tc.VAR_LANEPOSITION]
 # bg 차량은 위치 스냅샷이 필요 없고 경로 연장 판정에 쓰는 값만 구독한다.
@@ -3503,7 +3509,11 @@ class SimulationManager:
             self._bg_route_len[f"bg_{i}"] = len(route_edges)
 
         for i in range(self._runtime_taxi_count):
-            route_edges = self._random_route(edges, profile_source="init_taxi")
+            route_edges = None
+            if INIT_TAXI_HOTSPOT_WEIGHTED:
+                route_edges = self._weighted_initial_route()
+            if not route_edges:
+                route_edges = self._random_route(edges, profile_source="init_taxi")
             route_id = f"init_route_{route_index}"
             route_index += 1
             traci.route.add(route_id, route_edges)
@@ -3770,6 +3780,21 @@ class SimulationManager:
         route_edges = [fallback_edge]
         self._profile_generated_route(profile_source, fallback_edge, route_edges)
         return route_edges
+
+    def _weighted_initial_route(self) -> list[str] | None:
+        """핫스팟 가중치로 출발 엣지를 골라 경로를 만든다(초기 택시 배치용).
+        택시를 수요 밀집(핫스팟) 근처에 더 많이 배치해 콜드스타트 픽업거리를 줄인다.
+        가중치가 없거나 경로 생성에 실패하면 None을 반환(호출부에서 균등 폴백)."""
+        edges = self._routable_edges
+        weights = self._edge_weights if len(self._edge_weights) == len(edges) else None
+        if not weights:
+            return None
+        for _ in range(10):
+            start = _random.choices(edges, weights=weights, k=1)[0]
+            route = self._random_route_from(start)
+            if route:
+                return route
+        return None
 
     def _capture_state(
         self, sim_time: float, sub_results: dict
