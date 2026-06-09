@@ -83,6 +83,16 @@ SUMO_NET = str(
 SUMO_BINARY = "sumo-gui" if os.getenv("SUMO_GUI") == "1" else "sumo"
 SUMO_ROUTING_ALGORITHM = os.getenv("SUMO_ROUTING_ALGORITHM", "astar")
 SUMO_REROUTING_THREADS = int(os.getenv("SUMO_REROUTING_THREADS", "0"))
+# 혼잡 반영 라우팅. 일부 차량에만 rerouting device를 부여하면(probability) SUMO가 전역으로
+# 모든 엣지의 평균 통행시간을 수집·평활화한다. 그 값을 findRoute(ROUTING_MODE_AGGREGATED)가
+# 읽어 혼잡 구간을 우회 → 특정 도로 쏠림 완화. device는 삽입 시 1회만 관여하고(period 미설정=0)
+# 이후 앱의 setRoute 경로 관리와 충돌하지 않는다. 전 엣지 통행시간 수집 비용은 device 수와
+# 무관하므로 일부 차량(0.3)만으로 충분하다.
+ROUTE_REROUTING_PROBABILITY = os.getenv("ROUTE_REROUTING_PROBABILITY", "0.3")
+ROUTE_ADAPTATION_INTERVAL_S = os.getenv("ROUTE_ADAPTATION_INTERVAL_S", "60")
+# 지수이동평균 가중치(0~1). steps 방식과 달리 엣지당 메모리 O(1)이고, 60s 간격에서 최근
+# 혼잡을 적절히 반영하면서 경로 진동을 완충한다. (steps 기본 180은 60s 간격 시 ~3시간 창이라 둔함)
+ROUTE_ADAPTATION_WEIGHT = os.getenv("ROUTE_ADAPTATION_WEIGHT", "0.5")
 
 SIM_DURATION = float(os.getenv("SIM_DURATION", "3600"))        # simulated seconds
 FRAME_RATE = 60.0  # broadcast fps (WebSocket messages per real second)
@@ -1249,6 +1259,14 @@ class SimulationManager:
             ]
             if SUMO_REROUTING_THREADS > 0:
                 cmd.extend(["--device.rerouting.threads", str(SUMO_REROUTING_THREADS)])
+            # 라이브 실행만 혼잡 반영 라우팅을 켠다. experiment는 device 무작위 부여가
+            # 재현성에 영향을 줄 수 있어 기존대로 정적 라우팅을 유지한다.
+            if not experiment:
+                cmd.extend([
+                    "--device.rerouting.probability", ROUTE_REROUTING_PROBABILITY,
+                    "--device.rerouting.adaptation-interval", ROUTE_ADAPTATION_INTERVAL_S,
+                    "--device.rerouting.adaptation-weight", ROUTE_ADAPTATION_WEIGHT,
+                ])
             traci.start(cmd, label="main")
             (min_x, min_y), (max_x, max_y) = traci.simulation.getNetBoundary()
             corners = [(min_x, min_y), (min_x, max_y), (max_x, min_y), (max_x, max_y)]
@@ -2837,7 +2855,10 @@ class SimulationManager:
                     ):
                         continue
                     try:
-                        route = traci.simulation.findRoute(road_id, candidate.pickup_edge)
+                        route = traci.simulation.findRoute(
+                            road_id, candidate.pickup_edge,
+                            routingMode=tc.ROUTING_MODE_AGGREGATED,
+                        )
                         if not route.edges:
                             continue
                     except traci.exceptions.TraCIException:
@@ -3061,7 +3082,10 @@ class SimulationManager:
                     if not road_id or road_id.startswith(":") or road_id not in self._routable_edges_set:
                         continue
                     try:
-                        route = traci.simulation.findRoute(road_id, passenger.dropoff_edge)
+                        route = traci.simulation.findRoute(
+                            road_id, passenger.dropoff_edge,
+                            routingMode=tc.ROUTING_MODE_AGGREGATED,
+                        )
                         if not route.edges:
                             continue
                         trip_edges = list(route.edges)
@@ -3635,7 +3659,9 @@ class SimulationManager:
                 try:
                     if SIM_PROFILE:
                         self._prof_counters["findRoute_calls"] += 1
-                    result = traci.simulation.findRoute(current_edge, dst)
+                    result = traci.simulation.findRoute(
+                        current_edge, dst, routingMode=tc.ROUTING_MODE_AGGREGATED,
+                    )
                     if len(result.edges) >= min_len:
                         return list(result.edges)
                 except traci.exceptions.TraCIException:
@@ -3659,7 +3685,9 @@ class SimulationManager:
                 if src == dst:
                     continue
                 try:
-                    result = traci.simulation.findRoute(src, dst)
+                    result = traci.simulation.findRoute(
+                        src, dst, routingMode=tc.ROUTING_MODE_AGGREGATED,
+                    )
                     if len(result.edges) >= min_len:
                         route_edges = list(result.edges)
                         self._profile_generated_route(profile_source, dst, route_edges)
