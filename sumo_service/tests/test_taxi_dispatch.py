@@ -327,7 +327,8 @@ def test_pickup_when_taxi_passed_pickup_route_index(monkeypatch):
     assert mgr._taxi_states["taxi_0"] == "occupied"
     assert p.state == "picked_up"
     assert "taxi_0" not in mgr._taxi_pickup_route_index
-    assert mgr._taxi_dropoff_route_index["taxi_0"] == 1
+    # dropoff index는 prefix offset(현재 route_index=2)만큼 보정됨: 2 + (트립경로 상대 index 1) = 3
+    assert mgr._taxi_dropoff_route_index["taxi_0"] == 3
     assert mgr._prof_counters["pickup_index_reached"] == 1
 
 

@@ -2607,8 +2607,8 @@ class SimulationManager:
                     route = self._random_route_from_profiled("post_cancel_idle", road_id)
                     if route:
                         try:
-                            traci.vehicle.setRoute(taxi_id, route)
-                            self._taxi_route_len[taxi_id] = len(route)
+                            self._taxi_route_len[taxi_id] = self._set_route_tracked(
+                                taxi_id, route, vals.get(tc.VAR_ROUTE_INDEX))[0]
                         except traci.exceptions.TraCIException:
                             self._taxi_route_len[taxi_id] = 0
                     else:
@@ -3034,8 +3034,9 @@ class SimulationManager:
                     buf = self._random_route_from_profiled("pickup_buffer", candidate.pickup_edge)
                     if buf and len(buf) > 1:
                         dispatch_edges = dispatch_edges + buf[1:]
-                    traci.vehicle.setRoute(veh_id, dispatch_edges)
-                    self._taxi_route_len[veh_id] = len(dispatch_edges)
+                    full_len, route_offset = self._set_route_tracked(
+                        veh_id, dispatch_edges, vals.get(tc.VAR_ROUTE_INDEX))
+                    self._taxi_route_len[veh_id] = full_len
                     self._taxi_last_extend_route_index.pop(veh_id, None)
                     candidate.state = "assigned"
                     candidate.taxi_id = veh_id
@@ -3053,7 +3054,7 @@ class SimulationManager:
                         passenger=candidate,
                         final_fare=decision_payload["final_fare_cents"],
                     )
-                    self._taxi_pickup_route_index[veh_id] = pickup_route_index
+                    self._taxi_pickup_route_index[veh_id] = route_offset + pickup_route_index
                     self._taxi_dropoff_route_index.pop(veh_id, None)
                     previous_dropoff_time = self._taxi_previous_dropoff_times.get(veh_id)
                     if previous_dropoff_time is not None:
@@ -3136,16 +3137,18 @@ class SimulationManager:
                         buf = self._random_route_from_profiled("dropoff_buffer", passenger.dropoff_edge)
                         if buf and len(buf) > 1:
                             trip_edges = trip_edges + buf[1:]
-                        traci.vehicle.setRoute(veh_id, trip_edges)
+                        trip_full_len, trip_offset = self._set_route_tracked(
+                            veh_id, trip_edges, route_index)
                     except traci.exceptions.TraCIException:
                         continue
+                    self._taxi_route_len[veh_id] = trip_full_len
                     passenger.state = "picked_up"
                     passenger.taxi_id = veh_id
                     self._record_passenger_boarded_kpi(passenger, sim_time)
                     self._taxi_states[veh_id] = "occupied"
                     self._taxi_last_extend_route_index.pop(veh_id, None)
                     self._taxi_pickup_route_index.pop(veh_id, None)
-                    self._taxi_dropoff_route_index[veh_id] = dropoff_route_index
+                    self._taxi_dropoff_route_index[veh_id] = trip_offset + dropoff_route_index
                     if overshot and road_id != passenger.pickup_edge and SIM_PROFILE:
                         self._prof_counters["pickup_index_reached"] += 1
                     dispatch_time = self._taxi_dispatch_times.pop(veh_id, sim_time)
@@ -3230,8 +3233,8 @@ class SimulationManager:
                     self._taxi_active_call_details.pop(veh_id, None)
                     route = self._random_route_from_profiled("post_timeout_idle", road_id)
                     if route:
-                        traci.vehicle.setRoute(veh_id, route)
-                        self._taxi_route_len[veh_id] = len(route)
+                        self._taxi_route_len[veh_id] = self._set_route_tracked(
+                            veh_id, route, vals.get(tc.VAR_ROUTE_INDEX))[0]
                     else:
                         # 픽업 시 붙인 버퍼가 하차 지점 너머까지 이어져 있다. route_len=0으로 두어
                         # 다음 스텝에 _extend_vehicle_routes가 즉시 연장을 시도하게 한다.
@@ -3299,8 +3302,8 @@ class SimulationManager:
                     self._taxi_active_call_details.pop(veh_id, None)
                     route = self._random_route_from_profiled("post_dropoff_idle", road_id)
                     if route:
-                        traci.vehicle.setRoute(veh_id, route)
-                        self._taxi_route_len[veh_id] = len(route)
+                        self._taxi_route_len[veh_id] = self._set_route_tracked(
+                            veh_id, route, vals.get(tc.VAR_ROUTE_INDEX))[0]
                     else:
                         # 하차 후 경로를 못 찾으면 route_len=0으로 두어 다음 스텝에 즉시 재연장.
                         self._taxi_route_len[veh_id] = 0
@@ -3552,8 +3555,8 @@ class SimulationManager:
                     self._profile_generated_route("bg_extension", new_route[-1], new_route)
                 if new_route:
                     try:
-                        traci.vehicle.setRoute(veh_id, new_route)
-                        self._bg_route_len[veh_id] = len(new_route)
+                        self._bg_route_len[veh_id] = self._set_route_tracked(
+                            veh_id, new_route, route_index)[0]
                         self._bg_extend_cooldown[veh_id] = sim_time + _BG_EXTENSION_COOLDOWN_S
                     except traci.exceptions.TraCIException:
                         pass  # route_len 유지 → 다음 스텝 재시도
@@ -3623,8 +3626,8 @@ class SimulationManager:
                         )
                 if new_route:
                     try:
-                        traci.vehicle.setRoute(veh_id, new_route)
-                        self._taxi_route_len[veh_id] = len(new_route)
+                        self._taxi_route_len[veh_id] = self._set_route_tracked(
+                            veh_id, new_route, route_index)[0]
                         cooldown_s = (
                             _TAXI_EXTENSION_COOLDOWN_S
                             if taxi_state == "dispatched"
@@ -3664,6 +3667,19 @@ class SimulationManager:
                 w += imp * math.exp(-(dx * dx + dy * dy) / two_sigma_sq)
             weights.append(w)
         return weights
+
+    def _set_route_tracked(self, veh_id: str, edges, route_index) -> tuple[int, int]:
+        """setRoute한 뒤 (전체 경로 길이, prefix offset)을 반환한다.
+
+        SUMO의 setRoute는 이미 지나온 엣지들을 prefix로 보존한다. 따라서 실제 경로 =
+        traversed_prefix + edges 이고, VAR_ROUTE_INDEX도 이 전체 경로 기준으로 센다.
+        prefix 길이는 setRoute 시점의 현재 route_index와 같으므로(검증됨), 이를 offset으로
+        route_len(=offset+len(edges))과 pickup/dropoff index에 더해 보정해야
+        remaining_edges·overshot 판정이 어긋나지 않는다. (보정을 안 하면 dispatched 택시의
+        remaining이 음수가 되어 연장이 조기·반복 발동, 픽업 경로를 못 따라가 떠도는 버그.)"""
+        traci.vehicle.setRoute(veh_id, edges)
+        offset = route_index if isinstance(route_index, int) and route_index > 0 else 0
+        return offset + len(edges), offset
 
     def _random_route_from(
         self,
