@@ -133,6 +133,10 @@ DEFAULT_AVERAGE_TRIP_DISTANCE_M = 3000.0
 SIM_BASE_DATETIME = _datetime(2013, 7, 8, 8, 0, 0)
 # parquet 모드에서 승객 대량 스폰 시 findRoute RPC 폭증 방지용 튜닝값
 DISPATCH_MAX_CANDIDATES = int(os.getenv("DISPATCH_MAX_CANDIDATES", "3"))
+# cooldown/rejected pair가 가까운 후보 슬롯을 차지해 그 다음 배차 가능한 승객까지
+# 탐색이 막히는 starvation을 막기 위해, 실제 평가 후보 K명을 채울 때까지 가까운
+# 순으로 최대 K*MULTIPLIER명까지 훑는다. findRoute 호출 수는 K명으로 그대로 유지된다.
+DISPATCH_SCAN_MULTIPLIER = int(os.getenv("DISPATCH_SCAN_MULTIPLIER", "5"))
 
 PASSENGER_SOURCE = os.getenv("PASSENGER_SOURCE", "parquet")
 _DEFAULT_TRIPS_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "trips_processed.json"
@@ -2844,16 +2848,27 @@ class SimulationManager:
                     or road_id not in self._routable_edges_set
                 ):
                     continue
-                candidates = heapq.nsmallest(
-                    DISPATCH_MAX_CANDIDATES, waiting_passengers,
+                # cooldown·rejected pair는 후보 슬롯을 차지하지 않도록 가까운 순으로 더 넓게
+                # 훑어 실제 평가 가능 후보 K명을 채운다. findRoute 호출 수는 K명으로 유지.
+                scan_limit = max(
+                    DISPATCH_MAX_CANDIDATES,
+                    DISPATCH_MAX_CANDIDATES * DISPATCH_SCAN_MULTIPLIER,
+                )
+                nearby = heapq.nsmallest(
+                    min(scan_limit, len(waiting_passengers)), waiting_passengers,
                     key=lambda p: (p.x - tx) ** 2 + (p.y - ty) ** 2,
                 )
-                for candidate in candidates:
+                candidates = []
+                for candidate in nearby:
                     if (
                         self._is_rejected_dispatch_pair(veh_id, candidate.id)
                         or self._pair_on_dispatch_cooldown(veh_id, candidate.id, sim_time)
                     ):
                         continue
+                    candidates.append(candidate)
+                    if len(candidates) >= DISPATCH_MAX_CANDIDATES:
+                        break
+                for candidate in candidates:
                     try:
                         route = traci.simulation.findRoute(
                             road_id, candidate.pickup_edge,
