@@ -35,6 +35,7 @@ def _make_traci_stub():
         "VAR_DISTANCE": 132,
         "VAR_ROAD_ID": 80,
         "VAR_ROUTE_INDEX": 105,
+        "VAR_LANEPOSITION": 86,
         "ROUTING_MODE_DEFAULT": 0,
         "ROUTING_MODE_AGGREGATED": 1,
     }

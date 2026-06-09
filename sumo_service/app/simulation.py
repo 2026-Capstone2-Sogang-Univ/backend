@@ -183,7 +183,7 @@ HOTSPOTS: list[tuple[float, float, float]] = [
 HOTSPOT_SIGMA_M = 300.0     # 가우시안 감쇠 스케일 (m)
 HOTSPOT_BASE_WEIGHT = 1.0   # 모든 엣지 최소 가중치
 
-_SUB_VARS = [tc.VAR_POSITION, tc.VAR_ANGLE, tc.VAR_SPEED, tc.VAR_DISTANCE, tc.VAR_ROAD_ID, tc.VAR_ROUTE_INDEX]
+_SUB_VARS = [tc.VAR_POSITION, tc.VAR_ANGLE, tc.VAR_SPEED, tc.VAR_DISTANCE, tc.VAR_ROAD_ID, tc.VAR_ROUTE_INDEX, tc.VAR_LANEPOSITION]
 # bg 차량은 위치 스냅샷이 필요 없고 경로 연장 판정에 쓰는 값만 구독한다.
 _BG_SUB_VARS = [tc.VAR_ROAD_ID, tc.VAR_ROUTE_INDEX, tc.VAR_SPEED]
 # 경로 끝에서 남은 엣지 수가 이 값 이하이면 새 경로를 이어 붙인다.
@@ -2087,6 +2087,19 @@ class SimulationManager:
         mid = len(shape) // 2
         return shape[mid]
 
+    def _lane_pos_for_point(self, x: float, y: float) -> float | None:
+        """Along-edge (lane) position of a sumo-coordinate point, or None.
+
+        Used to tell whether a taxi sharing the pickup edge sits upstream of the
+        passenger. Computed once per passenger at creation, never per step.
+        """
+        traci_mod = _traci_module()
+        try:
+            road = traci_mod.simulation.convertRoad(x, y, isGeo=False)
+        except traci_mod.exceptions.TraCIException:
+            return None
+        return road[1] if isinstance(road, tuple) and len(road) > 1 else None
+
     def _h3_for_edge(self, edge_id: str) -> str | None:
         if edge_id in self._edge_h3_cache:
             return self._edge_h3_cache[edge_id]
@@ -2191,6 +2204,7 @@ class SimulationManager:
             state="waiting",
             h3_pickup=h3,
             h3_dropoff=h3_dropoff,
+            pickup_lane_pos=self._lane_pos_for_point(x, y),
         )
         self._push_db_event({
             "type": "passenger",
@@ -2265,6 +2279,7 @@ class SimulationManager:
             state="waiting",
             h3_pickup=h3,
             h3_dropoff=h3_dropoff,
+            pickup_lane_pos=self._lane_pos_for_point(x, y),
         )
         self._push_db_event({
             "type": "passenger",
@@ -2487,6 +2502,7 @@ class SimulationManager:
             h3_pickup=h3,
             h3_dropoff=h3_dropoff,
             incentive_limit=max(0, int(request.incentive_limit)),
+            pickup_lane_pos=self._lane_pos_for_point(x, y),
         )
         self._push_db_event({
             "type": "passenger",
@@ -2869,6 +2885,16 @@ class SimulationManager:
                     if len(candidates) >= DISPATCH_MAX_CANDIDATES:
                         break
                 for candidate in candidates:
+                    # 같은 엣지에 있고 택시가 승객보다 앞(downstream)이면 findRoute가
+                    # 길이≈0의 퇴화 경로를 줘서, 앞으로 갈수록 멀어지는데도 즉시 픽업돼
+                    # 버린다. 같은 엣지일 땐 택시가 승객보다 뒤(upstream)일 때만 배차한다.
+                    if road_id == candidate.pickup_edge and candidate.pickup_lane_pos is not None:
+                        taxi_lane_pos = vals.get(tc.VAR_LANEPOSITION)
+                        if (
+                            taxi_lane_pos is not None
+                            and taxi_lane_pos > candidate.pickup_lane_pos + PICKUP_THRESHOLD_M
+                        ):
+                            continue
                     try:
                         route = traci.simulation.findRoute(
                             road_id, candidate.pickup_edge,

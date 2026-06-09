@@ -23,3 +23,4 @@ class Passenger:
     h3_pickup: Optional[str] = None
     h3_dropoff: Optional[str] = None
     incentive_limit: Optional[int] = None
+    pickup_lane_pos: Optional[float] = None  # along-edge position on pickup_edge
