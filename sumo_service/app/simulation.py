@@ -2883,8 +2883,9 @@ class SimulationManager:
                     or road_id not in self._routable_edges_set
                 ):
                     continue
-                # cooldown·rejected pair는 후보 슬롯을 차지하지 않도록 가까운 순으로 더 넓게
-                # 훑어 실제 평가 가능 후보 K명을 채운다. findRoute 호출 수는 K명으로 유지.
+                # cooldown pair는 후보 슬롯을 차지하지 않도록 가까운 순으로 더 넓게
+                # 훑어 실제 평가 가능 후보 K명을 채운다. rejected pair는 일단 후보군에
+                # 포함하되(아래 평가 루프에서 걸러짐), findRoute 호출 수는 K명으로 유지.
                 scan_limit = max(
                     DISPATCH_MAX_CANDIDATES,
                     DISPATCH_MAX_CANDIDATES * DISPATCH_SCAN_MULTIPLIER,
@@ -2895,15 +2896,14 @@ class SimulationManager:
                 )
                 candidates = []
                 for candidate in nearby:
-                    if (
-                        self._is_rejected_dispatch_pair(veh_id, candidate.id)
-                        or self._pair_on_dispatch_cooldown(veh_id, candidate.id, sim_time)
-                    ):
+                    if self._pair_on_dispatch_cooldown(veh_id, candidate.id, sim_time):
                         continue
                     candidates.append(candidate)
                     if len(candidates) >= DISPATCH_MAX_CANDIDATES:
                         break
                 for candidate in candidates:
+                    if self._is_rejected_dispatch_pair(veh_id, candidate.id):
+                        continue
                     # 같은 엣지에 있고 택시가 승객보다 앞(downstream)이면 findRoute가
                     # 길이≈0의 퇴화 경로를 줘서, 앞으로 갈수록 멀어지는데도 즉시 픽업돼
                     # 버린다. 같은 엣지일 땐 택시가 승객보다 뒤(upstream)일 때만 배차한다.
