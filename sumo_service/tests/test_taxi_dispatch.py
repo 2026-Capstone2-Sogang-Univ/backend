@@ -117,6 +117,35 @@ def test_dispatch_selects_nearest_passenger():
     assert p_far.state == "waiting"
 
 
+def test_dispatch_skips_passenger_beyond_pickup_cutoff():
+    # 2.14마일(~3444m) 컷오프 밖 승객은 유일한 후보여도 배차되지 않는다.
+    mgr = make_manager()
+    p_far = make_passenger("p_0", x=5000.0, y=0.0, spawn_time=-100.0)  # > 3444m
+    mgr._passengers["p_0"] = p_far
+    sub = {"taxi_0": make_sub_entry(x=0.0, y=0.0)}
+    _traci_stub.vehicle.changeTarget = MagicMock()
+
+    mgr._update_taxi_states(0.0, sub)
+
+    assert mgr._taxi_states.get("taxi_0") != "dispatched"
+    assert p_far.state == "waiting"
+
+
+def test_dispatch_cutoff_disabled_when_zero(monkeypatch):
+    # 컷오프 비활성(0)이면 먼 승객도 배차 후보가 된다.
+    monkeypatch.setattr("app.simulation.DISPATCH_MAX_PICKUP_M2", 0)
+    mgr = make_manager()
+    p_far = make_passenger("p_0", x=5000.0, y=0.0, spawn_time=-100.0)
+    mgr._passengers["p_0"] = p_far
+    sub = {"taxi_0": make_sub_entry(x=0.0, y=0.0)}
+    _traci_stub.vehicle.changeTarget = MagicMock()
+
+    mgr._update_taxi_states(0.0, sub)
+
+    assert mgr._taxi_states["taxi_0"] == "dispatched"
+    assert p_far.state == "assigned"
+
+
 def test_dispatch_delayed_until_grace_elapsed():
     mgr = make_manager()
     spawn = 10.0

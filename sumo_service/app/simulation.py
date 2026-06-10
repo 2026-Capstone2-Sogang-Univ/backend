@@ -137,6 +137,11 @@ DISPATCH_MAX_CANDIDATES = int(os.getenv("DISPATCH_MAX_CANDIDATES", "3"))
 # 탐색이 막히는 starvation을 막기 위해, 실제 평가 후보 K명을 채울 때까지 가까운
 # 순으로 최대 K*MULTIPLIER명까지 훑는다. findRoute 호출 수는 K명으로 그대로 유지된다.
 DISPATCH_SCAN_MULTIPLIER = int(os.getenv("DISPATCH_SCAN_MULTIPLIER", "5"))
+# 픽업 직선거리 상한(마일). 이보다 먼 승객은 배차 후보에서 제외해 원거리 거절·findRoute
+# 낭비를 막는다. 0 이하면 컷오프 비활성. 기본 2.14 = model_coefficients.json pu_unlabeled_dist_mile.
+DISPATCH_MAX_PICKUP_MILES = float(os.getenv("DISPATCH_MAX_PICKUP_MILES", "2.14"))
+DISPATCH_MAX_PICKUP_M = DISPATCH_MAX_PICKUP_MILES * 1609.344
+DISPATCH_MAX_PICKUP_M2 = DISPATCH_MAX_PICKUP_M ** 2  # 제곱거리 비교용(sqrt 회피)
 # 승객 생성 후 이 시간(sim초) 동안은 배차 후보에서 제외해 "대기중"으로 표시만 한다.
 DISPATCH_DELAY_S = float(os.getenv("DISPATCH_DELAY_S", "5.0"))
 # 수동(API) 생성 승객에도 배차 유예를 적용할지. 기본 적용(1). 0/false면 수동 승객은 즉시 배차 가능.
@@ -2912,6 +2917,12 @@ class SimulationManager:
                 )
                 candidates = []
                 for candidate in nearby:
+                    if (
+                        DISPATCH_MAX_PICKUP_M2 > 0
+                        and (candidate.x - tx) ** 2 + (candidate.y - ty) ** 2
+                        > DISPATCH_MAX_PICKUP_M2
+                    ):
+                        continue  # 2.14마일 밖 직선거리 → 후보 제외(findRoute 전 사전 컷오프)
                     if self._pair_on_dispatch_cooldown(veh_id, candidate.id, sim_time):
                         continue
                     candidates.append(candidate)
