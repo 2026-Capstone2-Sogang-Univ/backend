@@ -39,7 +39,7 @@ def test_predicted_demand_source_uses_prediction_for_surge(monkeypatch):
     manager = SimulationManager(ExperimentConfig(demand_source="predicted"))
     manager._prediction_demand_provider = provider
 
-    manager._build_surge_cells({"h3_a": 1}, {"h3_a": 1}, 0.0)
+    manager._build_surge_cells({"h3_a": 1}, {"h3_a": 1}, {"h3_a": 1}, 0.0)
 
     assert provider.calls == [
         {
@@ -81,7 +81,7 @@ def test_actual_demand_source_uses_grid_demand_for_surge(monkeypatch):
     monkeypatch.setattr(simulation, "cell_center_latlng", lambda cell: (40.0, -73.0))
     manager = SimulationManager(ExperimentConfig(demand_source="actual"))
 
-    manager._build_surge_cells({"h3_a": 1}, {"h3_a": 2}, 0.0)
+    manager._build_surge_cells({"h3_a": 1}, {"h3_a": 2}, {"h3_a": 2}, 0.0)
 
     assert manager._surge_cells == [
         {
@@ -119,7 +119,7 @@ def test_runtime_surge_does_not_append_experiment_diagnostics(monkeypatch):
     monkeypatch.setattr(simulation, "cell_center_latlng", lambda cell: (40.0, -73.0))
     manager = SimulationManager()
 
-    manager._build_surge_cells({"h3_a": 1}, {"h3_a": 2}, 0.0)
+    manager._build_surge_cells({"h3_a": 1}, {"h3_a": 2}, {"h3_a": 2}, 0.0)
 
     assert manager._surge_diagnostics == []
 

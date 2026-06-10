@@ -293,10 +293,37 @@ def test_capture_grid_counts_matches_capture_state_counts():
     }
 
     _, state_supply, state_demand = mgr._capture_state(10.0, sub)
-    grid_supply, grid_demand = mgr._capture_grid_counts(sub)
+    grid_supply, grid_demand, grid_demand_weighted = mgr._capture_grid_counts(sub)
 
     assert grid_supply == state_supply
+    # 실제 카운트(grid_demand)는 _capture_state와 일치해야 한다.
     assert grid_demand == state_demand
+
+
+def test_capture_grid_counts_weights_assigned_demand(monkeypatch):
+    monkeypatch.setattr("app.simulation.ASSIGNED_DEMAND_WEIGHT", 0.5)
+    mgr = make_manager()
+    w = make_passenger("p_w", state="waiting"); w.h3_pickup = "cell"
+    a1 = make_passenger("p_a1", state="assigned"); a1.h3_pickup = "cell"
+    a2 = make_passenger("p_a2", state="assigned"); a2.h3_pickup = "cell"
+    mgr._passengers = {w.id: w, a1.id: a1, a2.id: a2}
+
+    _, grid_demand, grid_demand_weighted = mgr._capture_grid_counts({})
+
+    assert grid_demand["cell"] == 3                  # 실제 카운트: waiting1 + assigned2
+    assert grid_demand_weighted["cell"] == 2.0       # 가중: 1 + 2*0.5
+
+
+def test_capture_grid_counts_weight_one_reproduces_count(monkeypatch):
+    # ASSIGNED_DEMAND_WEIGHT=1.0이면 가중 demand가 실제 카운트와 동일(현재 동작 재현).
+    monkeypatch.setattr("app.simulation.ASSIGNED_DEMAND_WEIGHT", 1.0)
+    mgr = make_manager()
+    a = make_passenger("p_a", state="assigned"); a.h3_pickup = "cell"
+    mgr._passengers = {a.id: a}
+
+    _, grid_demand, grid_demand_weighted = mgr._capture_grid_counts({})
+
+    assert grid_demand_weighted["cell"] == grid_demand["cell"] == 1.0
 
 
 def test_dispatch_timeout_reverts_passenger_to_waiting():

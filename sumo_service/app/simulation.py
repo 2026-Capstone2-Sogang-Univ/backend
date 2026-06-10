@@ -144,6 +144,10 @@ DISPATCH_DELAY_MANUAL = os.getenv("DISPATCH_DELAY_MANUAL", "1").strip().lower() 
 # 라이브(비실험) 실행에서도 목표 매칭률 추종 인센티브(요금 역산)를 적용할지.
 # 기본 적용(1). 0/false면 라이브는 기존처럼 공급/수요 surge만 사용한다.
 LIVE_TARGET_PRICING = os.getenv("LIVE_TARGET_PRICING", "1").strip().lower() not in ("0", "false", "no")
+# 배차된(assigned) 승객의 surge 수요 가중치. surge 공식 입력에만 적용된다(프론트 표시 demand·
+# actual_demand는 실제 카운트 유지). 1.0=현재(assigned도 full), 0.0=waiting만, 기본 0.5
+# (이미 매칭돼 곧 충족될 수요는 surge 압력을 덜 준다).
+ASSIGNED_DEMAND_WEIGHT = float(os.getenv("ASSIGNED_DEMAND_WEIGHT", "0.5"))
 
 PASSENGER_SOURCE = os.getenv("PASSENGER_SOURCE", "parquet")
 _DEFAULT_TRIPS_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "trips_processed.json"
@@ -1517,11 +1521,11 @@ class SimulationManager:
                 _pt = time.perf_counter() if SIM_PROFILE else 0.0
                 surge_payload = None
                 with self._lock:
-                    grid_supply, grid_demand = self._capture_grid_counts(sub_results)
+                    grid_supply, grid_demand, grid_demand_weighted = self._capture_grid_counts(sub_results)
                     surge_interval = int(sim_time / 5.0)
                     if surge_interval > self._last_surge_interval:
                         self._last_surge_interval = surge_interval
-                        self._build_surge_cells(grid_supply, grid_demand, sim_time)
+                        self._build_surge_cells(grid_supply, grid_demand, grid_demand_weighted, sim_time)
                         surge_payload = self._surge_cells
                 if SIM_PROFILE:
                     _prof["totals"]["surge"] += time.perf_counter() - _pt
@@ -3846,10 +3850,17 @@ class SimulationManager:
         state_dict = {"vehicles": vehicles, "passengers": passengers_list, "sim_time": sim_time}
         return state_dict, grid_supply, grid_demand
 
-    def _capture_grid_counts(self, sub_results: dict) -> tuple[dict[str, int], dict[str, int]]:
-        """Return lightweight (grid_supply, grid_demand) for surge calculation."""
+    def _capture_grid_counts(
+        self, sub_results: dict
+    ) -> tuple[dict[str, int], dict[str, int], dict[str, float]]:
+        """Return (grid_supply, grid_demand, grid_demand_weighted) for surge calculation.
+
+        grid_demand: 실제 카운트(waiting+assigned 각 1, 표시·진단용).
+        grid_demand_weighted: surge 공식 입력용 가중 demand(waiting×1 + assigned×weight).
+        """
         grid_supply: dict[str, int] = defaultdict(int)
         grid_demand: dict[str, int] = defaultdict(int)
+        grid_demand_weighted: dict[str, float] = defaultdict(float)
 
         for veh_id, vals in sub_results.items():
             if veh_id.startswith("bg_"):
@@ -3862,24 +3873,33 @@ class SimulationManager:
                 grid_supply[get_cell(lat, lng)] += 1
 
         for p in self._passengers.values():
-            if p.state in ("waiting", "assigned") and p.h3_pickup:
+            if not p.h3_pickup:
+                continue
+            if p.state == "waiting":
                 grid_demand[p.h3_pickup] += 1
+                grid_demand_weighted[p.h3_pickup] += 1.0
+            elif p.state == "assigned":
+                grid_demand[p.h3_pickup] += 1
+                grid_demand_weighted[p.h3_pickup] += ASSIGNED_DEMAND_WEIGHT
 
-        return grid_supply, grid_demand
+        return grid_supply, grid_demand, grid_demand_weighted
 
     def _build_surge_cells(
         self,
         grid_supply: dict[str, int],
         grid_demand: dict[str, int],
+        grid_demand_weighted: dict[str, float],
         sim_time: float,
     ) -> None:
         surge_cells = []
         surge_by_h3 = {}
         raw_surge_by_h3 = {}
         target_matching_rate_by_h3 = {}
-        demand_for_surge: dict[str, float | int] = grid_demand
+        # surge 공식 입력은 가중 demand(assigned 가중). 예측 모드는 예측값으로 대체.
+        demand_for_surge: dict[str, float | int] = grid_demand_weighted
         config = self.experiment_config
-        if config is not None and config.demand_source == "predicted":
+        predicted_mode = config is not None and config.demand_source == "predicted"
+        if predicted_mode:
             if self._prediction_demand_provider is None:
                 raise RuntimeError("predicted demand source requires a prediction demand provider")
             demand_for_surge = self._prediction_demand_provider.demand_by_h3(
@@ -3914,6 +3934,8 @@ class SimulationManager:
             target_matching_rate_by_h3[cell] = target_matching_rate
             actual_demand = grid_demand.get(cell, 0)
             selected_demand = demand_for_surge.get(cell, 0)
+            # 프론트 표시 demand: 예측 모드는 예측값, 그 외엔 실제 카운트(가중값 아님).
+            display_demand = selected_demand if predicted_mode else actual_demand
             self._record_cell_bucket_kpi(
                 bucket_key=bucket,
                 h3_cell=cell,
@@ -3925,7 +3947,7 @@ class SimulationManager:
                 "h3": cell,
                 "bucket": bucket,
                 "supply": grid_supply.get(cell, 0),
-                "demand": selected_demand,
+                "demand": display_demand,
                 "actual_demand": actual_demand,
                 "surge": surge,
                 "raw_surge": raw_surge,
