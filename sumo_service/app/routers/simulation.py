@@ -282,6 +282,7 @@ async def get_status(request: Request):
 
 @router.get("/kpi")
 async def get_kpi(request: Request):
+    # 직전에 완료된 5분 시뮬레이션 구간(현재 진행 중 버킷 직전)의 KPI를 응답한다.
     manager = request.app.state.manager
     return manager.get_kpi_summary()
 

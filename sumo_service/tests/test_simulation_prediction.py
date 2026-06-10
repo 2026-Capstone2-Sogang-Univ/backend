@@ -97,6 +97,8 @@ def test_actual_demand_source_uses_grid_demand_for_surge(monkeypatch):
         }
     ]
     assert manager._surge_by_h3 == {"h3_a": pytest.approx(3.2)}
+    # 셀 관측은 sim_time 0.0(0~5분 버킷)에 기록되었으므로 6분 시점에 조회한다.
+    manager._state["sim_time"] = 360.0
     cells = {
         row["bucket"]: row
         for row in manager.get_kpi_summary()["cells"]["by_raw_bucket"]
@@ -576,20 +578,30 @@ def test_status_summary_contains_runtime_counts():
     assert summary["passenger_source"] == simulation.PASSENGER_SOURCE
 
 
+def _make_passenger(passenger_id: str, spawn_time: float) -> Passenger:
+    return Passenger(
+        id=passenger_id, x=0.0, y=0.0, lat=40.0, lng=-73.0,
+        pickup_edge="pickup_edge", dropoff_edge="dropoff_edge",
+        dropoff_x=1.0, dropoff_y=1.0, dropoff_lat=40.1, dropoff_lng=-73.1,
+        expected_distance_m=1000.0, expected_fare=1000,
+        spawn_time=spawn_time, state="assigned",
+    )
+
+
 def test_kpi_summary_groups_matching_by_raw_surge_bucket():
     manager = SimulationManager()
-    manager._record_dispatch_kpi({
-        "raw_surge": 1.2,
-        "passenger_id": "p_low",
-    }, accepted=True)
-    manager._record_dispatch_kpi({
-        "raw_surge": 2.8,
-        "passenger_id": "p_high",
-    }, accepted=False)
+    # 두 이벤트 모두 0~5분(0~300s) 버킷에 들어간다.
+    manager._record_dispatch_kpi({"raw_surge": 1.2, "passenger_id": "p_low"}, accepted=True, sim_time=10.0)
+    manager._record_dispatch_kpi({"raw_surge": 2.8, "passenger_id": "p_high"}, accepted=False, sim_time=20.0)
 
+    # 6분 시점에 조회 → 직전 완료 버킷(0~5분)을 응답.
+    manager._state["sim_time"] = 360.0
     summary = manager.get_kpi_summary()
     buckets = {row["bucket"]: row for row in summary["matching"]["by_raw_bucket"]}
 
+    assert summary["window"]["start_seconds"] == 0.0
+    assert summary["window"]["end_seconds"] == 300.0
+    assert summary["window"]["available"] is True
     assert buckets["raw_lt_1_5"]["request_count"] == 1
     assert buckets["raw_lt_1_5"]["matched_count"] == 1
     assert buckets["raw_lt_1_5"]["actual_rate"] == 1.0
@@ -601,30 +613,12 @@ def test_kpi_summary_groups_matching_by_raw_surge_bucket():
 
 def test_kpi_summary_records_bucket_wait_and_revenue():
     manager = SimulationManager()
-    passenger = Passenger(
-        id="p_wait",
-        x=0.0,
-        y=0.0,
-        lat=40.0,
-        lng=-73.0,
-        pickup_edge="pickup_edge",
-        dropoff_edge="dropoff_edge",
-        dropoff_x=1.0,
-        dropoff_y=1.0,
-        dropoff_lat=40.1,
-        dropoff_lng=-73.1,
-        expected_distance_m=1000.0,
-        expected_fare=1000,
-        spawn_time=10.0,
-        state="assigned",
-    )
-    manager._record_dispatch_kpi({
-        "raw_surge": 1.8,
-        "passenger_id": passenger.id,
-    }, accepted=True)
+    passenger = _make_passenger("p_wait", spawn_time=10.0)
+    manager._record_dispatch_kpi({"raw_surge": 1.8, "passenger_id": passenger.id}, accepted=True, sim_time=10.0)
     manager._record_passenger_boarded_kpi(passenger, 40.0)
-    manager._record_trip_kpi(fare=2500, meter_fare=2000)
+    manager._record_trip_kpi(fare=2500, meter_fare=2000, sim_time=40.0)
 
+    manager._state["sim_time"] = 360.0
     summary = manager.get_kpi_summary()
     bucket = {
         row["bucket"]: row for row in summary["matching"]["by_raw_bucket"]
@@ -634,6 +628,65 @@ def test_kpi_summary_records_bucket_wait_and_revenue():
     assert summary["passenger_waiting_incentive"]["average_wait_seconds"] == 30.0
     assert summary["driver_revenue"]["completed_trip_count"] == 1
     assert summary["driver_revenue"]["total_cents"] == 2500
+
+
+def test_kpi_summary_returns_last_completed_five_minute_bucket():
+    manager = SimulationManager()
+    # 75~80분(4500~4800s) 구간 이벤트
+    manager._record_dispatch_kpi({"raw_surge": 1.2, "passenger_id": "a"}, accepted=True, sim_time=4500.0)
+    manager._record_trip_kpi(fare=2500, sim_time=4700.0)
+    # 진행 중인 80~85분 버킷 이벤트 — 응답에서 제외되어야 한다.
+    manager._record_dispatch_kpi({"raw_surge": 1.2, "passenger_id": "b"}, accepted=True, sim_time=4850.0)
+    manager._record_trip_kpi(fare=9999, sim_time=4850.0)
+
+    # 83분30초(5010s)에 조회 → 75~80분 통계만 응답.
+    manager._state["sim_time"] = 5010.0
+    summary = manager.get_kpi_summary()
+
+    assert summary["window"]["start_seconds"] == 4500.0
+    assert summary["window"]["end_seconds"] == 4800.0
+    assert summary["window"]["available"] is True
+    assert summary["matching"]["request_count"] == 1
+    assert summary["matching"]["matched_count"] == 1
+    assert summary["driver_revenue"]["completed_trip_count"] == 1
+    assert summary["driver_revenue"]["total_cents"] == 2500
+
+
+def test_kpi_summary_empty_when_no_completed_bucket():
+    manager = SimulationManager()
+    manager._record_dispatch_kpi({"raw_surge": 1.2, "passenger_id": "a"}, accepted=True, sim_time=100.0)
+
+    # 아직 첫 5분 버킷이 끝나기 전(4분) 시점.
+    manager._state["sim_time"] = 240.0
+    summary = manager.get_kpi_summary()
+
+    assert summary["window"]["available"] is False
+    assert summary["matching"]["request_count"] == 0
+    assert summary["driver_revenue"]["completed_trip_count"] == 0
+
+
+def test_kpi_summary_wait_seconds_scoped_to_bucket():
+    manager = SimulationManager()
+    # 75~80분 버킷: 대기 20초
+    p1 = _make_passenger("p1", spawn_time=4500.0)
+    manager._record_dispatch_kpi({"raw_surge": 1.8, "passenger_id": p1.id}, accepted=True, sim_time=4500.0)
+    manager._record_passenger_boarded_kpi(p1, 4520.0)
+    # 진행 중 버킷: 큰 대기시간(응답에 섞이면 안 됨)
+    p2 = _make_passenger("p2", spawn_time=4800.0)
+    manager._record_dispatch_kpi({"raw_surge": 1.8, "passenger_id": p2.id}, accepted=True, sim_time=4850.0)
+    manager._record_passenger_boarded_kpi(p2, 4850.0)
+
+    manager._state["sim_time"] = 5010.0
+    summary = manager.get_kpi_summary()
+    assert summary["passenger_waiting"]["average_wait_seconds"] == 20.0
+
+
+def test_kpi_time_buckets_preserve_cumulative_average_for_pricing():
+    manager = SimulationManager()
+    # 서로 다른 5분 버킷에 트립을 기록해도 가격 산정용 누적 평균은 전체를 반영한다.
+    manager._record_trip_kpi(fare=2000, sim_time=100.0)
+    manager._record_trip_kpi(fare=4000, sim_time=4000.0)
+    assert manager._average_trip_fare_cents() == 3000
 
 
 def test_estimate_pickup_eta_uses_route_travel_time_when_available():

@@ -116,6 +116,9 @@ N_TAXIS = int(os.getenv("N_TAXIS", "300"))
 N_BACKGROUND_CARS = int(os.getenv("N_BACKGROUND_CARS", "800"))
 
 PASSENGER_SPAWN_INTERVAL = 300.0
+# KPI는 시뮬레이션 시간 기준 5분(300초) 단위 버킷으로 집계한다. /kpi 요청 시
+# 현재 sim_time이 속한 버킷은 아직 진행 중이므로, 직전에 완료된 버킷 통계를 응답한다.
+KPI_BUCKET_SECONDS = 300.0
 PASSENGERS_PER_5MIN = int(os.getenv("PASSENGERS_PER_5MIN", os.getenv("PASSENGER_LAMBDA", "80")))
 # Deprecated alias kept for older scripts/tests. New code should use PASSENGERS_PER_5MIN.
 PASSENGER_LAMBDA = PASSENGERS_PER_5MIN
@@ -495,6 +498,9 @@ class SimulationManager:
         self._target_matching_rates: dict[str, float] = dict(DEFAULT_TARGET_MATCHING_RATES)
         self._pricing_policy: dict[str, float] = dict(DEFAULT_PRICING_POLICY)
         self._runtime_kpi: RuntimeKpiState = self._new_runtime_kpi()
+        # 시뮬레이션 시간 5분 버킷별 KPI 누적 상태. key = int(sim_time // KPI_BUCKET_SECONDS).
+        # /kpi 응답은 직전에 완료된 버킷에서 산출한다. _runtime_kpi(누적)는 가격 산정용으로 유지.
+        self._kpi_time_buckets: dict[int, RuntimeKpiState] = {}
 
     # ------------------------------------------------------------------
     # Public async API (called from FastAPI endpoints)
@@ -719,8 +725,22 @@ class SimulationManager:
             }
 
     def get_kpi_summary(self) -> dict:
+        """직전에 완료된 5분(KPI_BUCKET_SECONDS) 시뮬레이션 구간의 KPI를 반환한다.
+
+        현재 sim_time이 속한 5분 버킷은 아직 진행 중이므로 제외하고, 바로 직전
+        버킷(예: sim_time 83분30초 → 75~80분)에서 누적된 데이터로 통계를 산출한다.
+        완료된 버킷이 아직 없으면(시작 직후) 모든 값이 0인 빈 통계를 반환한다.
+        """
         with self._lock:
             sim_time = self._state.get("sim_time", 0.0)
+            # 현재 진행 중인 버킷 = int(sim_time // 300). 직전 완료 버킷은 그 한 칸 전.
+            target_idx = int(sim_time // KPI_BUCKET_SECONDS) - 1
+            source = self._kpi_time_buckets.get(target_idx) if target_idx >= 0 else None
+            # 데이터 없는 구간(완료 버킷 미존재/무이벤트)은 빈 상태로 0 통계를 만든다.
+            kpi = source if source is not None else self._new_runtime_kpi(self._target_matching_rates)
+            window_start = float(target_idx * KPI_BUCKET_SECONDS) if target_idx >= 0 else 0.0
+            window_end = window_start + KPI_BUCKET_SECONDS if target_idx >= 0 else 0.0
+
             bucket_payloads = []
             total_requests = 0
             total_matched = 0
@@ -728,12 +748,12 @@ class SimulationManager:
             all_wait_seconds: list[float] = []
 
             for bucket_key, _, _, _ in RAW_SURGE_BUCKETS:
-                bucket = self._runtime_kpi.buckets[bucket_key]
+                bucket = kpi.buckets[bucket_key]
                 request_count = bucket.request_count
                 matched_count = bucket.matched_count
+                waits = list(bucket.wait_seconds or [])
                 actual_rate = matched_count / request_count if request_count else 0.0
                 matching_rate_error = actual_rate - bucket.target_rate
-                waits = list(bucket.wait_seconds or [])
                 all_wait_seconds.extend(waits)
                 average_wait = sum(waits) / len(waits) if waits else 0.0
                 p95_wait = self._percentile(waits, 95.0) if waits else 0.0
@@ -759,15 +779,21 @@ class SimulationManager:
             summary_actual = total_matched / total_requests if total_requests else 0.0
             average_wait = sum(all_wait_seconds) / len(all_wait_seconds) if all_wait_seconds else 0.0
             p95_wait = self._percentile(all_wait_seconds, 95.0) if all_wait_seconds else 0.0
-            empty_waits = list(self._runtime_kpi.empty_wait_seconds or [])
+            empty_waits = list(kpi.empty_wait_seconds or [])
+            completed_count = kpi.completed_trip_count
+            total_fare = kpi.total_fare_cents
             average_empty_wait = sum(empty_waits) / len(empty_waits) if empty_waits else 0.0
-            completed_count = self._runtime_kpi.completed_trip_count
-            total_fare = self._runtime_kpi.total_fare_cents
             parquet_replay = dict(self._parquet_replay_stats)
-            cell_bucket_payloads = self._cell_bucket_payloads()
+            cell_bucket_payloads = self._cell_bucket_payloads(kpi)
 
             return {
                 "sim_time": sim_time,
+                "window": {
+                    "start_seconds": window_start,
+                    "end_seconds": window_end,
+                    "duration_seconds": KPI_BUCKET_SECONDS,
+                    "available": source is not None,
+                },
                 "h3_resolution": H3_RESOLUTION,
                 "matching": {
                     "target_rate": summary_target,
@@ -1215,6 +1241,7 @@ class SimulationManager:
             self._manual_passenger_counter = 0
             self._manual_taxi_counter = 0
             self._runtime_kpi = self._new_runtime_kpi(self._target_matching_rates)
+            self._kpi_time_buckets = {}
 
     # ------------------------------------------------------------------
     # Async broadcast loop — runs in the event loop
@@ -1550,6 +1577,7 @@ class SimulationManager:
                         self._record_trip_kpi(
                             fare=fu.get("fare", 0),
                             meter_fare=fu.get("meter_fare", fu.get("fare", 0)),
+                            sim_time=sim_time,
                         )
                         if len(self._completed_passengers) > MAX_COMPLETED_PASSENGERS:
                             self._completed_passengers.pop(0)
@@ -1738,7 +1766,7 @@ class SimulationManager:
                                     "sim_time": sim_time,
                                 })
                                 self._completed_trip_count += 1
-                                self._record_trip_kpi(fare=fare, meter_fare=meter_fare)
+                                self._record_trip_kpi(fare=fare, meter_fare=meter_fare, sim_time=sim_time)
                                 if len(self._completed_passengers) > MAX_COMPLETED_PASSENGERS:
                                     self._completed_passengers.pop(0)
                                 self._push_db_event({
@@ -1888,19 +1916,34 @@ class SimulationManager:
             return self._runtime_passenger_source
         return PASSENGER_SOURCE
 
-    def _record_dispatch_kpi(self, decision_payload: dict, *, accepted: bool) -> None:
+    def _time_bucket_kpi(self, sim_time: float) -> RuntimeKpiState:
+        """sim_time이 속한 5분 버킷의 KPI 상태를 반환(없으면 생성)한다."""
+        idx = int(sim_time // KPI_BUCKET_SECONDS)
+        state = self._kpi_time_buckets.get(idx)
+        if state is None:
+            state = self._new_runtime_kpi(self._target_matching_rates)
+            self._kpi_time_buckets[idx] = state
+        return state
+
+    def _kpi_record_targets(self, sim_time: float) -> tuple[RuntimeKpiState, RuntimeKpiState]:
+        """이벤트는 전체 누적 상태(가격 산정용)와 현재 5분 버킷(리포팅용)에 함께 기록한다."""
+        return (self._runtime_kpi, self._time_bucket_kpi(sim_time))
+
+    def _record_dispatch_kpi(self, decision_payload: dict, *, accepted: bool, sim_time: float) -> None:
         raw_surge = float(decision_payload.get("raw_surge", 1.0) or 1.0)
         bucket_key = self._raw_surge_bucket(raw_surge)
-        bucket = self._runtime_kpi.buckets[bucket_key]
-        bucket.request_count += 1
+        empty_wait = decision_payload.get("empty_wait_time_s")
+        for kpi in self._kpi_record_targets(sim_time):
+            bucket = kpi.buckets[bucket_key]
+            bucket.request_count += 1
+            if accepted:
+                bucket.matched_count += 1
+            if empty_wait is not None:
+                kpi.empty_wait_seconds.append(float(empty_wait))
         if accepted:
-            bucket.matched_count += 1
             passenger_id = decision_payload.get("passenger_id")
             if passenger_id:
                 self._passenger_dispatch_buckets[str(passenger_id)] = bucket_key
-        empty_wait = decision_payload.get("empty_wait_time_s")
-        if empty_wait is not None:
-            self._runtime_kpi.empty_wait_seconds.append(float(empty_wait))
 
     def _record_cell_bucket_kpi(
         self,
@@ -1910,18 +1953,20 @@ class SimulationManager:
         supply: float | int,
         demand: float | int,
         raw_surge: float,
+        sim_time: float,
     ) -> None:
-        bucket = self._runtime_kpi.buckets[bucket_key]
-        bucket.unique_h3_cells.add(h3_cell)
-        bucket.supply_sum += float(supply)
-        bucket.demand_sum += float(demand)
-        bucket.raw_surge_sum += float(raw_surge)
-        bucket.cell_observation_count += 1
+        for kpi in self._kpi_record_targets(sim_time):
+            bucket = kpi.buckets[bucket_key]
+            bucket.unique_h3_cells.add(h3_cell)
+            bucket.supply_sum += float(supply)
+            bucket.demand_sum += float(demand)
+            bucket.raw_surge_sum += float(raw_surge)
+            bucket.cell_observation_count += 1
 
-    def _cell_bucket_payloads(self) -> list[dict]:
+    def _cell_bucket_payloads(self, kpi: RuntimeKpiState) -> list[dict]:
         payloads = []
         for bucket_key, _, _, _ in RAW_SURGE_BUCKETS:
-            bucket = self._runtime_kpi.buckets[bucket_key]
+            bucket = kpi.buckets[bucket_key]
             observations = bucket.cell_observation_count
             cells = sorted(bucket.unique_h3_cells or set())
             payloads.append({
@@ -1939,14 +1984,15 @@ class SimulationManager:
         bucket_key = self._passenger_dispatch_buckets.get(passenger.id)
         if not bucket_key:
             return
-        self._runtime_kpi.buckets[bucket_key].wait_seconds.append(
-            max(0.0, sim_time - passenger.spawn_time)
-        )
+        wait = max(0.0, sim_time - passenger.spawn_time)
+        for kpi in self._kpi_record_targets(sim_time):
+            kpi.buckets[bucket_key].wait_seconds.append(wait)
 
-    def _record_trip_kpi(self, *, fare: int, meter_fare: int = 0) -> None:
-        self._runtime_kpi.completed_trip_count += 1
-        self._runtime_kpi.total_fare_cents += int(fare)
-        self._runtime_kpi.total_meter_fare_cents += int(meter_fare)
+    def _record_trip_kpi(self, *, fare: int, meter_fare: int = 0, sim_time: float) -> None:
+        for kpi in self._kpi_record_targets(sim_time):
+            kpi.completed_trip_count += 1
+            kpi.total_fare_cents += int(fare)
+            kpi.total_meter_fare_cents += int(meter_fare)
 
     def _schedule_ws_event(self, method_name: str, *args) -> None:
         if self.connection_manager is None or self._loop is None:
@@ -3057,7 +3103,7 @@ class SimulationManager:
                     if not accepted:
                         self._set_dispatch_cooldowns(veh_id, candidate.id, sim_time)
                         self._record_dispatch_rejection(veh_id, candidate.id)
-                        self._record_dispatch_kpi(decision_payload, accepted=False)
+                        self._record_dispatch_kpi(decision_payload, accepted=False, sim_time=sim_time)
                         self._emit_event("dispatch_decision", {**decision_payload, "accepted": False})
                         self._push_db_event({**dispatch_payload, **decision_payload, "accepted": False})
                         continue
@@ -3095,7 +3141,7 @@ class SimulationManager:
                     if previous_dropoff_time is not None:
                         # 첫 승객 전 대기시간은 정의상 제외하고, 하차 이후 다음 수락까지의 search time만 기록한다.
                         decision_payload["empty_wait_time_s"] = sim_time - previous_dropoff_time
-                    self._record_dispatch_kpi(decision_payload, accepted=True)
+                    self._record_dispatch_kpi(decision_payload, accepted=True, sim_time=sim_time)
                     self._emit_event("dispatch_decision", {**decision_payload, "accepted": True})
                     self._push_db_event({**dispatch_payload, **decision_payload, "accepted": True})
                     if self._is_manual_entity(candidate.id, veh_id):
@@ -3942,6 +3988,7 @@ class SimulationManager:
                 supply=grid_supply.get(cell, 0),
                 demand=selected_demand,
                 raw_surge=raw_surge,
+                sim_time=sim_time,
             )
             surge_cells.append({
                 "h3": cell,
