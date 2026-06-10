@@ -141,6 +141,9 @@ DISPATCH_SCAN_MULTIPLIER = int(os.getenv("DISPATCH_SCAN_MULTIPLIER", "5"))
 DISPATCH_DELAY_S = float(os.getenv("DISPATCH_DELAY_S", "5.0"))
 # 수동(API) 생성 승객에도 배차 유예를 적용할지. 기본 적용(1). 0/false면 수동 승객은 즉시 배차 가능.
 DISPATCH_DELAY_MANUAL = os.getenv("DISPATCH_DELAY_MANUAL", "1").strip().lower() not in ("0", "false", "no")
+# 라이브(비실험) 실행에서도 목표 매칭률 추종 인센티브(요금 역산)를 적용할지.
+# 기본 적용(1). 0/false면 라이브는 기존처럼 공급/수요 surge만 사용한다.
+LIVE_TARGET_PRICING = os.getenv("LIVE_TARGET_PRICING", "1").strip().lower() not in ("0", "false", "no")
 
 PASSENGER_SOURCE = os.getenv("PASSENGER_SOURCE", "parquet")
 _DEFAULT_TRIPS_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "trips_processed.json"
@@ -2745,7 +2748,9 @@ class SimulationManager:
         calculated_surge = raw_surge
         pricing_driver_count = None
 
-        if self.experiment_config is not None and base_fare_usd > 0:
+        # 목표 매칭률 추종 인센티브: 실험모드는 항상, 라이브는 LIVE_TARGET_PRICING일 때 적용.
+        target_pricing_on = self.experiment_config is not None or LIVE_TARGET_PRICING
+        if target_pricing_on and base_fare_usd > 0:
             current_features = self._current_driver_features(
                 candidate=candidate,
                 sim_time=sim_time,
@@ -2756,13 +2761,20 @@ class SimulationManager:
             if current_features is not None:
                 dV_without_fare, D_pu_miles, T_pu = current_features
                 pricing_driver_count = 1
+                # 실험모드는 sweep 입력값을, 라이브는 런타임 정책값(모델 기본 beta_F) 사용.
+                if self.experiment_config is not None:
+                    beta_f = self.experiment_config.beta_f
+                    alpha_sensitivity = self.experiment_config.alpha_sensitivity
+                else:
+                    beta_f = None  # decision_function의 모델 기본 beta_F 사용
+                    alpha_sensitivity = self._runtime_alpha_sensitivity()
                 required_fare_usd = _required_fare_for_target_features(
                     target_p=target_matching_rate,
                     dV_without_fare=dV_without_fare,
                     D_pu=D_pu_miles,
                     T_pu=T_pu,
-                    beta_f=self.experiment_config.beta_f,
-                    alpha_sensitivity=self.experiment_config.alpha_sensitivity,
+                    beta_f=beta_f,
+                    alpha_sensitivity=alpha_sensitivity,
                 )
                 calculated_surge = required_fare_usd / base_fare_usd
             final_surge = apply_surge_limits(

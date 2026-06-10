@@ -161,7 +161,9 @@ def test_no_dispatch_when_no_waiting_passengers():
     assert mgr._taxi_states.get("taxi_0") != "dispatched"
 
 
-def test_dispatch_pricing_applies_passenger_incentive_limit():
+def test_dispatch_pricing_applies_passenger_incentive_limit(monkeypatch):
+    # surge_by_h3 기반 캡 적용 검증 — 목표매칭률 추종 인센티브(LIVE_TARGET_PRICING)는 끈 상태.
+    monkeypatch.setattr("app.simulation.LIVE_TARGET_PRICING", False)
     mgr = make_manager()
     p = make_passenger()
     p.h3_pickup = "pickup_cell"
