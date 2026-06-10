@@ -146,44 +146,6 @@ def test_dispatch_cutoff_disabled_when_zero(monkeypatch):
     assert p_far.state == "assigned"
 
 
-def test_manual_taxi_claims_passenger_before_fleet():
-    # 수동 택시(utaxi_)가 fleet보다 먼저 순회되어 승객을 claim한다(기본 우선순위 on).
-    mgr = make_manager()
-    p = make_passenger("p_0", x=0.0, y=0.0, spawn_time=-100.0)
-    mgr._passengers["p_0"] = p
-    # dict 삽입 순서상 fleet가 먼저 → 우선순위가 없으면 fleet가 claim했을 상황.
-    sub = {
-        "taxi_0": make_sub_entry(x=10.0, y=0.0),
-        "utaxi_0": make_sub_entry(x=20.0, y=0.0),
-    }
-    _traci_stub.vehicle.changeTarget = MagicMock()
-
-    mgr._update_taxi_states(0.0, sub)
-
-    assert mgr._taxi_targets.get("utaxi_0") == "p_0"
-    assert mgr._taxi_states["utaxi_0"] == "dispatched"
-    assert mgr._taxi_states.get("taxi_0") != "dispatched"
-
-
-def test_manual_taxi_priority_disabled(monkeypatch):
-    # 우선순위 off면 기존 구독 순서대로 → 먼저 등장한 fleet가 claim한다.
-    monkeypatch.setattr("app.simulation.MANUAL_TAXI_DISPATCH_PRIORITY", False)
-    mgr = make_manager()
-    p = make_passenger("p_0", x=0.0, y=0.0, spawn_time=-100.0)
-    mgr._passengers["p_0"] = p
-    sub = {
-        "taxi_0": make_sub_entry(x=10.0, y=0.0),
-        "utaxi_0": make_sub_entry(x=20.0, y=0.0),
-    }
-    _traci_stub.vehicle.changeTarget = MagicMock()
-
-    mgr._update_taxi_states(0.0, sub)
-
-    assert mgr._taxi_targets.get("taxi_0") == "p_0"
-    assert mgr._taxi_states["taxi_0"] == "dispatched"
-    assert mgr._taxi_states.get("utaxi_0") != "dispatched"
-
-
 def test_dispatch_delayed_until_grace_elapsed():
     mgr = make_manager()
     spawn = 10.0

@@ -142,10 +142,6 @@ DISPATCH_SCAN_MULTIPLIER = int(os.getenv("DISPATCH_SCAN_MULTIPLIER", "5"))
 DISPATCH_MAX_PICKUP_MILES = float(os.getenv("DISPATCH_MAX_PICKUP_MILES", "2.14"))
 DISPATCH_MAX_PICKUP_M = DISPATCH_MAX_PICKUP_MILES * 1609.344
 DISPATCH_MAX_PICKUP_M2 = DISPATCH_MAX_PICKUP_M ** 2  # 제곱거리 비교용(sqrt 회피)
-# 수동(프론트 "택시 생성") 택시를 fleet보다 먼저 순회해 승객 claim 1순위를 준다.
-# 배차 루프는 택시 순서대로 가까운 승객을 풀에서 제거하므로 순회 순서 = claim 우선순위.
-# 기본 적용(1). 0/false면 기존 구독 순서대로 순회.
-MANUAL_TAXI_DISPATCH_PRIORITY = os.getenv("MANUAL_TAXI_DISPATCH_PRIORITY", "1").strip().lower() not in ("0", "false", "no")
 # 승객 생성 후 이 시간(sim초) 동안은 배차 후보에서 제외해 "대기중"으로 표시만 한다.
 DISPATCH_DELAY_S = float(os.getenv("DISPATCH_DELAY_S", "5.0"))
 # 수동(API) 생성 승객에도 배차 유예를 적용할지. 기본 적용(1). 0/false면 수동 승객은 즉시 배차 가능.
@@ -2891,15 +2887,7 @@ class SimulationManager:
             if p.state == "waiting" and self._dispatch_delay_elapsed(p, sim_time)
         ]
 
-        taxi_iter = sub_results.items()
-        if MANUAL_TAXI_DISPATCH_PRIORITY:
-            # 수동 택시(utaxi_)를 먼저 순회해 가까운 승객을 fleet보다 먼저 claim하게 한다.
-            # stable sort라 각 그룹 내 기존 순서는 유지된다.
-            taxi_iter = sorted(
-                sub_results.items(),
-                key=lambda kv: 0 if kv[0].startswith("utaxi_") else 1,
-            )
-        for veh_id, vals in taxi_iter:
+        for veh_id, vals in sub_results.items():
             if not self._is_taxi_id(veh_id):
                 continue
             state = self._taxi_states.get(veh_id, "empty")
