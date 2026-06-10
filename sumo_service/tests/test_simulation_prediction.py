@@ -1,10 +1,12 @@
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from traci import constants as tc
 
 import app.simulation as simulation
+from app.demand_history import floor_to_15min
 from app.fare import TripAccumulator
 from app.passenger import Passenger
 from app.pricing import raw_surge_bucket
@@ -75,6 +77,72 @@ def test_predicted_demand_source_uses_prediction_for_surge(monkeypatch):
         "target_matching_rate": 0.85,
         "surge": 4.9,
     }
+
+
+def test_live_predicted_demand_source_uses_prediction_for_surge(monkeypatch):
+    # 라이브(experiment_config=None)에서 LIVE_DEMAND_PREDICTED 토글이 켜지면 실험과 동일하게
+    # demand_by_h3 단일구간 예측을 surge 입력으로 쓴다(기본 async 모드).
+    monkeypatch.setattr(simulation, "cell_center_latlng", lambda cell: (40.0, -73.0))
+    monkeypatch.setattr(simulation, "LIVE_DEMAND_PREDICTED", True)
+    monkeypatch.setattr(simulation, "LIVE_PREDICTION_MODE", "async")
+    provider = FakePredictionDemandProvider({"h3_a": 4.0})
+    manager = SimulationManager()  # live: no experiment_config
+    manager._prediction_demand_provider = provider
+
+    manager._build_surge_cells({"h3_a": 1}, {"h3_a": 1}, {"h3_a": 1}, 0.0)
+
+    assert provider.calls == [
+        {
+            "sim_datetime": datetime(2013, 7, 8, 8, 0, 0),
+            "mode": "async",
+            "actual_demand": {"h3_a": 1},
+        }
+    ]
+    assert manager._surge_by_h3 == {"h3_a": 4.9}
+    assert manager._surge_cells[0]["demand"] == 4.0  # 표시 demand는 예측값
+    assert manager._surge_cells[0]["actual_demand"] == 1
+    # 라이브는 실험이 아니므로 surge_diagnostics는 누적하지 않는다.
+    assert manager._surge_diagnostics == []
+
+
+def test_live_actual_demand_ignores_prediction_provider(monkeypatch):
+    # 토글이 꺼져 있으면(기본) provider가 있어도 호출하지 않고 실측 수요를 쓴다.
+    monkeypatch.setattr(simulation, "cell_center_latlng", lambda cell: (40.0, -73.0))
+    monkeypatch.setattr(simulation, "LIVE_DEMAND_PREDICTED", False)
+    provider = FakePredictionDemandProvider({"h3_a": 99.0})
+    manager = SimulationManager()
+    manager._prediction_demand_provider = provider
+
+    manager._build_surge_cells({"h3_a": 1}, {"h3_a": 2}, {"h3_a": 2}, 0.0)
+
+    assert provider.calls == []
+    assert manager._surge_cells[0]["demand"] == 2  # 실측
+
+
+def test_initialize_creates_live_predicted_provider_with_last_prediction_fallback(monkeypatch):
+    monkeypatch.setattr(simulation, "LIVE_DEMAND_PREDICTED", True)
+    monkeypatch.setenv("PREDICTION_API_KEY", "test-key")
+    manager = SimulationManager()  # live
+
+    manager._initialize_prediction_components()
+
+    assert manager._history_store is not None
+    assert manager._prediction_demand_provider is not None
+    assert manager._prediction_demand_provider.fallback_policy == simulation.LIVE_PREDICTION_FALLBACK
+    assert manager._prediction_demand_provider.fallback_policy == "last_prediction"
+    manager._close_prediction_demand_provider()
+
+
+def test_live_predicted_provider_disabled_without_api_key(monkeypatch):
+    # API 키가 없으면 예외로 죽지 않고 provider를 비활성화(이후 surge는 실측으로 폴백).
+    monkeypatch.setattr(simulation, "LIVE_DEMAND_PREDICTED", True)
+    monkeypatch.delenv("PREDICTION_API_KEY", raising=False)
+    manager = SimulationManager()
+
+    manager._initialize_prediction_components()
+
+    assert manager._prediction_demand_provider is None
+    assert manager._history_store is not None
 
 
 def test_actual_demand_source_uses_grid_demand_for_surge(monkeypatch):
@@ -762,6 +830,117 @@ async def test_start_resets_stale_run_state_before_runtime_launch(monkeypatch):
     assert manager._executor_task == "executor-task"
     assert manager._broadcast_task == "broadcast-task"
     assert fake_loop.submitted == (None, manager._run_loop)
+
+
+class FakeForecaster:
+    def __init__(self, demand: dict[str, float]) -> None:
+        self.demand = demand
+        self.calls: list[tuple[datetime, int]] = []
+        self.closed = False
+
+    def forecast(self, sim_datetime, *, steps):
+        self.calls.append((sim_datetime, steps))
+        base = floor_to_15min(sim_datetime)
+        return [
+            {
+                "target_time": base + timedelta(minutes=15 * (k + 1)),
+                "demand": dict(self.demand),
+            }
+            for k in range(steps)
+        ]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _wait_for_forecast(manager, *, min_calls, fake, timeout=2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with manager._lock:
+            inflight = manager._demand_forecast_inflight
+        if len(fake.calls) >= min_calls and not inflight:
+            return
+        time.sleep(0.005)
+    raise AssertionError("demand forecast did not settle in time")
+
+
+def test_get_demand_forecast_disabled_by_default():
+    manager = SimulationManager()
+    forecast = manager.get_demand_forecast()
+    assert forecast["enabled"] is False
+    assert forecast["buckets"] == []
+    assert forecast["horizon_min"] == 15
+
+
+def test_build_demand_forecast_snapshot_shapes_four_buckets(monkeypatch):
+    monkeypatch.setattr(simulation, "cell_center_latlng", lambda cell: (40.0, -73.0))
+    manager = SimulationManager()
+    base = SIM_BASE_DATETIME  # 2013-07-08 08:00
+    horizons = [
+        {
+            "target_time": base + timedelta(minutes=15 * (k + 1)),
+            "demand": {"h3_a": float(k + 1)},
+        }
+        for k in range(4)
+    ]
+
+    snapshot = manager._build_demand_forecast_snapshot(base, 900.0, horizons)
+
+    assert snapshot["enabled"] is True
+    assert snapshot["horizon_min"] == 15
+    assert snapshot["base_time"] == "2013-07-08T08:00:00"
+    assert [b["offset_min"] for b in snapshot["buckets"]] == [15, 30, 45, 60]
+    assert [b["target_time"] for b in snapshot["buckets"]] == [
+        "2013-07-08T08:15:00",
+        "2013-07-08T08:30:00",
+        "2013-07-08T08:45:00",
+        "2013-07-08T09:00:00",
+    ]
+    assert snapshot["buckets"][0]["cells"] == [
+        {"h3": "h3_a", "predicted_demand": 1.0, "center": {"lat": 40.0, "lng": -73.0}}
+    ]
+
+
+def test_maybe_refresh_demand_forecast_runs_once_per_15min_bucket(monkeypatch):
+    monkeypatch.setattr(simulation, "cell_center_latlng", lambda cell: (40.0, -73.0))
+    monkeypatch.setattr(simulation, "DEMAND_FORECAST_STEPS", 4)
+    manager = SimulationManager()
+    fake = FakeForecaster({"h3_a": 5.0})
+    manager._demand_forecaster = fake
+
+    # first tick of bucket 0 → one forecast computed and stored
+    manager._maybe_refresh_demand_forecast(0.0)
+    _wait_for_forecast(manager, min_calls=1, fake=fake)
+    assert len(fake.calls) == 1
+    snapshot = manager.get_demand_forecast()
+    assert snapshot["enabled"] is True
+    assert len(snapshot["buckets"]) == 4
+
+    # still inside bucket 0 (sim_time 100 < 900) → no new request
+    manager._maybe_refresh_demand_forecast(100.0)
+    time.sleep(0.05)
+    assert len(fake.calls) == 1
+
+    # new 15-min bucket (sim_time 900 = bucket 1) → second forecast
+    manager._maybe_refresh_demand_forecast(900.0)
+    _wait_for_forecast(manager, min_calls=2, fake=fake)
+    assert len(fake.calls) == 2
+    assert fake.calls[1][1] == 4  # steps forwarded from DEMAND_FORECAST_STEPS
+
+
+def test_close_demand_forecaster_clears_state_and_closes(monkeypatch):
+    manager = SimulationManager()
+    fake = FakeForecaster({"h3_a": 1.0})
+    manager._demand_forecaster = fake
+    manager._demand_forecast = {"enabled": True, "buckets": []}
+    manager._demand_forecast_bucket_idx = 3
+
+    manager._close_demand_forecaster()
+
+    assert fake.closed
+    assert manager._demand_forecaster is None
+    assert manager._demand_forecast is None
+    assert manager._demand_forecast_bucket_idx is None
 
 
 def _manager_with_active_trip(history: FakeHistoryStore) -> SimulationManager:

@@ -40,7 +40,7 @@ import traci.exceptions
 from traci import constants as tc
 
 from .coord import make_sumolib_converter, sumo_to_latlng
-from .demand_history import DemandHistoryStore
+from .demand_history import DemandHistoryStore, floor_to_15min
 from .driver.decision_function import (
     acceptance_features as _acceptance_features,
     acceptance_probability as _acceptance_probability,
@@ -147,10 +147,38 @@ DISPATCH_DELAY_MANUAL = os.getenv("DISPATCH_DELAY_MANUAL", "1").strip().lower() 
 # 라이브(비실험) 실행에서도 목표 매칭률 추종 인센티브(요금 역산)를 적용할지.
 # 기본 적용(1). 0/false면 라이브는 기존처럼 공급/수요 surge만 사용한다.
 LIVE_TARGET_PRICING = os.getenv("LIVE_TARGET_PRICING", "1").strip().lower() not in ("0", "false", "no")
+# 승객 incentive_limit(추가금 상한)을 실제 요금 계산에 반영할지.
+# 기본 비활성(0): incentive_limit 인터페이스(요청/응답 필드)는 그대로 두되,
+# 요금 캡(서지 적용 금액 min(요금+incentive_limit, ...))은 적용하지 않는다.
+# 1/true면 기존처럼 incentive_limit을 요금 상한으로 적용한다.
+INCENTIVE_LIMIT_ENABLED = os.getenv("INCENTIVE_LIMIT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 # 배차된(assigned) 승객의 surge 수요 가중치. surge 공식 입력에만 적용된다(프론트 표시 demand·
 # actual_demand는 실제 카운트 유지). 1.0=현재(assigned도 full), 0.0=waiting만, 기본 0.5
 # (이미 매칭돼 곧 충족될 수요는 surge 압력을 덜 준다).
 ASSIGNED_DEMAND_WEIGHT = float(os.getenv("ASSIGNED_DEMAND_WEIGHT", "0.5"))
+
+# 라이브 서버에서 외부 AI 수요 예측(Module3)을 켜서, 현재 15분 버킷 n 기준으로
+# n+1~n+STEPS 버킷의 예측 수요를 GET /simulation/demand-forecast로 노출할지.
+# 기본 비활성(0). 활성화하려면 PREDICTION_API_KEY 환경변수도 필요하다.
+DEMAND_FORECAST_ENABLED = os.getenv("DEMAND_FORECAST_ENABLED", "0").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+# 예측 horizon 버킷 수(roll-forward 단계). 기본 4 → n+1, n+2, n+3, n+4 (t+15·30·45·60분).
+DEMAND_FORECAST_STEPS = max(1, int(os.getenv("DEMAND_FORECAST_STEPS", "4")))
+# Module3 예측 엔드포인트. 라이브 forecast와 실험 predicted 모드 기본값으로 공유된다.
+PREDICTION_URL = os.getenv("PREDICTION_URL", "https://module3-ml.onrender.com/predict").strip()
+
+# 라이브 서버에서 surge/인센티브 계산에 외부 AI 예측 수요를 사용할지(실험의 demand_source=predicted
+# 와 동일한 demand_by_h3 단일구간 경로를 그대로 사용). 기본 "actual"(실측). "predicted"면 활성.
+LIVE_DEMAND_SOURCE = os.getenv("LIVE_DEMAND_SOURCE", "actual").strip().lower()
+LIVE_DEMAND_PREDICTED = LIVE_DEMAND_SOURCE == "predicted"
+# 라이브 예측 호출 모드. 기본 "async": surge는 self._lock 안에서 계산되므로 sync면 Module3 HTTP가
+# 락을 잡은 채 블로킹돼 REST/WS가 멈춘다. async는 즉시 폴백을 반환하고 백그라운드로 갱신한다.
+LIVE_PREDICTION_MODE = os.getenv("LIVE_PREDICTION_MODE", "async").strip().lower()
+# 예측 horizon(분). 실험 기본과 동일하게 15.
+LIVE_PREDICTION_HORIZON_MIN = max(1, int(os.getenv("LIVE_PREDICTION_HORIZON_MIN", "15")))
+# 라이브 폴백 정책. Module3 장애로 시뮬레이션이 죽지 않도록 기본 last_prediction(직전 예측 유지).
+LIVE_PREDICTION_FALLBACK = os.getenv("LIVE_PREDICTION_FALLBACK", "last_prediction").strip().lower()
 
 PASSENGER_SOURCE = os.getenv("PASSENGER_SOURCE", "parquet")
 _DEFAULT_TRIPS_FILE = Path(__file__).parent.parent / "sumo_configs" / "NY" / "trips_processed.json"
@@ -442,6 +470,12 @@ class SimulationManager:
         self._target_matching_rate_by_h3: dict[str, float] = {}
         self._history_store: DemandHistoryStore | None = None
         self._prediction_demand_provider: PredictionDemandProvider | None = None
+        # 라이브 다중구간 수요 예측(roll-forward). forecaster는 PredictionDemandProvider를
+        # forecast()로 사용하고, 결과 스냅샷은 _demand_forecast에 저장해 REST로 노출한다.
+        self._demand_forecaster: PredictionDemandProvider | None = None
+        self._demand_forecast: dict | None = None
+        self._demand_forecast_bucket_idx: int | None = None
+        self._demand_forecast_inflight: bool = False
         self._surge_diagnostics: list[dict] = []
         self._completed_passengers: list[dict] = []
         self._completed_trip_count: int = 0
@@ -1170,6 +1204,7 @@ class SimulationManager:
     def _reset_run_state(self) -> None:
         """Clear per-run mutable state while preserving manager configuration."""
         self._close_prediction_demand_provider()
+        self._close_demand_forecaster()
         with self._lock:
             self._state = {"vehicles": [], "passengers": [], "sim_time": 0.0}
             self._passengers = {}
@@ -1557,6 +1592,9 @@ class SimulationManager:
                 if SIM_PROFILE:
                     _prof["totals"]["surge"] += time.perf_counter() - _pt
 
+                # 새 15분 버킷 진입 시 다중구간 수요 예측을 백그라운드로 갱신(no-op if disabled).
+                self._maybe_refresh_demand_forecast(sim_time)
+
                 _pt = time.perf_counter() if SIM_PROFILE else 0.0
                 fare_updates = self._update_taxi_states(sim_time, sub_results)
                 if SIM_PROFILE:
@@ -1837,11 +1875,13 @@ class SimulationManager:
                     "surge": event.get("surge", 1.0),
                     "completion": event.get("completion"),
                 })
-                if event.get("completion") != "forced_at_end":
-                    taxi_id = event.get("taxi_id")
-                    dropoff_time = event.get("dropoff_sim_time")
-                    if taxi_id is not None and dropoff_time is not None:
-                        self._taxi_previous_dropoff_times[taxi_id] = float(dropoff_time)
+        # 공차 시간(하차 → 다음 수락까지의 search time) 산정에 쓰는 직전 하차 시각은
+        # 실험·라이브 모드 공통으로 기록해야 한다. (라이브에서 누락되면 KPI 공차 시간이 항상 0)
+        if event.get("type") == "trip" and event.get("completion") != "forced_at_end":
+            taxi_id = event.get("taxi_id")
+            dropoff_time = event.get("dropoff_sim_time")
+            if taxi_id is not None and dropoff_time is not None:
+                self._taxi_previous_dropoff_times[taxi_id] = float(dropoff_time)
         if self._run_id is None or self._db_queue is None or self._loop is None:
             return
         self._loop.call_soon_threadsafe(self._db_queue.put_nowait, event)
@@ -1874,6 +1914,106 @@ class SimulationManager:
         self._prediction_demand_provider = None
         provider.close()
         return provider
+
+    def _close_demand_forecaster(self) -> None:
+        forecaster = self._demand_forecaster
+        self._demand_forecaster = None
+        self._demand_forecast = None
+        self._demand_forecast_bucket_idx = None
+        self._demand_forecast_inflight = False
+        if forecaster is not None:
+            forecaster.close()
+
+    # 15분(=900 시뮬레이션 초) 단위 예측 버킷. 새 버킷에 진입할 때마다 백그라운드로
+    # roll-forward 예측을 갱신해 TraCI 루프(및 60fps 브로드캐스트)를 막지 않는다.
+    _DEMAND_FORECAST_BUCKET_SECONDS = 900.0
+
+    def _maybe_refresh_demand_forecast(self, sim_time: float) -> None:
+        forecaster = self._demand_forecaster
+        if forecaster is None:
+            return
+        bucket_idx = int(sim_time // self._DEMAND_FORECAST_BUCKET_SECONDS)
+        with self._lock:
+            if self._demand_forecast_inflight:
+                return
+            if bucket_idx == self._demand_forecast_bucket_idx:
+                return
+            self._demand_forecast_bucket_idx = bucket_idx
+            self._demand_forecast_inflight = True
+        sim_dt = SIM_BASE_DATETIME + timedelta(seconds=sim_time)
+        thread = threading.Thread(
+            target=self._compute_demand_forecast,
+            args=(forecaster, sim_dt, sim_time),
+            daemon=True,
+        )
+        thread.start()
+
+    def _compute_demand_forecast(
+        self,
+        forecaster: PredictionDemandProvider,
+        sim_dt: datetime,
+        sim_time: float,
+    ) -> None:
+        try:
+            horizons = forecaster.forecast(sim_dt, steps=DEMAND_FORECAST_STEPS)
+            snapshot = self._build_demand_forecast_snapshot(sim_dt, sim_time, horizons)
+            with self._lock:
+                self._demand_forecast = snapshot
+        except Exception as exc:
+            _logger.warning(
+                "demand forecast refresh failed at sim_time=%.1f: %s", sim_time, exc
+            )
+        finally:
+            with self._lock:
+                self._demand_forecast_inflight = False
+
+    def _build_demand_forecast_snapshot(
+        self,
+        sim_dt: datetime,
+        sim_time: float,
+        horizons: list[dict],
+    ) -> dict:
+        base_bucket = floor_to_15min(sim_dt)
+        buckets = []
+        for step, item in enumerate(horizons, start=1):
+            target_time: datetime = item["target_time"]
+            demand: dict[str, float] = item["demand"]
+            cells = []
+            for h3_cell, value in demand.items():
+                lat_c, lng_c = cell_center_latlng(h3_cell)
+                cells.append({
+                    "h3": h3_cell,
+                    "predicted_demand": value,
+                    "center": {"lat": lat_c, "lng": lng_c},
+                })
+            buckets.append({
+                "step": step,
+                "target_time": target_time.isoformat(),
+                "offset_min": step * 15,
+                "cell_count": len(cells),
+                "cells": cells,
+            })
+        return {
+            "enabled": True,
+            "generated_sim_time": sim_time,
+            "base_time": base_bucket.isoformat(),
+            "horizon_min": 15,
+            "h3_resolution": H3_RESOLUTION,
+            "buckets": buckets,
+        }
+
+    def get_demand_forecast(self) -> dict:
+        with self._lock:
+            if self._demand_forecast is not None:
+                return self._demand_forecast
+            return {
+                "enabled": self._demand_forecaster is not None,
+                "generated_sim_time": None,
+                "base_time": None,
+                "horizon_min": 15,
+                "h3_resolution": H3_RESOLUTION,
+                "buckets": [],
+            }
 
     def _record_history_spawn(self, sim_time: float, h3_cell: str | None) -> None:
         if self._history_store is None:
@@ -2004,8 +2144,15 @@ class SimulationManager:
 
     def _initialize_prediction_components(self) -> None:
         self._close_prediction_demand_provider()
+        self._close_demand_forecaster()
         config = self.experiment_config
-        if config is None:
+        predicted_experiment = config is not None and config.demand_source == "predicted"
+        # 라이브 서버에서 surge/인센티브에 예측 수요를 쓰는 모드(실험 predicted와 동일 경로).
+        live_predicted = config is None and LIVE_DEMAND_PREDICTED
+
+        # 라이브(config is None)에서도 forecaster나 live predicted가 켜져 있으면 history_store가
+        # 필요하다. 예측을 전혀 안 쓰는 경우에만 기존처럼 조기 종료한다.
+        if config is None and not DEMAND_FORECAST_ENABLED and not live_predicted:
             self._history_store = None
             self._surge_diagnostics = []
             return
@@ -2015,19 +2162,69 @@ class SimulationManager:
         self._history_store = DemandHistoryStore(model_h3_cells=model_h3_cells)
         self._surge_diagnostics = []
 
-        if config.demand_source != "predicted":
-            return
-        if config.weather_source != "static":
-            raise ValueError(f"unsupported weather source: {config.weather_source}")
+        if predicted_experiment:
+            if config.weather_source != "static":
+                raise ValueError(f"unsupported weather source: {config.weather_source}")
+            self._prediction_demand_provider = PredictionDemandProvider(
+                prediction_url=config.prediction_url,
+                model_h3_cells=model_h3_cells,
+                history_store=self._history_store,
+                weather_provider=StaticWeatherProvider(),
+                prediction_horizon_min=config.prediction_horizon_min,
+                fallback_policy=config.prediction_fallback_policy,
+            )
+        elif live_predicted:
+            self._init_live_predicted_provider(model_h3_cells)
 
-        self._prediction_demand_provider = PredictionDemandProvider(
-            prediction_url=config.prediction_url,
-            model_h3_cells=model_h3_cells,
-            history_store=self._history_store,
-            weather_provider=StaticWeatherProvider(),
-            prediction_horizon_min=config.prediction_horizon_min,
-            fallback_policy=config.prediction_fallback_policy,
-        )
+        if DEMAND_FORECAST_ENABLED:
+            self._init_demand_forecaster(model_h3_cells)
+
+    def _init_live_predicted_provider(self, model_h3_cells: list[str]) -> None:
+        """라이브 surge/인센티브용 예측 provider를 생성한다.
+
+        실험의 demand_source=predicted와 동일한 PredictionDemandProvider.demand_by_h3
+        단일구간 경로를 재사용한다. 라이브는 Module3 일시 장애로 시뮬레이션이 죽으면 안 되므로
+        fallback은 last_prediction을 기본으로 쓰고, API 키 미설정 등 생성 실패는 경고 후
+        비활성화한다(이 경우 surge는 실측 수요로 폴백).
+        """
+        try:
+            self._prediction_demand_provider = PredictionDemandProvider(
+                prediction_url=PREDICTION_URL,
+                model_h3_cells=model_h3_cells,
+                history_store=self._history_store,
+                weather_provider=StaticWeatherProvider(),
+                prediction_horizon_min=LIVE_PREDICTION_HORIZON_MIN,
+                fallback_policy=LIVE_PREDICTION_FALLBACK,
+            )
+        except ValueError as exc:
+            self._prediction_demand_provider = None
+            _logger.warning(
+                "live predicted demand disabled: failed to create provider (%s)", exc
+            )
+
+    def _init_demand_forecaster(self, model_h3_cells: list[str]) -> None:
+        """라이브 다중구간 예측용 forecaster를 생성한다.
+
+        라이브 실행은 Module3 일시 장애로 시뮬레이션이 죽으면 안 되므로 fallback은
+        last_prediction을 쓰고, API 키 미설정 등 생성 실패는 경고 후 비활성화한다.
+        """
+        self._demand_forecast = None
+        self._demand_forecast_bucket_idx = None
+        self._demand_forecast_inflight = False
+        try:
+            self._demand_forecaster = PredictionDemandProvider(
+                prediction_url=PREDICTION_URL,
+                model_h3_cells=model_h3_cells,
+                history_store=self._history_store,
+                weather_provider=StaticWeatherProvider(),
+                prediction_horizon_min=15,
+                fallback_policy="last_prediction",
+            )
+        except ValueError as exc:
+            self._demand_forecaster = None
+            _logger.warning(
+                "demand forecast disabled: failed to create forecaster (%s)", exc
+            )
 
     def _adjust_spawn_count_for_elasticity(self, raw_count: int, h3_cell: str | None, sim_time: float) -> int:
         passenger_elasticity = (
@@ -2434,8 +2631,13 @@ class SimulationManager:
     ) -> dict:
         system_surge = self._surge_by_h3.get(h3_pickup or "", 1.0)
         uncapped_total = round(expected_fare * system_surge)
-        cap_total = expected_fare + max(0, int(incentive_limit))
-        total_amount = min(uncapped_total, cap_total)
+        if INCENTIVE_LIMIT_ENABLED:
+            cap_total = expected_fare + max(0, int(incentive_limit))
+            total_amount = min(uncapped_total, cap_total)
+        else:
+            # incentive_limit 캡 비활성화: 서지 적용 금액을 그대로 사용한다.
+            # (incentive_limit 필드는 인터페이스 유지를 위해 응답에 그대로 echo)
+            total_amount = uncapped_total
         effective_surge = total_amount / expected_fare if expected_fare > 0 else 1.0
         return {
             "ok": True,
@@ -2719,6 +2921,8 @@ class SimulationManager:
 
     @staticmethod
     def _fare_cap_for_passenger(passenger: Passenger) -> int | None:
+        if not INCENTIVE_LIMIT_ENABLED:
+            return None
         if passenger.incentive_limit is None:
             return None
         return passenger.expected_fare + max(0, int(passenger.incentive_limit))
@@ -2928,7 +3132,16 @@ class SimulationManager:
             if p.state == "waiting" and self._dispatch_delay_elapsed(p, sim_time)
         ]
 
-        for veh_id, vals in sub_results.items():
+        # 동적 생성(수동 utaxi_) 택시를 먼저 순회해 가까운 승객을 우선 선점하게 한다.
+        # 배차는 택시 주도 그리디라, 먼저 처리되는 택시가 waiting_passengers에서 승객을
+        # 먼저 채간다(아래 waiting_passengers.remove). 따라서 순회 순서가 곧 배차 우선권이다.
+        # sorted는 안정 정렬이므로 수동 택시가 없으면 기존 sub_results 순서가 그대로 유지되어
+        # 실험 모드(utaxi_ 없음) 결과는 영향을 받지 않는다.
+        ordered_items = sorted(
+            sub_results.items(),
+            key=lambda kv: 0 if self._is_manual_entity(kv[0]) else 1,
+        )
+        for veh_id, vals in ordered_items:
             if not self._is_taxi_id(veh_id):
                 continue
             state = self._taxi_states.get(veh_id, "empty")
@@ -3944,13 +4157,24 @@ class SimulationManager:
         # surge 공식 입력은 가중 demand(assigned 가중). 예측 모드는 예측값으로 대체.
         demand_for_surge: dict[str, float | int] = grid_demand_weighted
         config = self.experiment_config
-        predicted_mode = config is not None and config.demand_source == "predicted"
+        predicted_experiment = config is not None and config.demand_source == "predicted"
+        # 라이브 predicted는 provider 생성 실패(API 키 누락 등) 시 실측으로 폴백해야 하므로
+        # provider 존재 여부까지 확인한다. 실험 predicted는 fail-fast(없으면 raise)를 유지한다.
+        live_predicted = (
+            config is None
+            and LIVE_DEMAND_PREDICTED
+            and self._prediction_demand_provider is not None
+        )
+        predicted_mode = predicted_experiment or live_predicted
         if predicted_mode:
             if self._prediction_demand_provider is None:
                 raise RuntimeError("predicted demand source requires a prediction demand provider")
+            prediction_mode_raw = (
+                config.prediction_mode if config is not None else LIVE_PREDICTION_MODE
+            )
             demand_for_surge = self._prediction_demand_provider.demand_by_h3(
                 SIM_BASE_DATETIME + timedelta(seconds=sim_time),
-                mode=self._provider_prediction_mode(config.prediction_mode),
+                mode=self._provider_prediction_mode(prediction_mode_raw),
                 actual_demand=grid_demand,
             )
 

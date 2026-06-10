@@ -162,35 +162,84 @@ class PredictionDemandProvider:
             if self._closed:
                 raise PredictionFallbackError("prediction provider is closed")
         self._record_request()
-        last_exc: Exception | None = None
         try:
             payload = self._request_payload(sim_datetime, target_time)
-            for attempt in range(self.retry_max + 1):
-                try:
-                    response = self._http_client().post(
-                        self.prediction_url,
-                        json=payload,
-                        headers={"X-API-Key": self.api_key},
-                        timeout=self.timeout_s,
-                    )
-                    response.raise_for_status()
-                    break
-                except Exception as exc:
-                    last_exc = exc
-                    if attempt >= self.retry_max or not self._should_retry(exc):
-                        raise
-                    self._record_retry()
-                    if self.retry_backoff_s > 0:
-                        time.sleep(self.retry_backoff_s * (2 ** attempt))
+            response = self._post_with_retry(payload)
             demand = self._parse_predictions(response.json(), target_time)
         except Exception as exc:
             latency_ms = (time.perf_counter() - started_at) * 1000
             self._record_failure(latency_ms)
-            raise PredictionFallbackError("prediction request failed") from (last_exc or exc)
+            raise PredictionFallbackError("prediction request failed") from exc
 
         latency_ms = (time.perf_counter() - started_at) * 1000
         self._record_success(target_time, demand, latency_ms)
         return dict(demand)
+
+    def _post_with_retry(self, payload: dict[str, object]) -> httpx.Response:
+        for attempt in range(self.retry_max + 1):
+            try:
+                response = self._http_client().post(
+                    self.prediction_url,
+                    json=payload,
+                    headers={"X-API-Key": self.api_key},
+                    timeout=self.timeout_s,
+                )
+                response.raise_for_status()
+                return response
+            except Exception as exc:
+                if attempt >= self.retry_max or not self._should_retry(exc):
+                    raise
+                self._record_retry()
+                if self.retry_backoff_s > 0:
+                    time.sleep(self.retry_backoff_s * (2 ** attempt))
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    def forecast(
+        self,
+        sim_datetime: datetime,
+        *,
+        steps: int = 4,
+    ) -> list[dict[str, object]]:
+        """Return predicted demand for the next ``steps`` 15-minute buckets.
+
+        Module3 only predicts a single horizon (t+15) per request, so multi-step
+        demand is produced by roll-forward: each predicted bucket is fed back as
+        a synthetic history record for the subsequent request. Given the current
+        bucket ``n`` (``floor_to_15min(sim_datetime)``), this returns the demand
+        for buckets ``n+1 … n+steps`` (i.e. t+15, t+30, …). The returned list is
+        ordered nearest-first; each item is ``{"target_time", "demand"}``.
+        """
+        base_bucket = floor_to_15min(sim_datetime)
+        predicted_by_bucket: dict[datetime, DemandMap] = {}
+        results: list[dict[str, object]] = []
+        for step_index in range(steps):
+            request_time = base_bucket + timedelta(minutes=15 * step_index)
+            target_time = request_time + timedelta(minutes=15)
+            with self._lock:
+                if self._closed:
+                    raise PredictionFallbackError("prediction provider is closed")
+            self._record_request()
+            started_at = time.perf_counter()
+            try:
+                payload = {
+                    "timestamp": request_time.isoformat(),
+                    "weather": self.weather_provider.features_at(request_time),
+                    "records": self.history_store.records_for_prediction(
+                        request_time, predicted_overrides=predicted_by_bucket
+                    ),
+                }
+                response = self._post_with_retry(payload)
+                demand = self._parse_predictions(response.json(), target_time)
+            except Exception as exc:
+                latency_ms = (time.perf_counter() - started_at) * 1000
+                self._record_failure(latency_ms)
+                raise PredictionFallbackError("forecast request failed") from exc
+
+            latency_ms = (time.perf_counter() - started_at) * 1000
+            self._record_success(target_time, demand, latency_ms)
+            predicted_by_bucket[target_time] = demand
+            results.append({"target_time": target_time, "demand": dict(demand)})
+        return results
 
     def _request_payload(self, sim_datetime: datetime, target_time: datetime) -> dict[str, object]:
         del target_time

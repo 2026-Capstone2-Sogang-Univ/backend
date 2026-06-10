@@ -96,6 +96,31 @@ def test_records_for_prediction_includes_recorded_spawn_and_dropoff_counts():
     }
 
 
+def test_records_for_prediction_uses_predicted_overrides_for_future_buckets():
+    store = DemandHistoryStore(model_h3_cells=["h3_a"])
+    store.record_spawn(datetime(2013, 7, 8, 8, 1), "h3_a")  # actual bucket 08:00
+
+    # request_time 08:30 (roll-forward step), 08:30 bucket is a future bucket
+    # filled from a prior prediction.
+    overrides = {datetime(2013, 7, 8, 8, 30): {"h3_a": 7.0}}
+    records = store.records_for_prediction(
+        datetime(2013, 7, 8, 8, 30), predicted_overrides=overrides
+    )
+
+    by_bucket = {r["time_bucket"]: r for r in records}
+    # overridden future bucket uses the predicted demand and zero dropoff
+    assert by_bucket["2013-07-08T08:30:00"]["demand_count"] == 7.0
+    assert by_bucket["2013-07-08T08:30:00"]["dropoff_trip_count"] == 0
+    # actual past bucket still comes from recorded spawns
+    assert by_bucket["2013-07-08T08:00:00"]["demand_count"] == 1
+
+    # overridden (predicted) buckets are excluded from actual-history missing stats:
+    # 7 history buckets total, 1 overridden → 6 counted, all missing except 08:00.
+    diagnostics = store.diagnostics()
+    assert diagnostics["history_required_count"] == 6
+    assert diagnostics["history_missing_count"] == 5
+
+
 def test_recording_history_is_thread_safe():
     store = DemandHistoryStore(model_h3_cells=["h3_a"])
     event_time = datetime(2013, 7, 8, 8, 16)

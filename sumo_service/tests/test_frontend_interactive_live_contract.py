@@ -124,6 +124,9 @@ async def test_live_dispatch_call_boarding_and_fare_contract():
         "N_BACKGROUND_CARS": "0",
         "SIMULATION_SPEED": "30",
         "SIM_PROFILE": "0",
+        # 이 계약 테스트는 incentive_limit 요금 캡(fare <= expected_fare + incentive_limit)을
+        # 단언하므로, 기본 비활성인 캡을 명시적으로 켠다.
+        "INCENTIVE_LIMIT_ENABLED": "1",
     })
     process = subprocess.Popen(
         [

@@ -78,7 +78,50 @@ curl      http://localhost:8080/simulation/status
 curl      http://localhost:8080/simulation/surge
 curl      http://localhost:8080/simulation/passengers
 curl      http://localhost:8080/simulation/fare/{passenger_id}
+curl      http://localhost:8080/simulation/demand-forecast
 ```
+
+### Live demand forecast (external AI prediction in the live server)
+
+The live server can expose multi-horizon demand predictions from the external
+Module3 server (`https://module3-ml.onrender.com/predict`). This is OFF by
+default and gated by an env toggle (the experiment-only `demand_source=predicted`
+path is unchanged).
+
+- Enable with `DEMAND_FORECAST_ENABLED=1` (requires `PREDICTION_API_KEY`).
+- `DEMAND_FORECAST_STEPS` (default 4) and `PREDICTION_URL` are configurable.
+- These (and `PREDICTION_TIMEOUT_S` / `PREDICTION_RETRY_MAX` / `PREDICTION_RETRY_BACKOFF_S`)
+  are managed via `sumo_service/.env` — copy `sumo_service/.env.example` to
+  `sumo_service/.env`. The file is loaded at startup by `app/__init__.py`
+  (`python-dotenv`), and real env vars / docker-compose `environment:` override it.
+  docker-compose loads the same file via `env_file` (optional).
+- Module3 only predicts a single horizon (t+15) per request, so the provider
+  produces N buckets by **roll-forward**: each prediction is fed back as a
+  synthetic history record (`records_for_prediction(..., predicted_overrides=...)`)
+  for the next request. For the current 15-min bucket `n`, the forecast covers
+  buckets `n+1 … n+STEPS` (t+15, t+30, t+45, t+60).
+- The forecast refreshes in a background thread once per 15 simulated minutes
+  (`_maybe_refresh_demand_forecast`) so the TraCI loop is never blocked, and the
+  latest snapshot is served by `GET /simulation/demand-forecast`.
+
+> Note: `GET /simulation/demand-forecast` is **display-only** — it does not feed
+> the incentive/pricing calculation. To drive pricing with prediction, use the
+> live predicted-demand toggle below.
+
+### Live predicted demand in surge/incentive (experiment-parity)
+
+Independently of the display forecast, the live server can feed **predicted
+demand into the surge/incentive calculation**, reusing the exact experiment path
+(`PredictionDemandProvider.demand_by_h3`, single horizon t+15). OFF by default.
+
+- Enable with `LIVE_DEMAND_SOURCE=predicted` (requires `PREDICTION_API_KEY`).
+- `LIVE_PREDICTION_MODE` (default `async`), `LIVE_PREDICTION_HORIZON_MIN`
+  (default 15), `LIVE_PREDICTION_FALLBACK` (default `last_prediction`).
+- `async` is the live default because `_build_surge_cells` runs under the
+  manager lock; `sync` would block REST/WS during the Module3 HTTP call. The
+  prediction is cached per 15-min bucket, so at most one fetch per bucket.
+- If provider creation fails (e.g. missing API key) the live server logs a
+  warning and falls back to actual demand instead of crashing.
 
 ### Preprocess NYC taxi data (parquet mode only)
 Sample = 24h × 7days × N_TAXIS × 5.5 passengers/taxi/h = 277,200 for a 1-week run.

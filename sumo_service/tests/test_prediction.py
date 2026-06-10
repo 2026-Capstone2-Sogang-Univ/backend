@@ -1,7 +1,8 @@
+import json
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterator
 
 import httpx
@@ -67,7 +68,11 @@ def test_sync_request_payload_matches_module3_contract_and_includes_api_key():
     assert payload["weather"]["feat_weather_cat"] == "rain"
 
 
-def test_api_key_is_required_before_sending_request():
+def test_api_key_is_required_before_sending_request(monkeypatch):
+    # 이 테스트는 "키 부재" 분기를 검증하므로 로컬 .env의 PREDICTION_API_KEY에 의존하지
+    # 않도록 환경변수를 명시적으로 제거한다(app/__init__이 .env를 로드할 수 있음).
+    monkeypatch.delenv("PREDICTION_API_KEY", raising=False)
+
     def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError("request should not be sent without an API key")
 
@@ -330,6 +335,51 @@ def test_async_background_request_eventually_caches_prediction_and_success():
         diagnostics = provider.diagnostics()
         assert diagnostics["prediction_success_count"] == 1
         assert diagnostics["prediction_request_count"] == 1
+
+
+def test_forecast_returns_four_buckets_and_rolls_predictions_forward():
+    seen_records: list[list[dict]] = []
+    call = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.read())
+        request_time = datetime.fromisoformat(body["timestamp"])
+        target_time = request_time + timedelta(minutes=15)
+        seen_records.append(body["records"])
+        n = call["n"]
+        call["n"] += 1
+        return httpx.Response(
+            200,
+            json={
+                "timestamp": body["timestamp"],
+                "target_time": target_time.isoformat(),
+                "horizon": "15min",
+                "count": 1,
+                "predictions": [{"h3": "h3_a", "predicted_demand_count": float(n + 1)}],
+            },
+        )
+
+    with _provider(["h3_a"], handler) as provider:
+        results = provider.forecast(datetime(2013, 7, 8, 8, 17), steps=4)
+
+    # base bucket 08:15 → predicts n+1..n+4 = 08:30, 08:45, 09:00, 09:15
+    assert [r["target_time"] for r in results] == [
+        datetime(2013, 7, 8, 8, 30),
+        datetime(2013, 7, 8, 8, 45),
+        datetime(2013, 7, 8, 9, 0),
+        datetime(2013, 7, 8, 9, 15),
+    ]
+    assert [r["demand"]["h3_a"] for r in results] == [1.0, 2.0, 3.0, 4.0]
+    assert call["n"] == 4
+
+    # roll-forward: the 2nd request's history must contain the just-predicted
+    # 08:30 bucket carrying the 1st prediction (1.0), not actual zero history.
+    records_step2 = {r["time_bucket"]: r for r in seen_records[1]}
+    assert records_step2["2013-07-08T08:30:00"]["demand_count"] == 1.0
+    # and the 3rd request carries both prior predictions forward (08:30=1, 08:45=2)
+    records_step3 = {r["time_bucket"]: r for r in seen_records[2]}
+    assert records_step3["2013-07-08T08:30:00"]["demand_count"] == 1.0
+    assert records_step3["2013-07-08T08:45:00"]["demand_count"] == 2.0
 
 
 def test_prediction_latency_p95_uses_inclusive_quantile():

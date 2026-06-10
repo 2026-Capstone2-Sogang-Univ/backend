@@ -11,6 +11,13 @@ from ..db.engine import get_pool
 from ..grid import H3_RESOLUTION
 from ..h3_regions import load_h3_region_map
 from ..simulation import DEFAULT_PRICING_POLICY, SimStatus, SimulationStartOptions
+from .responses import (
+    DemandForecastResponse,
+    KpiResponse,
+    PassengersResponse,
+    StatusResponse,
+    SurgeResponse,
+)
 
 router = APIRouter()
 
@@ -214,7 +221,7 @@ def _validate_start_body(body: StartSimulationBody | None) -> JSONResponse | Non
     return None
 
 
-@router.post("/start")
+@router.post("/start", responses={200: {"model": StatusResponse}})
 async def start_simulation(
     request: Request,
     body: StartSimulationBody | None = Body(default=None),
@@ -229,7 +236,7 @@ async def start_simulation(
     return _status_payload(manager)
 
 
-@router.post("/pause")
+@router.post("/pause", responses={200: {"model": StatusResponse}})
 async def pause_simulation(request: Request):
     manager = request.app.state.manager
     if manager.status != SimStatus.RUNNING:
@@ -238,7 +245,7 @@ async def pause_simulation(request: Request):
     return _status_payload(manager)
 
 
-@router.post("/resume")
+@router.post("/resume", responses={200: {"model": StatusResponse}})
 async def resume_simulation(request: Request):
     manager = request.app.state.manager
     if manager.status != SimStatus.PAUSED:
@@ -247,7 +254,7 @@ async def resume_simulation(request: Request):
     return _status_payload(manager)
 
 
-@router.post("/restart")
+@router.post("/restart", responses={200: {"model": StatusResponse}})
 async def restart_simulation(
     request: Request,
     body: StartSimulationBody | None = Body(default=None),
@@ -260,7 +267,7 @@ async def restart_simulation(
     return _status_payload(manager)
 
 
-@router.post("/stop")
+@router.post("/stop", responses={200: {"model": StatusResponse}})
 async def stop_simulation(request: Request):
     manager = request.app.state.manager
     await manager.stop()
@@ -274,23 +281,31 @@ async def shutdown_server(request: Request):
     return {"status": "shutting down"}
 
 
-@router.get("/status")
+@router.get("/status", responses={200: {"model": StatusResponse}})
 async def get_status(request: Request):
     manager = request.app.state.manager
     return _status_payload(manager)
 
 
-@router.get("/kpi")
+@router.get("/kpi", responses={200: {"model": KpiResponse}})
 async def get_kpi(request: Request):
     # 직전에 완료된 5분 시뮬레이션 구간(현재 진행 중 버킷 직전)의 KPI를 응답한다.
     manager = request.app.state.manager
     return manager.get_kpi_summary()
 
 
-@router.get("/surge")
+@router.get("/surge", responses={200: {"model": SurgeResponse}})
 async def get_surge(request: Request):
     manager = request.app.state.manager
     return {"h3_resolution": H3_RESOLUTION, "cells": manager.get_surge()}
+
+
+@router.get("/demand-forecast", responses={200: {"model": DemandForecastResponse}})
+async def get_demand_forecast(request: Request):
+    # 현재 15분 버킷 n 기준 n+1~n+STEPS 버킷의 외부 AI 예측 수요(roll-forward) 스냅샷.
+    # DEMAND_FORECAST_ENABLED가 꺼져 있으면 enabled=false, buckets=[] 를 반환한다.
+    manager = request.app.state.manager
+    return manager.get_demand_forecast()
 
 
 @router.get("/h3-regions")
@@ -302,7 +317,7 @@ async def get_h3_regions():
     }
 
 
-@router.get("/passengers")
+@router.get("/passengers", responses={200: {"model": PassengersResponse}})
 async def get_passengers(request: Request):
     manager = request.app.state.manager
     return {"passengers": manager.get_passengers()}

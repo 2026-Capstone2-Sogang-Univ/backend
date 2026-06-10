@@ -163,7 +163,9 @@ def test_no_dispatch_when_no_waiting_passengers():
 
 def test_dispatch_pricing_applies_passenger_incentive_limit(monkeypatch):
     # surge_by_h3 기반 캡 적용 검증 — 목표매칭률 추종 인센티브(LIVE_TARGET_PRICING)는 끈 상태.
+    # incentive_limit 요금 캡은 기본 비활성이므로 이 검증을 위해 명시적으로 켠다.
     monkeypatch.setattr("app.simulation.LIVE_TARGET_PRICING", False)
+    monkeypatch.setattr("app.simulation.INCENTIVE_LIMIT_ENABLED", True)
     mgr = make_manager()
     p = make_passenger()
     p.h3_pickup = "pickup_cell"

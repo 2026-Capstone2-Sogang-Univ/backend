@@ -3,6 +3,11 @@ services:
     volumes:
       - ./sumo_service/app:/app/app
       - ./sumo_service/sumo_configs:/app/sumo_configs
+    # 수요 예측 등 환경변수를 sumo_service/.env로 관리. 파일이 없어도 무시(required:false).
+    # 아래 environment: 항목이 .env보다 우선한다.
+    env_file:
+      - path: ./sumo_service/.env
+        required: false
     environment:
       - WATCHFILES_FORCE_POLLING=true
       - PASSENGER_SOURCE=random
