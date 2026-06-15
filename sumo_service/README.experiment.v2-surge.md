@@ -1,312 +1,149 @@
-# 서지 가격 실험 가이드
+# v2 Surge Experiment Guide
 
-이 문서는 `sumo_service`의 현재 Module 4 실험 모드를 설명한다.
+현재 코드 기준 v2 surge와 driver acceptance 실험 실행 방법을 정리한 문서다. 실험은 FastAPI 서버를 통하지 않고 `SimulationManager`를 직접 실행하며, WebSocket 표시가 아니라 JSON/CSV 결과 산출을 목적으로 한다.
 
-현재 구현은 `RideHailingPricingEngine_fixed_v2.py`(추가구현 요구사항)의 정책과 맞춘다. 별도 기사
-인센티브를 지급하지 않고, 서지 배율을 유일한 가격 조정 수단으로 사용한다.
-배차 의사결정 시점에는 셀의 `raw_surge`에서 목표 매칭률을 정하고, 기사 수락
-모델을 역산해 필요한 운임을 구한 뒤, 그 운임을 서지 배율로 변환한다. 이렇게
-계산된 최종 운임은 기사 수락 확률 계산과 완료 trip 요금 기록에 모두 사용된다.
+## 목적
 
-## 정책 흐름
+- H3 cell별 supply/demand 불균형이 surge에 미치는 영향 확인
+- v2 pricing이 목표 기사 수락률에 얼마나 가까워지는지 확인
+- 실제 수요 기반 정책과 AI 예측 수요 기반 정책 비교
+- `alpha_sensitivity`, `epsilon`, passenger elasticity 변화에 따른 matching/fare/wait KPI 비교
 
-pickup H3 cell 기준 흐름은 다음과 같다.
+## 기본 정책
 
-```text
-raw_surge = (demand / supply) ** (1 / abs(elasticity))
-target_matching_rate = get_target_matching_rate(raw_surge)
-required_fare_usd = inverse_acceptance_model(target_matching_rate, candidate_driver_features)
-calculated_surge = required_fare_usd / base_fare_usd
-final_surge = apply_surge_limits(calculated_surge)
-final_fare_usd = base_fare_usd * final_surge
+기본 pricing policy:
+
+```json
+{
+  "epsilon": -0.6,
+  "surge_min": 1.2,
+  "surge_max": 4.9,
+  "alpha_sensitivity": 1.0
+}
 ```
 
-서지 제한 정책:
+기본 target matching rate bucket:
 
-- 계산된 surge가 `1.2` 미만이면 서지가 꺼진 것으로 보고 `1.0`을 사용한다.
-- 활성화된 surge는 `0.1` 단위로 올림 처리한다.
-- surge 상한은 `4.9`다.
-
-목표 매칭률은 `final_surge`가 아니라 `raw_surge` 구간에서 정한다.
-
-| raw_surge | target_matching_rate |
+| raw surge 구간 | target matching rate |
 | --- | --- |
 | `< 1.5` | `0.55` |
 | `< 2.5` | `0.70` |
 | `< 3.5` | `0.80` |
 | `>= 3.5` | `0.85` |
 
-runtime mode에서는 셀 단위 limited surge를 배차 판단에 바로 사용하고, 배차
-시점의 surge를 trip 완료 요금에 반영한다. experiment mode에서는 위 v2
-inverse-pricing 경로를 사용한다.
+raw surge는 supply/demand 불균형에서 계산한다. v2 pricing은 후보 기사와 승객 feature를 기준으로 목표 수락률에 필요한 fare를 역산하고, `surge_min`, `surge_max`, 승객 cap을 적용한다.
 
-## 입력값
+## 승객 replay와 생성량
 
-주요 sweep 입력은 다음과 같다.
+실험의 기본 승객 소스는 코드 기본값인 `parquet`이다. `TRIPS_FILE`의 전처리된 승객 목록을 사용하며, `PASSENGERS_PER_5MIN` 또는 CLI의 `--passengers-per-5min` 값으로 5분 bucket당 생성 수를 제한한다.
 
-- `elasticity`: demand/supply imbalance에서 raw surge를 계산할 때 쓰는 민감도.
-- `alpha_sensitivity`: 기사 효용 민감도 보정값. inverse fare 계산에 사용한다.
-- `beta_f`: 학습된 fare coefficient를 직접 override할 때만 사용하는 선택값.
-  생략하면 `app/driver/model_coefficients.json`의 모델 계수를 사용한다.
-- `demand_source`: `actual` 또는 `predicted`.
-- `prediction_mode`: `none`, `sync`, `async`.
-- `passenger_elasticity`: 표시된 surge에 따른 승객 수요 반응을 실험할 때 쓰는 선택값.
+현재 코드 기본값은 `PASSENGERS_PER_5MIN=80`이다. 같은 seed와 같은 입력 파일을 사용하면 sampling 결과가 재현되도록 설계되어 있다. replay 파일 길이를 넘는 장기 실험은 loop 방식으로 이어진다.
 
-`target_p`는 더 이상 sweep 입력이 아니다. 목표 매칭률은 셀별 `raw_surge`
-구간에서 자동으로 결정된다.
+pickup/dropoff edge가 SUMO 네트워크에서 유효하지 않거나 route를 찾지 못하면 해당 trip은 skip되고, 결과의 `parquet_replay` diagnostics에 집계된다.
 
-## 실행 방법
+## AI 예측 수요 사용
 
-명령은 `Back/sumo_service`에서 실행한다.
+기본 실험은 `--demand-source actual`이며 외부 예측 API를 호출하지 않는다.
 
-actual demand 기준 단일 실행:
+예측 수요를 사용하려면 다음처럼 실행한다.
 
 ```powershell
-uv run python scripts\run_acceptance_experiment.py `
-  --elasticity 0.6 `
-  --alpha-sensitivity 1.0
+$env:PREDICTION_API_KEY="..."
+uv run python scripts\run_acceptance_experiment.py --demand-source predicted --prediction-mode sync --prediction-horizon-min 15
 ```
 
-기사 민감도 sweep:
+현재 스크립트는 한 번에 하나의 `--prediction-horizon-min` 값을 사용한다. 15/30/45/60분 horizon을 비교하려면 horizon별로 실험을 따로 실행한다.
+
+예측 API 관련 주요 옵션:
+
+| 옵션 | 기본값 | 설명 |
+| --- | --- | --- |
+| `--prediction-url` | `https://module3-ml.onrender.com/predict` | 외부 예측 API endpoint |
+| `--prediction-horizon-min` | `15` | 예측 horizon |
+| `--prediction-mode` | `none` | `none`, `sync`, `async` |
+| `--demand-source` | `actual` | `actual` 또는 `predicted` |
+
+예측 호출 실패와 fallback은 결과의 `prediction_failure_count`, `prediction_fallback_count`, `prediction_missing_h3_rate` 등으로 확인한다.
+
+## 실행 예시
+
+기본 단일 실험:
 
 ```powershell
-uv run python scripts\run_acceptance_experiment.py `
-  --elasticity 0.6 `
-  --alpha-sensitivity-list 0.5,0.75,1.0,1.25,1.5
+cd Back\sumo_service
+uv run python scripts\run_acceptance_experiment.py --json-output experiment_out.json --csv-output experiment_out.csv
 ```
 
-predicted demand 정책 실행:
+시간당 600명 수준의 승객 생성:
 
 ```powershell
-uv run python scripts\run_acceptance_experiment.py `
-  --elasticity 0.6 `
-  --demand-source predicted `
-  --prediction-mode sync `
-  --prediction-url https://module3-ml.onrender.com/predict `
-  --prediction-horizon-min 15
+uv run python scripts\run_acceptance_experiment.py --passengers-per-5min 50 --json-output experiment_600ph.json --csv-output experiment_600ph.csv
 ```
 
-승객 가격 탄력성 확장 실험:
+`alpha_sensitivity` sweep:
 
 ```powershell
-uv run python scripts\run_acceptance_experiment.py `
-  --elasticity 0.6 `
-  --passenger-elasticity -0.6
+uv run python scripts\run_acceptance_experiment.py --elasticity 0.6 --alpha-sensitivity-list 0.5,1.0,1.5,2.0 --json-output sweep.json --csv-output sweep.csv
 ```
 
-여러 조합을 CSV에 append:
+예측 수요 실험:
 
 ```powershell
-uv run python scripts\run_acceptance_experiment.py `
-  --elasticity-list 0.4,0.6 `
-  --alpha-sensitivity-list 0.75,1.0,1.25 `
-  --csv-output ..\.temp\acceptance_experiment_results.csv
+$env:PREDICTION_API_KEY="..."
+uv run python scripts\run_acceptance_experiment.py --demand-source predicted --prediction-mode sync --prediction-horizon-min 15 --json-output predicted.json --csv-output predicted.csv
 ```
 
-빠른 smoke test가 필요하면 simulated duration을 줄인다.
+## 주요 CLI 옵션
 
-```powershell
-uv run python scripts\run_acceptance_experiment.py `
-  --elasticity 0.6 `
-  --sim-duration 300
-```
+| 옵션 | 설명 |
+| --- | --- |
+| `--elasticity`, `--elasticity-list` | 수요/가격 탄력성 |
+| `--beta-f`, `--beta-f-list` | 기사 fare 민감도 |
+| `--alpha-sensitivity`, `--alpha-sensitivity-list` | 목표 수락률 error를 surge에 반영하는 민감도 |
+| `--seed` | 난수 seed |
+| `--sim-duration` | 실험 시뮬레이션 시간 |
+| `--step-length` | SUMO step length |
+| `--passengers-per-5min` | 5분 bucket당 승객 수 |
+| `--demand-source` | `actual` 또는 `predicted` |
+| `--prediction-mode` | `none`, `sync`, `async` |
+| `--prediction-horizon-min` | 예측 horizon |
+| `--passenger-elasticity` | 승객 가격 탄력성 제거 모델 |
+| `--json-output` | JSON 결과 파일 |
+| `--csv-output` | CSV 결과 파일 |
 
-## 출력 형식
+## 주요 결과 지표
 
-stdout은 JSON 배열이다. 각 row는 `status`, `reason`, `params`, `metrics`를
-가진다.
+JSON/CSV 결과에는 다음 값이 포함된다.
 
-```json
-[
-  {
-    "status": "ok",
-    "reason": null,
-    "params": {
-      "elasticity": 0.6,
-      "beta_f": null,
-      "seed": 42,
-      "demand_source": "actual",
-      "prediction_mode": "none",
-      "prediction_url": "https://module3-ml.onrender.com/predict",
-      "prediction_horizon_min": 15,
-      "passenger_elasticity": 0.0,
-      "alpha_sensitivity": 1.0,
-      "weather_source": "static"
-    },
-    "metrics": {
-      "spawned_passengers": 42,
-      "unique_matched_passengers": 31,
-      "matching_success_rate": 0.738,
-      "accepted_dispatch_count": 34,
-      "acceptances_per_driver_hour": 0.113,
-      "driver_revenue_per_hour_usd": 1.42,
-      "avg_actual_acceptance_probability": 0.79,
-      "avg_target_matching_rate": 0.7,
-      "avg_matching_rate_error": 0.02,
-      "avg_abs_matching_rate_error": 0.06,
-      "avg_required_fare_usd": 18.4,
-      "avg_final_surge": 1.8,
-      "avg_final_fare_usd": 18.0
-    }
-  }
-]
-```
-
-## KPI 의미
-
-`spawned_passengers`  
-실험 중 생성된 전체 승객 수다.
-
-`unique_matched_passengers`  
-한 번 이상 accepted dispatch decision을 받은 unique 승객 수다.
-
-`matching_success_rate`  
-
-```text
-unique_matched_passengers / spawned_passengers
-```
-
-`accepted_dispatch_count`  
-기사에게 제안된 배차 중 실제 수락된 배차 수다.
-
-`acceptances_per_driver_hour`  
-
-```text
-accepted_dispatch_count / (N_TAXIS * (sim_duration / 3600))
-```
-
-`driver_revenue_per_hour_usd`  
-완료된 trip의 최종 청구 운임을 택시-시간으로 나눈 값이다. 최종 청구 운임을
-사용하므로 dispatch 시점 surge가 포함된다. 시뮬레이션 종료 시 강제 완료된
-trip은 제외한다.
-
-```text
-sum(fare_usd for completed trips) / (N_TAXIS * (sim_duration / 3600))
-```
-
-`avg_actual_acceptance_probability`  
-배차 판단 시점에 계산된 기사 수락 확률 `p_actual`의 평균이다.
-
-`avg_target_matching_rate`  
-`raw_surge` 구간에서 결정된 목표 매칭률의 평균이다.
-
-`avg_matching_rate_error`  
-
-```text
-mean(p_actual - target_matching_rate)
-```
-
-`avg_abs_matching_rate_error`  
-
-```text
-mean(abs(p_actual - target_matching_rate))
-```
-
-`avg_required_fare_usd`  
-surge limit을 적용하기 전, inverse acceptance model이 요구한 운임의 평균이다.
-
-`avg_final_surge`  
-배차 판단에 사용된 최종 surge의 평균이다.
-
-`avg_final_fare_usd`  
-배차 판단에 사용된 최종 예상 운임의 평균이다.
-
-predicted-demand mode에서는 다음 prediction diagnostics가 함께 기록된다.
-
-- `prediction_request_count`
-- `prediction_success_count`
-- `prediction_failure_count`
-- `prediction_latency_ms_avg`
-- `prediction_latency_ms_p95`
-- `prediction_fallback_count`
-- `prediction_stale_use_count`
-- `prediction_missing_h3_rate`
+- `spawned_passengers`
+- `unique_matched_passengers`
+- `matching_success_rate`
+- `accepted_dispatch_count`
+- `acceptances_per_driver_hour`
+- `driver_revenue_per_hour_usd`
+- `avg_empty_wait_time_s`
+- `p50_empty_wait_time_s`
+- `p95_empty_wait_time_s`
+- `avg_actual_acceptance_probability`
+- `avg_target_matching_rate`
+- `avg_matching_rate_error`
+- `avg_abs_matching_rate_error`
+- `avg_required_fare_usd`
+- `avg_final_surge`
+- `avg_final_fare_usd`
 - `avg_actual_demand_for_surge`
 - `avg_predicted_demand_for_surge`
 - `avg_demand_bias`
 - `avg_abs_demand_error`
+- `parquet_replay`
+- `matching.by_raw_bucket`
+- `cells.by_raw_bucket`
 
-## Invalid row
+`avg_required_fare_usd`는 목표 수락률을 맞추기 위해 역산된 fare 평균이다. `avg_final_surge`와 `avg_final_fare_usd`는 cap과 surge 상한 적용 후 실제 의사결정에 가까운 값이다.
 
-입력값이 수학적으로 위험하거나 finite하지 않으면 SUMO를 실행하지 않고 invalid
-row를 출력한다.
+## 해석 주의사항
 
-현재 validation:
-
-- `beta_f`를 명시한 경우 finite해야 한다.
-- `alpha_sensitivity`는 양수이고 finite해야 한다.
-
-`beta_f`를 생략하면 학습된 모델 계수를 그대로 사용한다. 이 경로가 권장 기본값이다.
-
-## DB 저장 필드
-
-runtime DB 기록은 dispatch/trip 단위 scalar 값만 저장한다. 후보 기사별 상세 로그나
-전체 grid snapshot은 저장하지 않는다.
-
-`dispatch`에는 다음 값을 저장한다.
-
-- `raw_surge`
-- `target_matching_rate`
-- `calculated_surge`
-- `final_surge`
-- `final_fare_estimate_usd`
-- `p_actual`
-- `accepted`
-
-`trip`에는 다음 값을 저장한다.
-
-- `meter_fare`: surge 적용 전 NYC TLC meter fare. 단위는 cents.
-- `surge`: 해당 trip에 적용된 dispatch-time surge.
-- `fare`: 최종 청구 운임. 단위는 cents.
-- `expected_fare`: 기존 meter estimate. 단위는 cents.
-
-기존 DB volume을 사용하는 경우를 위해 startup 시
-`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migration을 실행한다.
-
-## 구현 위치
-
-- `app/pricing.py`: raw surge, target matching-rate band, final surge limit.
-- `app/grid.py`: WebSocket heatmap과 runtime cache에 쓰는 cell-level limited surge.
-- `app/driver/decision_function.py`: 기사 수락 확률과 inverse fare 계산.
-- `app/fare.py`: meter fare와 최종 청구 fare 계산.
-- `app/simulation.py`: dispatch pricing, acceptance decision, trip fare accounting.
-- `scripts/run_acceptance_experiment.py`: CLI sweep runner와 KPI 집계.
-
-## 비교 방법
-
-predicted demand 효과를 보려면 같은 seed와 같은 파라미터에서 actual demand와 비교한다.
-
-```powershell
-uv run python scripts\run_acceptance_experiment.py `
-  --elasticity 0.6 `
-  --demand-source actual `
-  --json-output ..\.temp\actual.json
-
-uv run python scripts\run_acceptance_experiment.py `
-  --elasticity 0.6 `
-  --demand-source predicted `
-  --prediction-mode sync `
-  --json-output ..\.temp\predicted.json
-```
-
-predicted demand는 같은 조건에서 다음 중 하나 이상을 개선할 때 의미가 있다.
-
-- 더 높은 `matching_success_rate`
-- 더 낮은 `avg_empty_wait_time_s`
-- 더 낮은 `avg_abs_matching_rate_error`
-- 더 높은 `acceptances_per_driver_hour`
-- 더 높거나 안정적인 `driver_revenue_per_hour_usd`
-
-predicted mode가 나쁘게 나오면 먼저 `prediction_missing_h3_rate`,
-`avg_demand_bias`, `avg_abs_demand_error`, `avg_surge`, `avg_final_surge`를
-확인한다.
-
-## 주의사항
-
-- passenger `expected_fare`는 기존 meter estimate이며 surge를 포함하지 않는다.
-- completed trip의 `fare`는 dispatch-time surge가 반영된 최종 청구 운임이다.
-- frontend 호환성을 위해 WebSocket `fare_update` payload 구조는 유지한다.
-- WebSocket `surge` payload는 heatmap 표시용 limited cell surge를 계속 제공한다.
-- 장기 predicted-demand 실험에서는 `last_prediction` fallback이 필요할 수 있지만,
-  현재 기본값은 `error`다. 예측 실패가 validation run에 조용히 섞이지 않게 하기
-  위한 선택이다.
+- `avg_target_matching_rate`가 높고 `matching_success_rate`가 낮으면 surge 상한, 후보 기사 부족, pickup 거리, acceptance model 중 하나가 병목일 수 있다.
+- `avg_final_surge`가 4.9에 붙어 있으면 정책 상한에 걸린 상태다.
+- `parquet_replay.skipped_pickup`, `skipped_dropoff`, `route_failed`가 높으면 전처리 데이터와 SUMO edge 매칭을 먼저 확인한다.
+- predicted mode가 actual보다 나쁘면 `prediction_missing_h3_rate`, `avg_demand_bias`, `avg_abs_demand_error`를 먼저 확인한다.

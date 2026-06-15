@@ -1,367 +1,194 @@
-# SUMO 기반 택시 수요 예측 및 동적 배차 시뮬레이션 백엔드
+# DigitalTwin Backend
 
-뉴욕 맨해튼 실제 도로 네트워크 위에서 택시·승객·일반 차량의 이동을 시뮬레이션하고,
-딥러닝 기반 수요 예측을 실시간으로 반영하여 동적 배차를 수행하는 백엔드 시스템입니다.
-시뮬레이션 결과는 WebSocket을 통해 웹 기반 Digital Twin 프론트엔드에 스트리밍됩니다.
+Manhattan SUMO 네트워크 위에서 택시, 승객, 배경 차량을 시뮬레이션하고 프론트엔드에 REST API와 WebSocket 데이터를 제공하는 백엔드 저장소다. 현재 실행 중심 서비스는 `sumo_service`이며, 배차, 요금, surge, KPI, 수동 승객/택시 생성, 실험 모드를 함께 담당한다.
 
 ---
 
 ## 시스템 구성
 
-세 개의 독립된 마이크로서비스로 구성되며, 내부 통신은 gRPC를 사용합니다.
+현재 백엔드는 `sumo_service`가 시뮬레이션 상태의 기준이다. 프론트엔드는 REST API로 제어/조회 요청을 보내고, WebSocket protobuf 스트림으로 실시간 상태를 받는다. AI 수요 예측 API는 실험 모드에서 선택적으로 호출한다.
 
+```text
++------------------------------------------------------------------+
+|                      Web Frontend                                |
+|  - REST control/query client                                     |
+|  - WebSocket protobuf client                                     |
++------------------------------+-----------------------------------+
+                               |
+                               | REST API
+                               | WebSocket protobuf
+                               v
++------------------------------------------------------------------+
+|                         SUMO Service                             |
+|  - FastAPI REST API                                              |
+|  - WebSocket broadcaster                                         |
+|  - SUMO/TraCI simulation loop                                    |
+|  - taxi/passenger/background vehicle state management            |
+|  - dispatch, fare, surge, KPI logic                              |
+|  - manual passenger/taxi creation                                |
++---------------+-------------------------------+------------------+
+                |                               |
+                | optional DB write/query        | experiment mode only
+                v                               v
++-------------------------------+    +-----------------------------+
+| PostgreSQL / TimescaleDB      |    | External Prediction API      |
+|  - run/trip/dispatch records  |    |  - demand prediction by H3   |
+|  - vehicle state/log storage  |    |  - selected horizon request  |
++-------------------------------+    +-----------------------------+
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Web Frontend (Digital Twin)                   │
-│                         WebSocket Client                         │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │ WebSocket
-                               │ boundary / snapshot / surge
-                               │ fare_update / finished
-                               │
-┌──────────────────────────────▼──────────────────────────────────┐
-│                         SUMO Service                             │
-│  - SUMO/TraCI 시뮬레이션 제어 (맨해튼 도로망)                   │
-│  - FastAPI REST API  (시뮬레이션 제어 + 조회)                   │
-│  - WebSocket 서버    (60 fps 상태 스트리밍)                     │
-│  - CLI 콘솔 제어                                                 │
-└───────────────┬──────────────────────────────┬──────────────────┘
-                │ gRPC (시뮬레이션 상태)        │ gRPC (인센티브/재라우팅)
-                ▼                              ▲
-┌───────────────────────┐      ┌───────────────────────────────────┐
-│   Prediction Service  │      │          Dispatch Service          │
-│   [미구현]            │─────▶│          [미구현]                  │
-│   - 딥러닝 추론       │      │   - 수급 불균형 계산               │
-│   - 5분 주기 트리거   │      │   - 인센티브 레벨 결정             │
-└───────────────────────┘      │   - 최근접 택시 배차               │
-  gRPC (예측 수요)              └───────────────────────────────────┘
-```
 
-### SUMO Service [구현 완료]
+### SUMO Service
 
-- SUMO 1.26 시뮬레이터를 TraCI API로 제어하는 핵심 서비스
-- 맨해튼 OSM 기반 도로 네트워크(`manhattan_car_only.net.xml`) 사용
-- 초기 상태: 빈 택시 300대 + 배경 일반 차량 1,200대 (TraCI로 동적 생성)
-- 시뮬레이션 속도: 20× 가속 모드 (실제 1초 = 시뮬레이션 20초)
-- 종료 조건: 시뮬레이션 시간 3,600초(1시간) 도달 시 자동 종료
-- 승객 생성: 5분 시뮬 주기마다 Poisson 분포(λ=5), `random` / `parquet` 이중 모드
-- 배차 타임아웃: 600초 내 미픽업 시 재배차 (새 택시 즉시 배정)
-- 트립 타임아웃: 1,800초 내 미하차 시 강제 완료 처리
-- 빈 택시 경로: 핫스팟(Times Square, Penn Station 등) 가중치 기반 무작위 재배정
-- 요금 계산: NYC 택시 미터 요금체계 (기본료 $3.00 + 거리/저속 추가 + 고정 할증 $1.50)
-- H3 격자(해상도 9) 기반 공급/수요 집계 및 서지 계수(surge coefficient) 계산
-- DB 영속화: PostgreSQL 16 + TimescaleDB — 모든 run/승객/배차/트립 기록
-
-### Prediction Service [미구현]
-
-- 딥러닝 모델의 추론(inference)을 담당 (학습 제외)
-- 시뮬레이션 시계 기준 5분마다 자동 트리거
-- 출력: t+1 ~ t+6 각 5분 구간별 예측 호출 수
-
-### Dispatch Service [미구현]
-
-- 수급 불균형 지표 계산: `imbalance = predicted_demand - available_taxis`
-- 불균형 심각도에 비례한 인센티브 레벨 결정 (0.0 ~ 1.0)
-- 빈 택시 재라우팅: 인센티브 레벨에 따른 확률론적 재배정
-- 배차: 대기 승객과 가장 가까운 빈 택시 자동 매칭
+- SUMO/TraCI 기반 Manhattan 도로망 시뮬레이션
+- 택시, 승객, 배경 차량 생성과 상태 전이 관리
+- parquet replay 또는 random 승객 생성 지원
+- H3 cell 단위 supply/demand/surge 계산
+- 기사 수락률 기반 v2 pricing과 effective fare 계산
+- REST API와 WebSocket protobuf로 프론트엔드 연동
+- PostgreSQL/TimescaleDB 저장 지원
+- 실험 스크립트를 통한 actual/predicted demand 비교 지원
 
 ---
 
 ## 기술 스택
 
 | 항목 | 기술 |
-|------|------|
-| 시뮬레이터 | SUMO 1.26 + TraCI |
+| --- | --- |
+| 시뮬레이터 | SUMO + TraCI |
 | 웹 프레임워크 | FastAPI + Uvicorn |
-| WebSocket | FastAPI WebSocket (Starlette) |
-| H3 격자 | h3 4.x |
+| WebSocket | FastAPI WebSocket, protobuf binary |
+| H3 격자 | h3 |
 | DB | PostgreSQL 16 + TimescaleDB |
 | DB 드라이버 | asyncpg |
-| 내부 통신 | gRPC (예정) |
-| 배포 | Docker, Docker Compose |
 | 언어 | Python 3.11 |
 | 패키지 관리 | uv |
+| 배포 | Docker, Docker Compose |
 
 ---
 
-## 빠른 시작
+## 실행
 
-### 요구사항
+### 로컬 실행
 
-- Docker, Docker Compose
+```powershell
+cd Back\sumo_service
+uv sync --group dev
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8080
+```
 
-### 환경변수
+### Docker 실행
 
-| 변수 | 기본값 | 설명 |
-|------|--------|------|
-| `PASSENGER_SOURCE` | `random` | 승객 생성 모드 (`random` / `parquet`) |
-| `DATABASE_URL` | 없음 | PostgreSQL 연결 문자열. 미설정 시 DB 기능 비활성화 (no-op) |
-| `SUMO_GUI` | 없음 | `1` 설정 시 SUMO GUI 창 오픈 (로컬 디버깅 전용) |
-
-### 전체 시스템 실행
-
-```bash
+```powershell
 cd Back
 docker compose up --build
 ```
 
-`docker-compose.override.yml`에 `DATABASE_URL`이 설정되어 있어 postgres 컨테이너와 자동 연결.  
+`docker-compose.override.yml`이 있으면 Docker Compose가 자동으로 함께 읽는다. 이 override는 개발 편의를 위해 코드 볼륨 마운트, `--reload`, `PASSENGER_SOURCE=random`, `DATABASE_URL` 등을 적용한다. 배포 설정에 가깝게 확인하려면 override 없이 실행한다.
 
-### 시뮬레이션 제어
-
-**REST API:**
-
-```bash
-curl -X POST http://localhost:8080/simulation/start
-curl -X POST http://localhost:8080/simulation/pause
-curl -X POST http://localhost:8080/simulation/resume
-curl -X POST http://localhost:8080/simulation/restart
+```powershell
+cd Back
+docker compose -f docker-compose.yml up --build
 ```
 
-**콘솔 (컨테이너 stdout):**
+---
 
-```
-s=start  p=pause  u=resume  r=restart  e=end  q=quit server
-```
+## 주요 기본값
 
-### 로컬 개발 (sumo_service 단독)
+| 항목 | 기본값 | 설명 |
+| --- | --- | --- |
+| `PASSENGER_SOURCE` | `parquet` | 승객 생성 모드 |
+| `TRIPS_FILE` | `sumo_configs/NY/trips_processed.json` | parquet replay 입력 파일 |
+| `PASSENGERS_PER_5MIN` | `80` | 5분 bucket당 승객 수. random/parquet 공통 |
+| `SIM_DURATION` | `3600` | 시뮬레이션 시간, 초 |
+| `SIMULATION_SPEED` | `20` | 실제 1초당 진행할 시뮬레이션 초 |
+| `N_TAXIS` | `300` | 초기 택시 수 |
+| `N_BACKGROUND_CARS` | `800` | 초기 배경 차량 수 |
+| `SUMO_ROUTING_ALGORITHM` | `astar` | SUMO routing algorithm |
+| `DATABASE_URL` | 없음 | 없으면 DB writer 없이 동작 |
 
-```bash
-cd Back/sumo_service
-
-# 의존성 설치 (개발 도구 포함)
-uv sync --group dev
-
-# 단위 테스트 실행
-uv run pytest -v
-
-# 개발 서버 (SUMO 없이 API 레이어만 확인)
-uv run uvicorn app.main:app --reload --port 8080
-```
+`PASSENGER_LAMBDA`는 호환용 alias다. 현재 코드는 `PASSENGERS_PER_5MIN`을 우선 사용하고, 값이 없을 때만 fallback으로 읽는다.
 
 ---
 
 ## REST API
 
-| 메서드 | 경로 | 설명 |
-|--------|------|------|
-| POST | `/simulation/start` | 시뮬레이션 시작 |
-| POST | `/simulation/pause` | 일시정지 |
-| POST | `/simulation/resume` | 재개 |
-| POST | `/simulation/restart` | 초기화 후 재시작 |
-| POST | `/simulation/stop` | 시뮬레이션 중단 (서버 유지) |
-| POST | `/simulation/shutdown` | 시뮬레이션 중단 후 서버 프로세스 종료 |
-| GET  | `/simulation/status` | 현재 상태 + 차량/승객 스냅샷 |
-| GET  | `/simulation/passengers` | 대기 중 승객 목록 |
-| GET  | `/simulation/surge` | H3 셀별 공급/수요/서지 계수 |
-| GET  | `/simulation/fare/{passenger_id}` | 완료된 트립 요금 조회 (없으면 404) |
+주요 REST API prefix는 `/simulation`이다.
 
----
+| Method | Endpoint | 설명 |
+| --- | --- | --- |
+| `POST` | `/simulation/start` | 시뮬레이션 시작 |
+| `POST` | `/simulation/pause` | 일시정지 |
+| `POST` | `/simulation/resume` | 재개 |
+| `POST` | `/simulation/restart` | 재시작 |
+| `POST` | `/simulation/stop` | 시뮬레이션 중지 |
+| `POST` | `/simulation/shutdown` | 서버 종료 |
+| `GET` | `/simulation/status` | 현재 상태 조회 |
+| `GET` | `/simulation/kpi` | KPI 조회 |
+| `GET` | `/simulation/surge` | H3 cell별 supply/demand/surge |
+| `GET` | `/simulation/h3-regions` | H3 ID to display name map |
+| `GET` | `/simulation/passengers` | 현재 승객 목록 |
+| `POST` | `/simulation/passengers/quote` | 수동 승객 생성 전 예상 요금 조회 |
+| `POST` | `/simulation/passengers` | 수동 승객 생성 |
+| `POST` | `/simulation/taxis` | 수동 택시 생성 |
+| `GET` | `/simulation/taxis/{taxi_id}/standby` | 빈 택시 standby 정보 |
+| `GET` | `/simulation/taxis/{taxi_id}/call` | 배차된 택시의 call detail |
+| `GET` | `/simulation/fare/{passenger_id}` | 완료 trip 요금 조회 |
 
-## WebSocket 프로토콜
-
-**엔드포인트:** `ws://localhost:8080/ws`
-
-### 메시지 타입 요약
-
-| 타입 | 전송 빈도 | 설명 |
-|------|----------|------|
-| `boundary` | 연결당 1회 | SUMO 내부 좌표 + WGS84 지리 경계 |
-| `snapshot` | 60 fps | 택시 전체 + 대기/배차 승객 목록 (단일 메시지) |
-| `surge` | 5 시뮬 초마다 | H3 셀별 공급·수요·서지 계수 |
-| `fare_update` | 하차 시 1회 | 실제 요금 및 이동 거리 기록 |
-| `finished` | 시뮬 종료 시 1회 | 시뮬레이션 3,600초 도달 알림 |
-
-### boundary
-
-클라이언트 접속 시 1회 전송합니다. SUMO 내부 좌표계(미터)와 WGS84 좌표계 경계를 함께 제공합니다.
+### Start/Restart body 예시
 
 ```json
 {
-  "type": "boundary",
-  "sumo": {
-    "minX": 0.0,
-    "minY": 0.0,
-    "maxX": 10000.0,
-    "maxY": 20000.0
-  },
-  "geo": {
-    "minLat": 40.700,
-    "minLng": -74.020,
-    "maxLat": 40.880,
-    "maxLng": -73.910
-  }
+  "duration": 3600,
+  "seed": 42,
+  "passenger_source": "parquet",
+  "taxi_count": 200,
+  "background_vehicle_count": 600,
+  "passengers_per_5min": 50,
+  "simulation_speed": 20,
+  "initial_passenger_count": 0
 }
-```
-
-### snapshot
-
-매 스텝(60 fps) 전송. 택시와 승객을 하나의 메시지로 묶어 전송합니다.  
-
-```json
-{
-  "type": "snapshot",
-  "sim_time": 300.0,
-  "vehicles": [
-    {"id": "taxi_0", "lat": 40.716, "lng": -74.001, "angle": 90.0, "speed": 5.2, "state": "empty"}
-  ],
-  "passengers": [
-    {"id": "p_0", "lat": 40.715, "lng": -74.002, "expected_fare": 5900, "expected_distance_m": 2100.5}
-  ]
-}
-```
-
-| state | 의미 |
-|-------|------|
-| `empty` | 승객 없음, 배차 대기 중 |
-| `dispatched` | 승객 픽업 이동 중 |
-| `occupied` | 승객 탑승, 목적지 이동 중 |
-
-`passengers`는 대기(`waiting`) 및 배차됨(`assigned`) 상태만 포함합니다. 탑승 후 목록에서 제거됩니다.
-
-### surge
-
-5 시뮬 초마다 전송. 빈 택시(공급) 또는 대기 승객(수요)이 존재하는 H3 셀만 포함합니다.
-
-```json
-{
-  "type": "surge",
-  "h3_resolution": 9,
-  "cells": [
-    {
-      "h3": "892830828cbffff",
-      "supply": 4,
-      "demand": 2,
-      "surge": 0.63,
-      "center": {"lat": 40.7128, "lng": -74.006}
-    }
-  ],
-  "sim_time": 300.0
-}
-```
-
-서지 계수 계산:
-
-| 조건 | 값 |
-|------|----|
-| supply = 0, demand = 0 | 1.0 |
-| supply = 0, demand > 0 | 5.0 (최대) |
-| supply > 0, demand = 0 | 0.0 |
-| supply > 0, demand > 0 | `min((demand / supply)^1.667, 5.0)` |
-
-### fare_update
-
-택시가 하차 지점 30m 이내에 도달하는 순간 전송합니다.
-
-```json
-{
-  "type": "fare_update",
-  "passenger_id": "p_42",
-  "taxi_id": "taxi_7",
-  "fare": 6200,
-  "expected_fare": 5900,
-  "distance_m": 2100.5,
-  "sim_time": 480.0
-}
-```
-
-요금 계산 방식 (단위: USD 센트):
-
-```
-기본요금       $3.00  (승차 즉시)
-거리 추가      $0.70  (1/5마일 = 약 322m 마다)
-저속 추가      $0.70  (시속 12마일 미만 시 60초 마다)
-─────────────────────────────────────
-개선 부담금    $1.00  (모든 운행)
-MTA 할증료     $0.50  (맨해튼 운행, 항상 적용)
-─────────────────────────────────────
-미적용 항목    NYS 혼잡 할증료 $2.50 (96번가 남쪽)
-               CBD 혼잡 통행료 $0.75 (60번가 남쪽)
-               야간 할증 $1.00 / 러시아워 할증 $2.50
 ```
 
 ---
 
-## 승객 생성 모드
+## WebSocket
 
-`PASSENGER_SOURCE` 환경변수로 모드를 전환합니다.
+WebSocket endpoint는 `/ws`이며 JSON이 아니라 protobuf binary를 전송한다. proto 기준은 `proto/ws_messages.proto` 또는 프로젝트 루트의 `ws_messages.proto` 복사본이다.
 
-| 모드 | 환경변수 값 | 동작 |
-|------|-----------|------|
-| random (기본) | `random` | 5분 시뮬 주기마다 Poisson(λ=5) 샘플링으로 승객 생성 |
-| parquet | `parquet` | 전처리된 NYC 실제 택시 데이터 기반으로 승객 생성 |
+주요 메시지:
 
-**parquet 모드 사전 준비 — 전처리 스크립트 실행:**
+- `boundary`: 접속 시 1회, SUMO/geo boundary
+- `snapshot`: 차량/승객 스냅샷
+- `surge`: H3 cell별 supply/demand/surge
+- `fare_update`: trip 완료 요금
+- `finished`: 시뮬레이션 종료
+- `passenger_created`, `taxi_created`, `passenger_creation_failed`
+- `dispatch_assigned`, `passenger_boarded`, `passenger_cancelled`
 
-`bash` / Git Bash:
+---
 
-```bash
-cd Back
-python scripts/preprocess_trips.py \
-  --input  real_taxi_data/od_month=07/consolidated.parquet \
-  --net    sumo_service/sumo_configs/NY/manhattan_car_only.net.xml \
-  --output sumo_service/sumo_configs/NY/trips_processed.json \
-  --start  "2013-07-08 08-00-00" \
-  --end    "2013-07-08 09-00-00" \
-  --workers 8 \
-  --sample 5000
-```
+## 승객 replay 데이터
 
-PowerShell:
+기본 replay 파일은 `sumo_service/sumo_configs/NY/trips_processed.json`이다. 런타임에서는 `PASSENGERS_PER_5MIN` 또는 start body의 `passengers_per_5min` 값으로 5분 bucket당 생성량을 조절한다. replay 파일 길이를 넘는 장기 실행은 loop 방식으로 이어진다.
+
+테스트용 `trips_processed_600ph_sample.json`은 로컬 검증 편의를 위한 샘플 파일이다. 배포나 기본 실행은 `trips_processed.json`을 기준으로 한다.
+
+---
+
+## 실험 모드
+
+v2 surge와 기사 수락률 기반 실험은 다음 문서를 기준으로 한다.
+
+- `sumo_service/README.experiment.v2-surge.md`
+- `sumo_service/scripts/run_acceptance_experiment.py`
+
+예측 수요 실험은 `--demand-source predicted`와 `PREDICTION_API_KEY`가 필요하다.
+
+---
+
+## 검증
 
 ```powershell
-cd Back
-python scripts/preprocess_trips.py `
-  --input  real_taxi_data/od_month=07/consolidated.parquet `
-  --net    sumo_service/sumo_configs/NY/manhattan_car_only.net.xml `
-  --output sumo_service/sumo_configs/NY/trips_processed.json `
-  --start  "2013-07-08 08-00-00" `
-  --end    "2013-07-08 09-00-00" `
-  --workers 8 `
-  --sample 5000
-```
-
-필요 패키지 (서비스 컨테이너 외부 전용):
-
-```bash
-pip install pandas pyarrow sumolib pyproj rtree
-```
-
----
-
-## 프로젝트 구조
-
-```
-Back/
-├── sumo_service/                  # SUMO 시뮬레이션 서비스 [구현 완료]
-│   ├── app/
-│   │   ├── main.py                # FastAPI 앱 + WebSocket 엔드포인트 + CLI 스레드
-│   │   ├── simulation.py          # SimulationManager (TraCI 루프, 상태머신, 요금 누적)
-│   │   ├── connection_manager.py  # WebSocket 연결 관리 + 브로드캐스트
-│   │   ├── coord.py               # SUMO <-> WGS84 좌표 변환 (sumolib 기반)
-│   │   ├── fare.py                # 요금 계산 (TripAccumulator, calculate_fare)
-│   │   ├── grid.py                # H3 격자 조회 + compute_surge
-│   │   ├── passenger.py           # Passenger 데이터클래스
-│   │   ├── db/
-│   │   │   ├── engine.py          # asyncpg 풀 관리 (DATABASE_URL 없으면 no-op)
-│   │   │   └── writer.py          # asyncio.Queue 기반 비동기 DB 라이터
-│   │   └── routers/
-│   │       ├── simulation.py      # REST 라우터 (start/pause/resume/restart/stop/shutdown/status/fare/surge/passengers)
-│   │       └── ws.py              # WebSocket 라우터
-│   ├── db/
-│   │   └── init.sql               # DB 스키마 (simulation_run/passenger/taxi/dispatch/trip)
-│   ├── sumo_configs/
-│   │   └── NY/                    # 맨해튼 SUMO 네트워크 설정 파일
-│   ├── tests/                     # 단위 테스트 (pytest, SUMO/Docker 없이 실행 가능)
-│   ├── Dockerfile
-│   └── pyproject.toml
-├── scripts/
-│   └── preprocess_trips.py        # NYC 택시 parquet → trips_processed.json 변환 (1회성)
-├── prediction_service/            # [미구현]
-├── dispatch_service/              # [미구현]
-├── proto/                         # gRPC 공통 proto 정의 [미구현]
-├── docs/
-│   ├── PRD.md
-│   └── project-proposal.md
-└── CLAUDE.md                      # Claude Code 작업 가이드
+cd Back\sumo_service
+uv run pytest -q
 ```
